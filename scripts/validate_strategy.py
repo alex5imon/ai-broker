@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 
 RESULTS_PATH = Path(
-    "/Users/alex/Broker/backtest_results/"
+    "backtest_results/"
     "multi_strategy_2020-07-27_to_2026-04-16_20260420T162929.json"
 )
 
