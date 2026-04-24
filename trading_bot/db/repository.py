@@ -7,6 +7,7 @@ the database schema.  All queries use parameterised placeholders.
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from datetime import datetime, timedelta
@@ -798,3 +799,156 @@ def save_backtest_result(conn: sqlite3.Connection, result: dict[str, Any]) -> in
     bt_id: int = cur.lastrowid  # type: ignore[assignment]
     logger.debug("Saved backtest result id=%d backtest_id=%s", bt_id, result["backtest_id"])
     return bt_id
+
+
+# ---------------------------------------------------------------------------
+# Tick state — per-strategy state carried across stateless cron runs
+# ---------------------------------------------------------------------------
+
+def save_tick_state(
+    conn: sqlite3.Connection,
+    strategy_id: str,
+    *,
+    last_bar_ts: str | None,
+    state: dict[str, Any] | None = None,
+) -> None:
+    """Upsert the tick state for *strategy_id*.
+
+    *last_bar_ts* is the ISO timestamp of the most recently processed bar; it
+    may be ``None`` if no bar has been processed yet.  *state* is an arbitrary
+    JSON-serialisable dict of additional fields.
+    """
+    state_json: str = json.dumps(state or {}, sort_keys=True)
+    now: str = _now_eastern_iso()
+    conn.execute(
+        """
+        INSERT INTO tick_state (strategy_id, last_bar_ts, last_run_at, state_json, updated_at)
+        VALUES (:strategy_id, :last_bar_ts, :now, :state_json, :now)
+        ON CONFLICT(strategy_id) DO UPDATE SET
+            last_bar_ts = excluded.last_bar_ts,
+            last_run_at = excluded.last_run_at,
+            state_json  = excluded.state_json,
+            updated_at  = excluded.updated_at
+        """,
+        {
+            "strategy_id": strategy_id,
+            "last_bar_ts": last_bar_ts,
+            "now": now,
+            "state_json": state_json,
+        },
+    )
+    conn.commit()
+
+
+def load_tick_state(
+    conn: sqlite3.Connection, strategy_id: str
+) -> dict[str, Any] | None:
+    """Return the tick state for *strategy_id*, or ``None`` if no row exists.
+
+    The returned dict includes ``strategy_id``, ``last_bar_ts``, ``last_run_at``,
+    ``updated_at``, plus all keys from the stored ``state_json`` blob merged in
+    under a ``state`` key for callers that prefer structured access.
+    """
+    _ensure_row_factory(conn)
+    row = conn.execute(
+        "SELECT strategy_id, last_bar_ts, last_run_at, state_json, updated_at "
+        "FROM tick_state WHERE strategy_id = ?",
+        (strategy_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    result: dict[str, Any] = dict(row)
+    try:
+        result["state"] = json.loads(result.pop("state_json") or "{}")
+    except json.JSONDecodeError:
+        logger.warning("Corrupt state_json for strategy %s; returning empty", strategy_id)
+        result["state"] = {}
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Risk circuit state — persisted kill switches / drawdown counters
+# ---------------------------------------------------------------------------
+
+def save_risk_state(
+    conn: sqlite3.Connection,
+    key: str,
+    *,
+    tripped: bool,
+    reason: str | None = None,
+    state: dict[str, Any] | None = None,
+) -> None:
+    """Upsert the risk circuit state for *key* (``'global'`` or a strategy id).
+
+    When *tripped* flips from False to True, ``tripped_at`` is set to *now*.
+    When it flips back to False, ``tripped_at`` and ``reason`` are cleared.
+    """
+    _ensure_row_factory(conn)
+    prior = conn.execute(
+        "SELECT tripped FROM risk_circuit_state WHERE key = ?",
+        (key,),
+    ).fetchone()
+    now: str = _now_eastern_iso()
+    state_json: str = json.dumps(state or {}, sort_keys=True)
+
+    if tripped:
+        # Preserve the original tripped_at on an update; only stamp it on first trip.
+        tripped_at: str | None = now
+        if prior is not None and int(prior["tripped"]) == 1:
+            existing = conn.execute(
+                "SELECT tripped_at FROM risk_circuit_state WHERE key = ?",
+                (key,),
+            ).fetchone()
+            if existing and existing["tripped_at"]:
+                tripped_at = existing["tripped_at"]
+    else:
+        tripped_at = None
+        reason = None
+
+    conn.execute(
+        """
+        INSERT INTO risk_circuit_state (key, tripped, tripped_at, reason, state_json, updated_at)
+        VALUES (:key, :tripped, :tripped_at, :reason, :state_json, :now)
+        ON CONFLICT(key) DO UPDATE SET
+            tripped     = excluded.tripped,
+            tripped_at  = excluded.tripped_at,
+            reason      = excluded.reason,
+            state_json  = excluded.state_json,
+            updated_at  = excluded.updated_at
+        """,
+        {
+            "key": key,
+            "tripped": 1 if tripped else 0,
+            "tripped_at": tripped_at,
+            "reason": reason,
+            "state_json": state_json,
+            "now": now,
+        },
+    )
+    conn.commit()
+
+
+def load_risk_state(
+    conn: sqlite3.Connection, key: str
+) -> dict[str, Any] | None:
+    """Return the risk circuit state for *key*, or ``None`` if no row exists.
+
+    ``tripped`` is returned as a bool.  ``state_json`` is decoded into a
+    ``state`` dict; a corrupt blob is logged and replaced with ``{}``.
+    """
+    _ensure_row_factory(conn)
+    row = conn.execute(
+        "SELECT key, tripped, tripped_at, reason, state_json, updated_at "
+        "FROM risk_circuit_state WHERE key = ?",
+        (key,),
+    ).fetchone()
+    if row is None:
+        return None
+    result: dict[str, Any] = dict(row)
+    result["tripped"] = bool(result["tripped"])
+    try:
+        result["state"] = json.loads(result.pop("state_json") or "{}")
+    except json.JSONDecodeError:
+        logger.warning("Corrupt state_json for risk key %s; returning empty", key)
+        result["state"] = {}
+    return result

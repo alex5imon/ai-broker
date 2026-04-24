@@ -173,10 +173,45 @@ def _migration_v6(conn: sqlite3.Connection) -> None:
     logger.info("Applied migration V6: positions.strategy_id NOT NULL")
 
 
+def _migration_v7(conn: sqlite3.Connection) -> None:
+    """V7: tick model persistence — tick_state + risk_circuit_state tables.
+
+    These tables persist state that previously lived only in the long-running
+    asyncio process, so that the stateless GHA cron tick can resume from the
+    last known state each run.  Idempotent.
+    """
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS tick_state (
+            strategy_id     TEXT PRIMARY KEY,
+            last_bar_ts     TEXT,
+            last_run_at     TEXT NOT NULL DEFAULT (datetime('now')),
+            state_json      TEXT NOT NULL DEFAULT '{}',
+            updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS risk_circuit_state (
+            key             TEXT PRIMARY KEY,
+            tripped         INTEGER NOT NULL DEFAULT 0,
+            tripped_at      TEXT,
+            reason          TEXT,
+            state_json      TEXT NOT NULL DEFAULT '{}',
+            updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        """
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_version (version, description) "
+        "VALUES (7, 'V7 schema - tick_state + risk_circuit_state')"
+    )
+    logger.info("Applied migration V7: tick_state + risk_circuit_state")
+
+
 _MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (4, "V4 schema - multi-market adaptive trading bot", _migration_v4),
     (5, "V5 schema - multi-strategy Alpaca trading bot", _migration_v5),
     (6, "V6 schema - positions.strategy_id NOT NULL", _migration_v6),
+    (7, "V7 schema - tick_state + risk_circuit_state", _migration_v7),
 ]
 
 

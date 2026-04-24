@@ -176,4 +176,4 @@ def ticker_market(ticker: str) -> Market:
 # Schema version — must match the DB migration target
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION: int = 6
+SCHEMA_VERSION: int = 7
