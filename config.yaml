@@ -1,0 +1,583 @@
+# =============================================================================
+# Trading Bot Configuration - V5 (Alpaca)
+# =============================================================================
+# This file is the single source of truth for all tunable parameters.
+# Never hardcode values that belong here.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Account Settings
+# -----------------------------------------------------------------------------
+account:
+  base_currency: "GBP"
+  trading_mode: "live"              # 'live' or 'backtest'
+  phase_override: null              # Set to 0, 1, 2, or 3 to force a phase (null = auto-detect)
+
+# -----------------------------------------------------------------------------
+# Alpaca Connection
+# -----------------------------------------------------------------------------
+alpaca:
+  # API keys are read from environment variables:
+  #   ALPACA_API_KEY
+  #   ALPACA_SECRET_KEY
+  paper: true                        # true = paper trading, false = live
+  data_feed: "iex"                   # "iex" (free) or "sip" (paid, all exchanges)
+  max_retries: 5
+  retry_backoff_seconds: 30
+  # Suppress ntfy noise from transient Alpaca REST blips. The "connection
+  # lost" / "reconnected" pair only fires when the outage has persisted
+  # past this threshold. Exhausted-retries CRITICAL alerts always fire
+  # regardless. Default 120s — Alpaca transient blips are almost always
+  # under a minute; outages worth notifying about are longer.
+  reconnect_alert_threshold_seconds: 120
+
+# -----------------------------------------------------------------------------
+# Market Data
+# -----------------------------------------------------------------------------
+market_data:
+  staleness_threshold_seconds: 300    # IEX-only feed has natural multi-minute gaps on ETFs
+  resubscribe_wait_seconds: 15
+  resubscribe_retry_seconds: 60
+  # With a 2-symbol watchlist, 1 stale symbol = 50%, which would trip the default.
+  # Raise trip point so both must be stale before pausing trading.
+  mass_staleness_pct: 0.95
+  mass_staleness_resume_pct: 0.50
+  # Alpaca's free paper IEX websocket is notoriously sparse — it often emits
+  # zero ticks for liquid ETFs for many minutes at a time. Strategies fetch
+  # fresh bars via REST on every scan, so streaming staleness is not a
+  # sufficient reason to halt trading. When this flag is false, mass staleness
+  # still logs a CRITICAL warning but does NOT pause entry scans, per-symbol
+  # is_stale() always returns False, and get_latest_price() falls back to the
+  # latest REST bar close if no live tick has been received.
+  pause_on_mass_staleness: false
+
+# -----------------------------------------------------------------------------
+# Market Schedule (US only)
+# -----------------------------------------------------------------------------
+schedule:
+  us:
+    pre_market_scan_start: "09:15"  # ET
+    pre_market_scan_end: "09:30"
+    market_open: "09:30"
+    execution_start: "09:35"        # Skip first 5 min
+    execution_end: "15:50"
+    wind_down_start: "15:50"
+    wind_down_end: "15:58"
+    market_close: "16:00"
+    timezone: "US/Eastern"
+  warmup_minutes: 15
+  late_start_close_only_after_us: "15:30"   # ET - US market
+  bot_start_gmt: "13:30"           # Adjusted for US-only (09:30 ET ~ 13:30 GMT)
+  bot_end_gmt: "21:00"
+
+# -----------------------------------------------------------------------------
+# Holiday Calendar (update annually)
+# -----------------------------------------------------------------------------
+holidays:
+  us_2026:
+    - "2026-01-01"  # New Year's Day
+    - "2026-01-19"  # MLK Day
+    - "2026-02-16"  # Presidents' Day
+    - "2026-04-03"  # Good Friday
+    - "2026-05-25"  # Memorial Day
+    - "2026-06-19"  # Juneteenth
+    - "2026-07-03"  # Independence Day (observed)
+    - "2026-09-07"  # Labor Day
+    - "2026-11-26"  # Thanksgiving
+    - "2026-12-25"  # Christmas Day
+  us_early_close_2026:
+    - "2026-11-27"  # Day after Thanksgiving (13:00 ET close)
+    - "2026-12-24"  # Christmas Eve (13:00 ET close)
+
+# -----------------------------------------------------------------------------
+# Watchlist (US stocks only — commission-free on Alpaca)
+# -----------------------------------------------------------------------------
+watchlist:
+  # Full SPDR sector set (11 sectors) + SPY + QQQ. 13 tickers gives enough
+  # breadth for sector-rotation filters (backlog #6), keeps gap risk low
+  # (all ETFs), and is uniformly liquid on the free IEX feed.
+  # No individual stocks (earnings-gap risk) and no leveraged ETFs (decay).
+  us:
+    - "SPY"     # S&P 500 ETF — primary, most validated
+    - "QQQ"     # Nasdaq-100 ETF — tech-heavy complement
+    - "XLK"     # Technology
+    - "XLF"     # Financials
+    - "XLV"     # Health Care
+    - "XLY"     # Consumer Discretionary
+    - "XLP"     # Consumer Staples
+    - "XLE"     # Energy
+    - "XLI"     # Industrials
+    - "XLB"     # Materials
+    - "XLU"     # Utilities
+    - "XLRE"    # Real Estate
+    - "XLC"     # Communication Services
+  # Phase 2 expansion — broader ETF set once strategy is proven
+  us_phase2:
+    - "SPY"
+    - "QQQ"
+    - "XLF"     # Financial Select Sector SPDR
+    - "XLE"     # Energy Select Sector SPDR
+    - "XLK"     # Technology Select Sector SPDR
+    - "XLV"     # Health Care Select Sector SPDR
+  # Phase 3 expansion — mega-caps for intraday mean reversion
+  us_phase3:
+    - "SPY"
+    - "QQQ"
+    - "XLF"
+    - "XLE"
+    - "XLK"
+    - "XLV"
+    - "AAPL"    # Apple
+    - "MSFT"    # Microsoft
+    - "NVDA"    # NVIDIA
+    - "GOOGL"   # Alphabet
+    - "AMZN"    # Amazon
+    - "META"    # Meta Platforms
+
+# -----------------------------------------------------------------------------
+# Watchlist Quality Criteria
+# -----------------------------------------------------------------------------
+watchlist_criteria:
+  min_avg_daily_volume_us: 5000000
+  max_spread_pct_us: 0.0005       # 0.05% as decimal
+  max_price_us_usd: 40.00
+  min_market_cap_usd: 1000000000  # $1B
+  max_symbols_per_sector: 3
+  price_limits_by_phase:
+    phase1:
+      us_usd: 40.0
+    phase2:
+      us_usd: 100.0
+    phase3:
+      us_usd: 9999.0              # No practical limit
+
+# -----------------------------------------------------------------------------
+# Risk Management
+# -----------------------------------------------------------------------------
+risk:
+  daily_loss_limit_pct: 0.01      # -1% of account equity
+  max_daily_trades:
+    phase1: 10
+    phase2: 25
+    phase3: 50
+  max_positions:
+    phase1: 2
+    phase2: 4
+    phase3: 8
+  max_sector_exposure:
+    phase1: 1
+    phase2: 2
+    phase3: 3
+  risk_per_trade_pct:
+    phase1: 0.02                  # 2% of equity
+    phase2: 0.015                 # 1.5%
+    phase3: 0.01                  # 1%
+  max_position_pct:
+    phase1: 0.40                  # 40% of equity
+    phase2: 0.25                  # 25%
+    phase3: 0.15                  # 15%
+  min_position_value:
+    phase1:
+      us_usd: 50.0
+    phase2:
+      us_usd: 100.0
+    phase3:
+      us_usd: 200.0
+  drawdown_breaker:
+    threshold_pct: 0.05           # 5% from 5-day peak
+    rolling_days: 5
+    pause_days: 1
+    recovery_position_size_pct: 0.50  # 50% size for first 3 trades after breaker
+    recovery_trades: 3
+  correlation_threshold: 0.85
+  order_rejections:
+    max_count: 3
+    window_minutes: 10
+    pause_minutes: 15
+    entry_cooldown_minutes: 15
+
+# -----------------------------------------------------------------------------
+# Strategy - Technical Indicators
+# -----------------------------------------------------------------------------
+strategy:
+  ema:
+    fast_period: 9
+    slow_period: 21
+    timeframe: "5min"             # 5-minute bars
+    crossover_lookback_bars: 3    # Signal valid for 3 bars after crossover
+  bollinger:
+    period: 20
+    std_dev: 2.0
+    timeframe: "5min"
+    bounce_lookback_bars: 5       # Look back 5 bars for band touch
+    squeeze_threshold: 0.02       # bandwidth / middle < this = squeeze
+  volume:
+    average_period: 20
+    multiplier: 1.5               # Current vol must be > 1.5x average
+    timeframe: "5min"
+  atr:
+    period: 14
+    rank_lookback_days: 100
+    extreme_percentile: 85        # Skip entry if ATR rank >= 85th
+    high_percentile: 70           # Reduce size if ATR rank >= 70th
+    high_vol_size_reduction: 0.75 # Multiply position size by this
+  scan_interval_seconds:
+    phase1: 30
+    phase2: 15
+    phase3: 5
+
+# -----------------------------------------------------------------------------
+# Entry Parameters
+# -----------------------------------------------------------------------------
+entry:
+  min_signals_required: 3         # All 3 signals must align in Phase 1
+  sentiment_threshold: 0.1        # Normalized score > 0.1 for longs
+  sentiment_block_threshold: -0.2 # Block entry if sentiment < -0.2
+  no_data_size_multiplier: 0.75   # 75% size when no sentiment data
+  spread_max_us_pct: 0.0005       # 0.05%
+  spread_wait_seconds: 120        # Wait up to 2 min for spread to narrow
+  spread_recheck_seconds: 15      # Recheck spread every 15 sec
+  entry_timeout_seconds: 300      # Cancel unfilled entry after 5 min
+  partial_fill_min_pct: 0.50      # Accept partial fill >= 50%
+  cooldown_minutes: 30            # Cooldown after exiting a ticker
+  earnings_blackout_hours: 48     # Hours before/after earnings to skip
+
+# -----------------------------------------------------------------------------
+# Sentiment
+# -----------------------------------------------------------------------------
+sentiment:
+  cache_ttl_minutes: 30
+  refresh_interval_minutes: 30
+  finnhub_rate_limit_per_minute: 60
+  neutral_position_size_pct: 0.75
+  sector_block_threshold: -0.1
+  market_reduce_threshold: -0.2
+  market_reduce_size_pct: 0.50
+  market_close_only_threshold: -0.4
+  market_symbols:
+    - "SPY"
+    - "QQQ"
+
+# -----------------------------------------------------------------------------
+# Exit Parameters - Intraday
+# -----------------------------------------------------------------------------
+exit_intraday:
+  stop_loss_pct: 0.02             # -2% from entry
+  take_profit_pct: 0.03           # +3% from entry
+  trailing_activation_pct: 0.015  # Activate trailing at +1.5%
+  trailing_distance_pct: 0.01     # Trail at -1% from high
+  time_stop_hours: 4              # Re-evaluate after 4 hours
+  time_stop_flat_threshold: 0.005 # +/- 0.5% considered "flat"
+
+# -----------------------------------------------------------------------------
+# Exit Parameters - Swing
+# -----------------------------------------------------------------------------
+exit_swing:
+  stop_loss_pct: 0.03             # -3% from entry
+  take_profit_pct: 0.05           # +5% from entry
+  trailing_activation_pct: 0.025  # Activate trailing at +2.5%
+  trailing_distance_pct: 0.015    # Trail at -1.5% from high
+  max_hold_days: 5                # Maximum hold time in trading days
+  daily_review: true              # Re-evaluate swing positions daily
+
+# -----------------------------------------------------------------------------
+# Exit Parameters - Phase 2 Overrides
+# -----------------------------------------------------------------------------
+exit_intraday_phase2:
+  stop_loss_pct: 0.015            # -1.5%
+  take_profit_pct: 0.025          # +2.5%
+  trailing_activation_pct: 0.012
+  trailing_distance_pct: 0.008
+
+# -----------------------------------------------------------------------------
+# Exit Parameters - Phase 3 Overrides
+# -----------------------------------------------------------------------------
+exit_intraday_phase3:
+  stop_loss_pct: 0.01             # -1.0% (tight scalping)
+  take_profit_pct: 0.015          # +1.5%
+  trailing_activation_pct: 0.008
+  trailing_distance_pct: 0.005
+
+# -----------------------------------------------------------------------------
+# Spread-Widening Protection
+# -----------------------------------------------------------------------------
+exit_spread_protection:
+  max_spread_pct: 0.0015          # 0.15% - delay non-emergency exits
+  max_delay_seconds: 120          # Max 2 minutes delay
+  recheck_interval_seconds: 15
+
+# -----------------------------------------------------------------------------
+# Notifications
+# -----------------------------------------------------------------------------
+notifications:
+  ntfy_server: "https://ntfy.sh"
+  ntfy_topic: "trading-bot-alpaca"
+  ntfy_kill_topic: "trading-bot-kill-alpaca"
+  priorities:
+    trade_entry: 3
+    position_closed: 3
+    stop_loss_hit: 4
+    daily_loss_limit: 4
+    trailing_activated: 2
+    daily_summary: 3
+    phase_transition: 4
+    gateway_disconnect: 5
+    gateway_reconnect: 3
+    mass_staleness: 4
+    kill_switch: 5
+    drawdown_breaker: 5
+    order_rejection: 3
+    excessive_rejections: 4
+    max_daily_trades: 3
+    bot_startup: 2
+    bot_shutdown: 2
+  fallback_to_osascript: true
+  max_retries: 3
+  retry_interval_seconds: 60
+  rate_limit_per_minute: 5
+
+# -----------------------------------------------------------------------------
+# Settlement
+# -----------------------------------------------------------------------------
+settlement:
+  t_plus_days: 1                  # T+1 for US equities
+
+# -----------------------------------------------------------------------------
+# FX
+# -----------------------------------------------------------------------------
+fx:
+  refresh_interval_seconds: 300   # 5 min (uses free API, not broker)
+  fallback_gbp_usd: 1.27         # Used if external FX API unavailable
+
+# -----------------------------------------------------------------------------
+# Phase 0 - Portfolio Cleanup
+# -----------------------------------------------------------------------------
+phase0:
+  enabled: true
+  notification_delay_seconds: 300
+  scoring:
+    liquidity_weight: 25
+    market_cap_weight: 20
+    exchange_weight: 15
+    technical_weight: 15
+    sentiment_weight: 10
+    loss_weight: 15
+  thresholds:
+    hold_min_score: 60
+    sell_min_score: 30
+  sell_strategy:
+    start_at_mid: true
+    adjust_toward_bid_after_hours: 2
+    adjust_to_bid_after_hours: 4
+    urgent_adjust_interval_minutes: 30
+    market_order_threshold_value: 50
+
+# -----------------------------------------------------------------------------
+# Phase Transitions
+# -----------------------------------------------------------------------------
+phases:
+  phase1_to_phase2:
+    equity_gbp: 5000
+    min_trading_days: 40
+    min_win_rate_last_n: 0.52
+    win_rate_lookback_trades: 20
+    positive_pnl_lookback_days: 30
+    max_loss_limit_breaches_last_n: 0
+    loss_breach_lookback_days: 20
+  phase2_to_phase3:
+    equity_gbp: 20000
+    min_trading_days: 60
+    min_win_rate_last_n: 0.55
+    win_rate_lookback_trades: 40
+    min_sharpe_ratio: 1.0
+    sharpe_lookback_days: 60
+    positive_pnl_lookback_days: 60
+  demotion:
+    equity_pct_of_threshold: 0.80
+
+# -----------------------------------------------------------------------------
+# Reporting
+# -----------------------------------------------------------------------------
+reporting:
+  output_dir: "~/trading_bot_reports"
+  daily_report: true
+  weekly_report: true
+  monthly_report: true
+  equity_curve_days: 30
+  templates_dir: "trading_bot/reporting/templates"
+
+# -----------------------------------------------------------------------------
+# Health Check
+# -----------------------------------------------------------------------------
+health:
+  enabled: true
+  host: "0.0.0.0"
+  port: 8080
+
+# -----------------------------------------------------------------------------
+# Database
+# -----------------------------------------------------------------------------
+database:
+  path: "trading_bot/data/trading_bot.db"
+  backup_enabled: true
+  backup_interval_hours: 24
+  backup_dir: "trading_bot/data/backups"
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+logging:
+  level: "INFO"
+  file: "trading_bot/logs/bot.log"
+  backup_count: 30
+  format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+# -----------------------------------------------------------------------------
+# Backtesting
+# -----------------------------------------------------------------------------
+backtesting:
+  slippage_bps_per_side: 2
+  default_sentiment: 0.0
+  bar_size: "1 min"
+
+# -----------------------------------------------------------------------------
+# Multi-Strategy Configuration
+# -----------------------------------------------------------------------------
+multi_strategy:
+  enabled: true
+  # 2026-04-24 objective reframe: sentiment_combo disabled (low edge
+  # after 2 iterations). Its $1000 redistributed +$500 each to
+  # mean_reversion and breakout — the two highest-PF sleeves in the
+  # 13-year SPY backtest. Sentiment signal is still consumed by the
+  # bot-wide entry filters (entry.sentiment_block_threshold and
+  # sentiment.market_reduce_threshold), just not as a standalone sleeve.
+  total_allocation_usd: 5000.0
+  comparison_period_days: 252
+
+  # Market regime filter — blocks new entries when SPY < 50-day SMA.
+  # Mirrors the gate applied in multi_strategy_backtest.run_daily().
+  regime_filter:
+    enabled: true
+    index_symbol: "SPY"
+    sma_period: 50
+    cache_ttl_minutes: 30
+
+  strategies:
+    # Mean Reversion is the only strategy validated on 13 years of SPY 5-min
+    # bars (66.4% win rate, +6.74% total, PF 1.17). Others are disabled until
+    # they produce comparable backtest evidence.
+    mean_reversion:
+      enabled: true
+      # Bumped 1000 -> 1500 after 2026-04-24 objective reframe:
+      # absorbed half of the disabled sentiment_combo allocation.
+      # Top PF strategy (1.63) with the added BB confirmation.
+      allocation_usd: 1500.0
+      max_positions: 3          # hold up to 3 concurrent diversified ETF positions
+      rsi_period: 14
+      rsi_oversold: 28
+      rsi_recovery: 35
+      rsi_exit: 55
+      stop_loss_pct: 0.02        # fallback when ATR unavailable
+      take_profit_pct: 0.03      # fallback when ATR unavailable
+      volume_multiplier: 1.3
+      oversold_lookback: 5
+      require_ema_confirm: false
+      ema_confirm_period: 9
+      # ATR-based stops/targets (match multi_strategy_backtest._atr_adjusted_stops)
+      use_atr_stops: true
+      atr_period: 14
+      atr_stop_mult: 2.0
+      atr_target_mult: 5.0
+      atr_trail_mult: 2.5
+      atr_activation_mult: 2.5
+      # Risk-based position sizing (match multi_strategy_backtest._size_by_risk)
+      use_risk_sizing: true
+      risk_per_trade_pct: 0.02   # 2% of equity risked per trade (6% if all 3 positions stop out)
+      max_position_pct: 0.33     # 33% per position × 3 positions = ~99% of equity deployed
+      # Fractional shares: required on $1k capital for SPY/QQQ (~$250+/share).
+      # Alpaca supports fractional down to 1/1000000.
+      fractional_shares: true
+      # Volatility-adaptive RSI oversold thresholds.
+      # Uses 20-day realized vol of df_daily closes as a VIX proxy.
+      # High vol (≥25%) → stricter threshold (deeper dip = quality signal).
+      # Low vol  (≤12%) → looser threshold (more trades when moves are small).
+      # Normal regime uses the baseline rsi_oversold.
+      # Let winners run past the target. When true:
+      #   - ATR target becomes the trailing-stop activation trigger (not a hard exit)
+      #   - RSI-normalisation exit is disabled once position is up >= let_winners_run_up_pct
+      #   - Trailing stop takes over from that point
+      # Exits become: stop loss, or trailing stop.
+      let_winners_run: true
+      let_winners_run_up_pct: 0.03
+      vix_adaptive_rsi: true
+      rv_lookback_days: 20
+      rv_high_threshold: 25.0
+      rv_low_threshold: 12.0
+      rsi_oversold_high_vol: 25
+      rsi_oversold_low_vol: 30
+      # Bollinger Band confirmation (backlog #4, enabled 2026-04-24).
+      # Require price to have touched the lower BB within the last 3 bars
+      # and closed back above it. Second independent mean-reversion signal
+      # complementing RSI — raises conviction, should lift PF.
+      require_bb_confirm: true
+      bb_period: 20
+      bb_std: 2.0
+      bb_lookback_bars: 3
+
+    trend_following:
+      enabled: true
+      allocation_usd: 1000.0
+      max_positions: 1
+      sma_period: 50
+      ema_fast: 9
+      ema_slow: 21
+      volume_multiplier: 1.5
+      trailing_stop_pct: 0.025
+      initial_stop_pct: 0.03
+
+    breakout:
+      enabled: true
+      # Bumped 1000 -> 1500 after 2026-04-24 objective reframe:
+      # absorbed half of the disabled sentiment_combo allocation.
+      # Highest PF strategy (2.94) in the 13-year SPY backtest.
+      allocation_usd: 1500.0
+      max_positions: 1
+      breakout_period: 20
+      exit_period: 10
+      volume_multiplier: 1.5
+      stop_loss_pct: 0.03
+
+    # Sentiment Combo DISABLED 2026-04-24 (objective reframe).
+    # Two tuning iterations exhausted the parameter search:
+    #   iter 1 baseline: 45 trades, PF 1.05, +2.67% over 13 yr
+    #   iter 2 tighter:   2 trades, PF 0.79
+    # Underlying hypothesis ("sentiment + 1 technical = tradeable edge
+    # on ETFs") didn't validate. Sentiment is still used bot-wide as
+    # a risk filter / size modifier — see entry.sentiment_block_threshold
+    # and sentiment.market_reduce_threshold. Left in config for future
+    # re-enable (e.g. archetype switch to earnings-driven single stocks).
+    sentiment_combo:
+      enabled: false
+      allocation_usd: 0.0
+      max_positions: 2
+      sentiment_threshold: 0.25
+      min_technical_signals: 1
+      stop_loss_pct: 0.015
+      take_profit_pct: 0.025
+
+    # Overnight Drift (backlog #11, enabled 2026-04-24).
+    # Buy on the last 5-min bar of the session, sell on the first bar
+    # of the next session. Captures the historical overnight equity
+    # premium. 3% disaster stop caps gap-down tail risk.
+    overnight_drift:
+      enabled: true
+      allocation_usd: 1000.0
+      max_positions: 1
+      # Entry fires on the 15:45 5-min bar (covers 15:45-15:49:59 ET).
+      # Must fire BEFORE wind-down (15:50) because the backtester skips
+      # new entries once wind-down starts. This gives ~15 min before close.
+      entry_window_start: "15:40"
+      entry_window_end: "15:45"
+      stop_loss_pct: 0.03
+      position_pct: 0.95
+      fractional_shares: true

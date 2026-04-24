@@ -38,14 +38,22 @@ jobs:
           restore-keys: |
             bot-state-
 
+      - name: Restore SQLite DB
+        uses: actions/cache@v4
+        with:
+          path: trading_bot/data/trading_bot.db*
+          key: bot-db-${{ github.run_id }}
+          restore-keys: |
+            bot-db-
+
       - name: Run bot
         env:
           ALPACA_ENV: ${{ vars.ALPACA_ENV || 'paper' }}
-          ALPACA_API_KEY_ID: ${{ vars.ALPACA_ENV == 'live' && secrets.ALPACA_LIVE_KEY_ID || secrets.ALPACA_PAPER_KEY_ID }}
-          ALPACA_API_SECRET: ${{ vars.ALPACA_ENV == 'live' && secrets.ALPACA_LIVE_SECRET || secrets.ALPACA_PAPER_SECRET }}
+          ALPACA_API_KEY: ${{ vars.ALPACA_ENV == 'live' && secrets.ALPACA_LIVE_KEY_ID || secrets.ALPACA_PAPER_KEY_ID }}
+          ALPACA_SECRET_KEY: ${{ vars.ALPACA_ENV == 'live' && secrets.ALPACA_LIVE_SECRET || secrets.ALPACA_PAPER_SECRET }}
           BOT_LOG_DIR: logs
           BOT_STATE_DIR: state
-        run: python -m bot.run
+        run: python -m trading_bot.main --mode normal
 
       - name: Upload logs
         if: always()
@@ -62,3 +70,12 @@ jobs:
           name: bot-state-${{ github.run_id }}
           path: state/
           retention-days: 30
+
+      - name: Upload SQLite DB
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-db-${{ github.run_id }}
+          path: trading_bot/data/trading_bot.db*
+          retention-days: 30
+          if-no-files-found: ignore

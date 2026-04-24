@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Phase 0 Report - {{ date }}</title>
+<style>
+  :root {
+    --bg-primary: #0d1117;
+    --bg-secondary: #161b22;
+    --bg-tertiary: #21262d;
+    --border: #30363d;
+    --text-primary: #e6edf3;
+    --text-secondary: #8b949e;
+    --text-muted: #6e7681;
+    --green: #3fb950;
+    --green-bg: rgba(63, 185, 80, 0.1);
+    --red: #f85149;
+    --red-bg: rgba(248, 81, 73, 0.1);
+    --blue: #58a6ff;
+    --yellow: #d29922;
+    --purple: #bc8cff;
+    --orange: #d29922;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    line-height: 1.5;
+    padding: 20px;
+    max-width: 1200px;
+    margin: 0 auto;
+  }
+
+  h1, h2, h3 { font-weight: 600; }
+  h1 { font-size: 1.5rem; margin-bottom: 4px; }
+  h2 { font-size: 1.15rem; margin-bottom: 12px; color: var(--blue); border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 0.95rem; margin-bottom: 8px; color: var(--text-secondary); }
+
+  .header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 12px;
+    padding: 16px 20px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 20px;
+  }
+
+  .header-left h1 { color: var(--text-primary); }
+  .header-left .subtitle { color: var(--text-secondary); font-size: 0.85rem; }
+
+  .header-right {
+    text-align: right;
+    display: flex;
+    gap: 20px;
+  }
+
+  .stat-box {
+    text-align: center;
+    padding: 8px 16px;
+    background: var(--bg-tertiary);
+    border-radius: 6px;
+    min-width: 110px;
+  }
+
+  .stat-box .label { font-size: 0.7rem; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.5px; }
+  .stat-box .value { font-size: 1.3rem; font-weight: 700; margin-top: 2px; }
+
+  .positive { color: var(--green); }
+  .negative { color: var(--red); }
+  .neutral { color: var(--text-secondary); }
+
+  section {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin-bottom: 16px;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+  }
+
+  th, td {
+    padding: 8px 10px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+
+  th {
+    color: var(--text-secondary);
+    font-weight: 600;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    background: var(--bg-tertiary);
+    position: sticky;
+    top: 0;
+  }
+
+  td { color: var(--text-primary); }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: var(--bg-tertiary); }
+
+  .metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 10px;
+  }
+
+  .metric-card {
+    padding: 10px 14px;
+    background: var(--bg-tertiary);
+    border-radius: 6px;
+    border: 1px solid var(--border);
+  }
+
+  .metric-card .label { font-size: 0.7rem; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.5px; }
+  .metric-card .value { font-size: 1.1rem; font-weight: 700; margin-top: 2px; }
+
+  .badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .badge-hold { background: var(--green-bg); color: var(--green); border: 1px solid var(--green); }
+  .badge-sell { background: var(--red-bg); color: var(--red); border: 1px solid var(--red); }
+  .badge-urgent { background: rgba(210, 153, 34, 0.15); color: var(--orange); border: 1px solid var(--orange); }
+  .badge-dry-run { background: rgba(188, 140, 255, 0.15); color: var(--purple); border: 1px solid var(--purple); }
+  .badge-phase { background: rgba(88, 166, 255, 0.15); color: var(--blue); border: 1px solid var(--blue); }
+
+  .score-bar {
+    display: inline-block;
+    height: 8px;
+    border-radius: 4px;
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+
+  .score-bar-bg {
+    width: 100px;
+    background: var(--bg-primary);
+    display: inline-block;
+    height: 8px;
+    border-radius: 4px;
+    position: relative;
+    vertical-align: middle;
+  }
+
+  .score-bar-fill {
+    position: absolute;
+    height: 8px;
+    border-radius: 4px;
+    left: 0;
+    top: 0;
+  }
+
+  .breakdown-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 6px;
+    margin-top: 6px;
+  }
+
+  .breakdown-item {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    padding: 4px 8px;
+    background: var(--bg-primary);
+    border-radius: 4px;
+  }
+
+  .breakdown-item .score { color: var(--text-primary); font-weight: 600; }
+
+  .log-entry {
+    padding: 6px 10px;
+    margin-bottom: 4px;
+    border-left: 3px solid var(--border);
+    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+    font-size: 0.78rem;
+    color: var(--text-secondary);
+    background: var(--bg-primary);
+    border-radius: 0 4px 4px 0;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+
+  .log-entry.error { border-left-color: var(--red); }
+  .log-entry.warning { border-left-color: var(--yellow); }
+  .log-entry.info { border-left-color: var(--blue); }
+
+  .footer {
+    text-align: center;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-top: 20px;
+    padding: 12px 0;
+    border-top: 1px solid var(--border);
+  }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <div class="header-left">
+    <h1>Phase 0: Portfolio Cleanup Report</h1>
+    <div class="subtitle">
+      {{ date }}
+      <span class="badge badge-phase">Phase 0</span>
+      {% if dry_run %}<span class="badge badge-dry-run">Dry Run</span>{% endif %}
+    </div>
+  </div>
+  <div class="header-right">
+    <div class="stat-box">
+      <div class="label">Equity</div>
+      <div class="value">{{ account_equity_gbp | fmt_money }}</div>
+    </div>
+    <div class="stat-box">
+      <div class="label">Positions</div>
+      <div class="value">{{ portfolio | length }}</div>
+    </div>
+    <div class="stat-box">
+      <div class="label">Unrealised P&amp;L</div>
+      <div class="value {% if total_unrealised_pnl >= 0 %}positive{% else %}negative{% endif %}">
+        {{ total_unrealised_pnl | fmt_pnl }}
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- IB Portfolio Snapshot -->
+<section>
+  <h2>Current Portfolio (IB)</h2>
+  {% if portfolio %}
+  <table>
+    <thead>
+      <tr>
+        <th>Ticker</th>
+        <th>Exchange</th>
+        <th>Currency</th>
+        <th>Qty</th>
+        <th>Avg Cost</th>
+        <th>Market Price</th>
+        <th>Market Value</th>
+        <th>Unrealised P&amp;L</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for p in portfolio %}
+      <tr>
+        <td><strong>{{ p.ticker }}</strong></td>
+        <td>{{ p.exchange }}</td>
+        <td>{{ p.currency }}</td>
+        <td>{{ p.quantity }}</td>
+        <td>{{ "%.4f" | format(p.avg_cost) }}</td>
+        <td>{{ "%.4f" | format(p.market_price) }}</td>
+        <td>{{ "%.2f" | format(p.market_value) }}</td>
+        <td class="{% if p.unrealized_pnl >= 0 %}positive{% else %}negative{% endif %}">
+          {{ p.unrealized_pnl | fmt_pnl }}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p style="color: var(--text-muted);">No positions found.</p>
+  {% endif %}
+</section>
+
+<!-- Phase 0 Assessments -->
+<section>
+  <h2>Position Assessments</h2>
+  {% if assessments %}
+  <table>
+    <thead>
+      <tr>
+        <th>Ticker</th>
+        <th>Exchange</th>
+        <th>Value (GBP)</th>
+        <th>Score</th>
+        <th>Action</th>
+        <th>Breakdown</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for a in assessments %}
+      <tr>
+        <td><strong>{{ a.ticker }}</strong></td>
+        <td>{{ a.exchange }}</td>
+        <td>{{ a.current_value_gbp | fmt_money }}</td>
+        <td>
+          <span class="score-bar-bg">
+            <span class="score-bar-fill"
+                  style="width: {{ a.score }}%;
+                         background: {% if a.score >= 60 %}var(--green){% elif a.score >= 30 %}var(--red){% else %}var(--orange){% endif %};">
+            </span>
+          </span>
+          {{ a.score }}/100
+        </td>
+        <td>
+          <span class="badge {% if a.classification == 'HOLD' %}badge-hold{% elif a.classification == 'SELL' %}badge-sell{% else %}badge-urgent{% endif %}">
+            {{ a.classification }}
+          </span>
+        </td>
+        <td>
+          <div class="breakdown-grid">
+            {% if a.scores_breakdown %}
+            {% for key, val in a.scores_breakdown.items() %}
+            <div class="breakdown-item">{{ key }}: <span class="score">{{ val }}</span></div>
+            {% endfor %}
+            {% endif %}
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p style="color: var(--text-muted);">No assessments recorded.</p>
+  {% endif %}
+</section>
+
+<!-- Assessment Details -->
+{% if assessments %}
+<section>
+  <h2>Assessment Reasoning</h2>
+  {% for a in assessments %}
+  <div style="margin-bottom: 12px; padding: 10px; background: var(--bg-tertiary); border-radius: 6px; border-left: 3px solid {% if a.classification == 'HOLD' %}var(--green){% elif a.classification == 'SELL' %}var(--red){% else %}var(--orange){% endif %};">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+      <strong>{{ a.ticker }}</strong>
+      <span class="badge {% if a.classification == 'HOLD' %}badge-hold{% elif a.classification == 'SELL' %}badge-sell{% else %}badge-urgent{% endif %}">
+        {{ a.classification }} ({{ a.score }})
+      </span>
+    </div>
+    <div style="font-size: 0.82rem; color: var(--text-secondary);">{{ a.reasoning }}</div>
+    {% if a.recommended_action %}
+    <div style="font-size: 0.8rem; color: var(--blue); margin-top: 4px;">Action: {{ a.recommended_action }}</div>
+    {% endif %}
+    {% if a.trailing_stop_price %}
+    <div style="font-size: 0.8rem; color: var(--yellow); margin-top: 2px;">Trailing stop: {{ "%.4f" | format(a.trailing_stop_price) }}</div>
+    {% endif %}
+  </div>
+  {% endfor %}
+</section>
+{% endif %}
+
+<!-- Summary Statistics -->
+<section>
+  <h2>Summary</h2>
+  <div class="metrics-grid">
+    <div class="metric-card">
+      <div class="label">Total Positions</div>
+      <div class="value">{{ assessments | length }}</div>
+    </div>
+    <div class="metric-card">
+      <div class="label">Hold</div>
+      <div class="value positive">{{ hold_count }}</div>
+    </div>
+    <div class="metric-card">
+      <div class="label">Sell</div>
+      <div class="value negative">{{ sell_count }}</div>
+    </div>
+    <div class="metric-card">
+      <div class="label">Urgent Sell</div>
+      <div class="value" style="color: var(--orange);">{{ urgent_count }}</div>
+    </div>
+    <div class="metric-card">
+      <div class="label">Avg Score</div>
+      <div class="value">{{ "%.0f" | format(avg_score) }}</div>
+    </div>
+    <div class="metric-card">
+      <div class="label">Mode</div>
+      <div class="value" style="font-size: 0.9rem;">{% if dry_run %}Dry Run{% else %}Live{% endif %}</div>
+    </div>
+  </div>
+</section>
+
+<!-- Log Highlights -->
+{% if log_highlights %}
+<section>
+  <h2>Log Highlights</h2>
+  {% for entry in log_highlights %}
+  <div class="log-entry {{ entry.level }}">{{ entry.text }}</div>
+  {% endfor %}
+</section>
+{% endif %}
+
+<div class="footer">
+  Generated {{ generated_at }} | Trading Bot Phase 0 Report
+</div>
+
+</body>
+</html>

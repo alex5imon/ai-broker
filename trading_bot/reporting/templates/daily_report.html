@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Daily Trading Report - {{ date }}</title>
+<style>
+  :root {
+    --bg-primary: #0d1117;
+    --bg-secondary: #161b22;
+    --bg-tertiary: #21262d;
+    --border: #30363d;
+    --text-primary: #e6edf3;
+    --text-secondary: #8b949e;
+    --text-muted: #6e7681;
+    --green: #3fb950;
+    --green-bg: rgba(63, 185, 80, 0.1);
+    --red: #f85149;
+    --red-bg: rgba(248, 81, 73, 0.1);
+    --blue: #58a6ff;
+    --yellow: #d29922;
+    --purple: #bc8cff;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    line-height: 1.5;
+    padding: 20px;
+    max-width: 1200px;
+    margin: 0 auto;
+  }
+
+  h1, h2, h3 { font-weight: 600; }
+  h1 { font-size: 1.5rem; margin-bottom: 4px; }
+  h2 { font-size: 1.15rem; margin-bottom: 12px; color: var(--blue); border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 0.95rem; margin-bottom: 8px; color: var(--text-secondary); }
+
+  .header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 12px;
+    padding: 16px 20px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 20px;
+  }
+
+  .header-left h1 { color: var(--text-primary); }
+  .header-left .subtitle { color: var(--text-secondary); font-size: 0.85rem; }
+
+  .header-right {
+    text-align: right;
+    display: flex;
+    gap: 20px;
+  }
+
+  .stat-box {
+    text-align: center;
+    padding: 8px 16px;
+    background: var(--bg-tertiary);
+    border-radius: 6px;
+    min-width: 110px;
+  }
+
+  .stat-box .label { font-size: 0.7rem; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.5px; }
+  .stat-box .value { font-size: 1.3rem; font-weight: 700; margin-top: 2px; }
+
+  .positive { color: var(--green); }
+  .negative { color: var(--red); }
+  .neutral { color: var(--text-secondary); }
+
+  section {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin-bottom: 16px;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+  }
+
+  th, td {
+    padding: 8px 10px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+
+  th {
+    color: var(--text-secondary);
+    font-weight: 600;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    background: var(--bg-tertiary);
+    position: sticky;
+    top: 0;
+  }
+
+  td { color: var(--text-primary); }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: var(--bg-tertiary); }
+
+  .metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 10px;
+  }
+
+  .metric-card {
+    padding: 10px 14px;
+    background: var(--bg-tertiary);
+    border-radius: 6px;
+    border: 1px solid var(--border);
+  }
+
+  .metric-card .label { font-size: 0.7rem; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.3px; }
+  .metric-card .value { font-size: 1.1rem; font-weight: 600; margin-top: 2px; }
+
+  .two-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+
+  @media (max-width: 768px) {
+    .two-col { grid-template-columns: 1fr; }
+    .header { flex-direction: column; }
+    .header-right { flex-wrap: wrap; }
+  }
+
+  .bar-chart { margin-top: 8px; }
+
+  .bar-row {
+    display: flex;
+    align-items: center;
+    margin-bottom: 4px;
+    font-size: 0.8rem;
+  }
+
+  .bar-label {
+    width: 60px;
+    text-align: right;
+    padding-right: 8px;
+    color: var(--text-secondary);
+    flex-shrink: 0;
+  }
+
+  .bar-container {
+    flex: 1;
+    height: 20px;
+    background: var(--bg-primary);
+    border-radius: 3px;
+    overflow: hidden;
+    position: relative;
+  }
+
+  .bar-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.3s ease;
+    min-width: 2px;
+  }
+
+  .bar-fill.positive-bar { background: var(--green); }
+  .bar-fill.negative-bar { background: var(--red); }
+
+  .bar-value {
+    width: 70px;
+    padding-left: 8px;
+    font-size: 0.8rem;
+    font-weight: 500;
+  }
+
+  .chart-container {
+    width: 100%;
+    overflow-x: auto;
+    margin-top: 8px;
+  }
+
+  .chart-container svg {
+    width: 100%;
+    height: 200px;
+  }
+
+  .progress-bar {
+    height: 8px;
+    background: var(--bg-primary);
+    border-radius: 4px;
+    overflow: hidden;
+    margin: 6px 0;
+  }
+
+  .progress-fill {
+    height: 100%;
+    background: var(--blue);
+    border-radius: 4px;
+    transition: width 0.3s ease;
+  }
+
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+
+  .badge-phase { background: rgba(88, 166, 255, 0.15); color: var(--blue); }
+  .badge-win { background: var(--green-bg); color: var(--green); }
+  .badge-loss { background: var(--red-bg); color: var(--red); }
+
+  .footer {
+    text-align: center;
+    padding: 12px;
+    color: var(--text-muted);
+    font-size: 0.75rem;
+  }
+
+  .table-scroll {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .no-data {
+    text-align: center;
+    padding: 30px;
+    color: var(--text-muted);
+    font-style: italic;
+  }
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<div class="header">
+  <div class="header-left">
+    <h1>Daily Trading Report</h1>
+    <div class="subtitle">{{ date }} &middot; <span class="badge badge-phase">{{ phase_name }}</span></div>
+  </div>
+  <div class="header-right">
+    <div class="stat-box">
+      <div class="label">Equity</div>
+      <div class="value">&pound;{{ "%.2f"|format(account_equity_gbp) }}</div>
+    </div>
+    <div class="stat-box">
+      <div class="label">Daily P&amp;L</div>
+      <div class="value {% if metrics.net_pnl_gbp > 0 %}positive{% elif metrics.net_pnl_gbp < 0 %}negative{% else %}neutral{% endif %}">
+        {{ metrics.net_pnl_gbp|fmt_pnl }}
+      </div>
+    </div>
+    <div class="stat-box">
+      <div class="label">Trades</div>
+      <div class="value">{{ metrics.total_trades }}</div>
+    </div>
+    <div class="stat-box">
+      <div class="label">Win Rate</div>
+      <div class="value {% if metrics.win_rate >= 0.5 %}positive{% elif metrics.win_rate < 0.4 %}negative{% else %}neutral{% endif %}">
+        {{ metrics.win_rate|fmt_pct }}
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- SUMMARY METRICS -->
+<section>
+  <h2>Performance Summary</h2>
+  <div class="metrics-grid">
+    <div class="metric-card">
+      <div class="label">Gross P&amp;L</div>
+      <div class="value {% if metrics.gross_pnl_gbp >= 0 %}positive{% else %}negative{% endif %}">
+        &pound;{{ metrics.gross_pnl_gbp|fmt_pnl }}
+      </div>
+    </div>
+    <div class="metric-card">
+      <div class="label">Commissions</div>
+      <div class="value negative">&pound;{{ "%.2f"|format(metrics.commissions_gbp) }}</div>
+    </div>
+    <div class="metric-card">
+      <div class="label">Net P&amp;L</div>
+      <div class="value {% if metrics.net_pnl_gbp >= 0 %}positive{% else %}negative{% endif %}">
+        &pound;{{ metrics.net_pnl_gbp|fmt_pnl }}
+      </div>
+    </div>
+    <div class="metric-card">
+      <div class="label">Wins / Losses</div>
+      <div class="value"><span class="positive">{{ metrics.wins }}</span> / <span class="negative">{{ metrics.losses }}</span></div>
+    </div>
+    <div class="metric-card">
+      <div class="label">Avg Win</div>
+      <div class="value positive">&pound;{{ "%.2f"|format(metrics.avg_win) }}</div>
+    </div>
+    <div class="metric-card">
+      <div class="label">Avg Loss</div>
+      <div class="value negative">&pound;{{ "%.2f"|format(metrics.avg_loss) }}</div>
+    </div>
+    <div class="metric-card">
+      <div class="label">Profit Factor</div>
+      <div class="value {% if metrics.profit_factor >= 1.5 %}positive{% elif metrics.profit_factor < 1.0 %}negative{% else %}neutral{% endif %}">
+        {{ "%.2f"|format(metrics.profit_factor) }}
+      </div>
+    </div>
+    <div class="metric-card">
+      <div class="label">Expectancy</div>
+      <div class="value {% if metrics.expectancy >= 0 %}positive{% else %}negative{% endif %}">
+        &pound;{{ "%.2f"|format(metrics.expectancy) }}
+      </div>
+    </div>
+    <div class="metric-card">
+      <div class="label">Largest Win</div>
+      <div class="value positive">&pound;{{ "%.2f"|format(metrics.largest_win_gbp) }}</div>
+    </div>
+    <div class="metric-card">
+      <div class="label">Largest Loss</div>
+      <div class="value negative">&pound;{{ "%.2f"|format(metrics.largest_loss_gbp) }}</div>
+    </div>
+    <div class="metric-card">
+      <div class="label">Max Drawdown</div>
+      <div class="value negative">{{ metrics.max_drawdown_pct|fmt_pct }}</div>
+    </div>
+    <div class="metric-card">
+      <div class="label">Commission Ratio</div>
+      <div class="value {% if metrics.commission_ratio > 0.2 %}negative{% elif metrics.commission_ratio > 0.1 %}neutral{% else %}positive{% endif %}">
+        {{ metrics.commission_ratio|fmt_pct }}
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- MARKET BREAKDOWN -->
+<section>
+  <h2>Market Breakdown</h2>
+  <div class="two-col">
+    <div class="metric-card">
+      <div class="label">LSE Trades</div>
+      <div class="value">{{ metrics.lse_trades }}</div>
+    </div>
+    <div class="metric-card">
+      <div class="label">US Trades</div>
+      <div class="value">{{ metrics.us_trades }}</div>
+    </div>
+  </div>
+</section>
+
+<!-- PER-TRADE DETAIL -->
+<section>
+  <h2>Trade Details</h2>
+  {% if metrics.trades %}
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr>
+          <th>Ticker</th>
+          <th>Exchange</th>
+          <th>Side</th>
+          <th>Entry Time</th>
+          <th>Entry Price</th>
+          <th>Exit Time</th>
+          <th>Exit Price</th>
+          <th>Qty</th>
+          <th>Hold Type</th>
+          <th>Gross P&amp;L</th>
+          <th>Commission</th>
+          <th>Net P&amp;L (GBP)</th>
+          <th>Exit Reason</th>
+          <th>Signals</th>
+          <th>Sentiment</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for t in metrics.trades %}
+        <tr>
+          <td><strong>{{ t.ticker }}</strong></td>
+          <td>{{ t.exchange }}</td>
+          <td>{{ t.side }}</td>
+          <td>{{ t.entry_time|fmt_time }}</td>
+          <td>{{ "%.4f"|format(t.entry_price) }}</td>
+          <td>{{ t.exit_time|fmt_time }}</td>
+          <td>{{ "%.4f"|format(t.exit_price) if t.exit_price else "N/A" }}</td>
+          <td>{{ t.quantity }}</td>
+          <td>{{ t.hold_type }}</td>
+          <td class="{% if (t.gross_pnl or 0) >= 0 %}positive{% else %}negative{% endif %}">
+            {{ "%.2f"|format(t.gross_pnl or 0) }}
+          </td>
+          <td>{{ "%.2f"|format(t.commission or 0) }}</td>
+          <td class="{% if (t.pnl_gbp or 0) >= 0 %}positive{% else %}negative{% endif %}">
+            <strong>&pound;{{ "%.2f"|format(t.pnl_gbp or 0) }}</strong>
+          </td>
+          <td><span class="badge {% if t.exit_reason in ['take_profit', 'trailing_stop'] %}badge-win{% elif t.exit_reason == 'stop_loss' %}badge-loss{% endif %}">{{ t.exit_reason or "open" }}</span></td>
+          <td>{{ t.signals or "-" }}</td>
+          <td>{{ "%.2f"|format(t.sentiment_score) if t.sentiment_score is not none else "-" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="no-data">No trades closed today.</div>
+  {% endif %}
+</section>
+
+<!-- P&L BY TICKER -->
+{% if ticker_stats %}
+<section>
+  <h2>P&amp;L by Ticker</h2>
+  <div class="bar-chart">
+    {% set max_abs_pnl = namespace(val=0.01) %}
+    {% for ts in ticker_stats %}
+      {% if ts.net_pnl_gbp|abs > max_abs_pnl.val %}
+        {% set max_abs_pnl.val = ts.net_pnl_gbp|abs %}
+      {% endif %}
+    {% endfor %}
+    {% for ts in ticker_stats %}
+    <div class="bar-row">
+      <div class="bar-label">{{ ts.ticker }}</div>
+      <div class="bar-container">
+        {% set width_pct = (ts.net_pnl_gbp|abs / max_abs_pnl.val * 100) if max_abs_pnl.val > 0 else 0 %}
+        <div class="bar-fill {% if ts.net_pnl_gbp >= 0 %}positive-bar{% else %}negative-bar{% endif %}"
+             style="width: {{ "%.1f"|format(width_pct) }}%"></div>
+      </div>
+      <div class="bar-value {% if ts.net_pnl_gbp >= 0 %}positive{% else %}negative{% endif %}">
+        &pound;{{ ts.net_pnl_gbp|fmt_pnl }}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+<!-- EQUITY CURVE -->
+{% if equity_curve and equity_curve|length > 1 %}
+<section>
+  <h2>Equity Curve (Last {{ equity_curve|length }} Days)</h2>
+  <div class="chart-container">
+    {% set eq_values = equity_curve|map(attribute='account_equity_gbp')|list %}
+    {% set min_eq = eq_values|min %}
+    {% set max_eq = eq_values|max %}
+    {% set eq_range = max_eq - min_eq if max_eq != min_eq else 1 %}
+    {% set chart_w = 1100 %}
+    {% set chart_h = 180 %}
+    {% set pad_top = 10 %}
+    {% set pad_bottom = 30 %}
+    {% set pad_left = 60 %}
+    {% set pad_right = 10 %}
+    {% set plot_w = chart_w - pad_left - pad_right %}
+    {% set plot_h = chart_h - pad_top - pad_bottom %}
+    {% set n_points = equity_curve|length %}
+    {% set x_step = plot_w / (n_points - 1) if n_points > 1 else plot_w %}
+
+    <svg viewBox="0 0 {{ chart_w }} {{ chart_h }}" xmlns="http://www.w3.org/2000/svg">
+      <!-- Grid lines -->
+      <line x1="{{ pad_left }}" y1="{{ pad_top }}" x2="{{ pad_left }}" y2="{{ chart_h - pad_bottom }}"
+            stroke="#30363d" stroke-width="1"/>
+      <line x1="{{ pad_left }}" y1="{{ chart_h - pad_bottom }}" x2="{{ chart_w - pad_right }}" y2="{{ chart_h - pad_bottom }}"
+            stroke="#30363d" stroke-width="1"/>
+
+      <!-- Y-axis labels -->
+      <text x="{{ pad_left - 5 }}" y="{{ pad_top + 4 }}" fill="#8b949e" font-size="10" text-anchor="end">
+        &pound;{{ "%.0f"|format(max_eq) }}
+      </text>
+      <text x="{{ pad_left - 5 }}" y="{{ chart_h - pad_bottom + 4 }}" fill="#8b949e" font-size="10" text-anchor="end">
+        &pound;{{ "%.0f"|format(min_eq) }}
+      </text>
+      {% set mid_eq = (min_eq + max_eq) / 2 %}
+      <text x="{{ pad_left - 5 }}" y="{{ pad_top + plot_h / 2 + 4 }}" fill="#8b949e" font-size="10" text-anchor="end">
+        &pound;{{ "%.0f"|format(mid_eq) }}
+      </text>
+      <line x1="{{ pad_left }}" y1="{{ pad_top + plot_h / 2 }}" x2="{{ chart_w - pad_right }}" y2="{{ pad_top + plot_h / 2 }}"
+            stroke="#21262d" stroke-width="1" stroke-dasharray="4,4"/>
+
+      <!-- Equity line -->
+      <polyline fill="none" stroke="#58a6ff" stroke-width="2" stroke-linejoin="round"
+        points="{% for ec in equity_curve %}{% set x = pad_left + loop.index0 * x_step %}{% set y = pad_top + plot_h - ((ec.account_equity_gbp - min_eq) / eq_range * plot_h) %}{{ "%.1f"|format(x) }},{{ "%.1f"|format(y) }}{% if not loop.last %} {% endif %}{% endfor %}"/>
+
+      <!-- Area fill -->
+      <polygon fill="rgba(88, 166, 255, 0.08)"
+        points="{{ pad_left }},{{ chart_h - pad_bottom }} {% for ec in equity_curve %}{% set x = pad_left + loop.index0 * x_step %}{% set y = pad_top + plot_h - ((ec.account_equity_gbp - min_eq) / eq_range * plot_h) %}{{ "%.1f"|format(x) }},{{ "%.1f"|format(y) }} {% endfor %}{{ "%.1f"|format(pad_left + (n_points - 1) * x_step) }},{{ chart_h - pad_bottom }}"/>
+
+      <!-- Data points -->
+      {% for ec in equity_curve %}
+        {% set x = pad_left + loop.index0 * x_step %}
+        {% set y = pad_top + plot_h - ((ec.account_equity_gbp - min_eq) / eq_range * plot_h) %}
+        <circle cx="{{ "%.1f"|format(x) }}" cy="{{ "%.1f"|format(y) }}" r="3" fill="#58a6ff" stroke="#0d1117" stroke-width="1"/>
+      {% endfor %}
+
+      <!-- X-axis date labels -->
+      {% set label_step = (n_points / 5)|int if n_points > 5 else 1 %}
+      {% for ec in equity_curve %}
+        {% if loop.index0 % label_step == 0 or loop.last %}
+          {% set x = pad_left + loop.index0 * x_step %}
+          <text x="{{ "%.1f"|format(x) }}" y="{{ chart_h - 5 }}" fill="#6e7681" font-size="9" text-anchor="middle">
+            {{ ec.date[5:] }}
+          </text>
+        {% endif %}
+      {% endfor %}
+    </svg>
+  </div>
+</section>
+{% endif %}
+
+<!-- PHASE PROGRESS -->
+<section>
+  <h2>Phase Progress</h2>
+  {% if phase_progress.at_max_phase %}
+    <div class="metric-card" style="text-align: center;">
+      <div class="value positive">Maximum phase reached</div>
+    </div>
+  {% else %}
+  <div class="metrics-grid">
+    <div class="metric-card">
+      <div class="label">Current Phase</div>
+      <div class="value">{{ phase_progress.current_phase }}</div>
+    </div>
+    <div class="metric-card">
+      <div class="label">Target Phase</div>
+      <div class="value">{{ phase_progress.next_phase }}</div>
+    </div>
+    <div class="metric-card">
+      <div class="label">Equity Target</div>
+      <div class="value">&pound;{{ "%.0f"|format(phase_progress.equity_target or 0) }}</div>
+    </div>
+    <div class="metric-card">
+      <div class="label">Sharpe Ratio</div>
+      <div class="value {% if sharpe_ratio >= 1.0 %}positive{% elif sharpe_ratio < 0 %}negative{% else %}neutral{% endif %}">
+        {{ "%.2f"|format(sharpe_ratio) }}
+      </div>
+    </div>
+  </div>
+
+  <div style="margin-top: 12px;">
+    <h3>Equity Progress ({{ "%.1f"|format(phase_progress.equity_progress_pct) }}%)</h3>
+    <div class="progress-bar">
+      <div class="progress-fill" style="width: {{ "%.1f"|format(phase_progress.equity_progress_pct) }}%"></div>
+    </div>
+  </div>
+
+  <div style="margin-top: 8px;">
+    <h3>Trading Days: {{ phase_progress.trading_days }} / {{ phase_progress.trading_days_target }} ({{ "%.1f"|format(phase_progress.trading_days_progress_pct) }}%)</h3>
+    <div class="progress-bar">
+      <div class="progress-fill" style="width: {{ "%.1f"|format(phase_progress.trading_days_progress_pct) }}%"></div>
+    </div>
+  </div>
+
+  {% if phase_progress.estimated_days_remaining is not none %}
+  <div style="margin-top: 8px;">
+    <h3>Estimated Days to Next Phase: {{ phase_progress.estimated_days_remaining }}
+      (avg daily P&amp;L: &pound;{{ "%.2f"|format(phase_progress.avg_daily_pnl_gbp) }})</h3>
+  </div>
+  {% endif %}
+
+  <div style="margin-top: 8px;">
+    <h3>Recent Win Rate (last 20 trades): {{ phase_progress.recent_win_rate|fmt_pct }}</h3>
+  </div>
+  {% endif %}
+</section>
+
+<!-- SETTLEMENTS -->
+{% if settlements %}
+<section>
+  <h2>Pending Settlements</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Ticker</th>
+        <th>Amount</th>
+        <th>Currency</th>
+        <th>Amount (GBP)</th>
+        <th>Sell Date</th>
+        <th>Settle Date</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for s in settlements %}
+      <tr>
+        <td>{{ s.ticker }}</td>
+        <td>{{ "%.2f"|format(s.amount) }}</td>
+        <td>{{ s.currency }}</td>
+        <td>&pound;{{ "%.2f"|format(s.amount_gbp) }}</td>
+        <td>{{ s.sell_date }}</td>
+        <td>{{ s.settle_date }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
+<!-- OPEN POSITIONS -->
+{% if open_positions %}
+<section>
+  <h2>Open Positions (Overnight)</h2>
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr>
+          <th>Ticker</th>
+          <th>Exchange</th>
+          <th>Qty</th>
+          <th>Entry Price</th>
+          <th>Entry Time</th>
+          <th>Stop</th>
+          <th>Target</th>
+          <th>Status</th>
+          <th>Hold Type</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in open_positions %}
+        <tr>
+          <td><strong>{{ p.ticker }}</strong></td>
+          <td>{{ p.exchange }}</td>
+          <td>{{ p.quantity }}</td>
+          <td>{{ "%.4f"|format(p.entry_price) }}</td>
+          <td>{{ p.entry_time|fmt_time }}</td>
+          <td>{{ "%.4f"|format(p.stop_price) if p.stop_price else "-" }}</td>
+          <td>{{ "%.4f"|format(p.target_price) if p.target_price else "-" }}</td>
+          <td>{{ p.status }}</td>
+          <td>{{ p.hold_type }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+
+<div class="footer">
+  Generated {{ generated_at }} &middot; Adaptive Multi-Market Trading Bot v4.0
+</div>
+
+</body>
+</html>
