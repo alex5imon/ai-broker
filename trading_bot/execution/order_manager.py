@@ -2,16 +2,21 @@
 
 Handles entry limit orders, stop-loss, take-profit, trailing stops,
 partial fills, timeouts, and emergency flattening.
+
+In the tick model (Phase 3) entry timeouts are evaluated on each tick by
+comparing ``order.submitted_at`` against ``entry_timeout_seconds``; the
+old ``asyncio.create_task`` per-order timer is gone because it cannot
+survive a stateless cron run.  ``_active_orders`` is hydrated from the
+``positions`` table at the start of ``_check_order_statuses``.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import sqlite3
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
@@ -101,7 +106,6 @@ class _ActiveOrder:
     target_price: float = 0.0
     hold_type: str = "intraday"
     strategy_id: str | None = None
-    timeout_task: asyncio.Task[None] | None = None
     trail_pct: float | None = None
     trail_activation_price: float | None = None
     trail_activated: bool = False
@@ -133,29 +137,88 @@ class OrderManager:
         self._active_orders: dict[int, _ActiveOrder] = {}
         self._alpaca_to_trade: dict[str, int] = {}
 
-        # Start order polling task
-        self._poll_task: asyncio.Task[None] | None = None
+    # ------------------------------------------------------------------
+    # Tick-model hydration + status check
+    # ------------------------------------------------------------------
 
-    async def start_order_polling(self) -> None:
-        """Start background task to poll order status from Alpaca."""
-        if self._poll_task is not None:
-            return
-        self._poll_task = asyncio.create_task(
-            self._poll_orders_loop(), name="order-poller"
-        )
+    def _hydrate_active_orders(self) -> None:
+        """Rebuild ``_active_orders`` from the ``positions`` table.
 
-    async def _poll_orders_loop(self) -> None:
-        """Poll Alpaca for order status updates every 5 seconds."""
+        Each tick starts with an empty in-memory dict; we rehydrate from
+        the DB so ``_check_order_statuses`` and entry-timeout sweeps can
+        operate on the same set of positions the prior tick left open.
+        """
         try:
-            while True:
-                await asyncio.sleep(5.0)
-                await self._check_order_statuses()
-        except asyncio.CancelledError:
+            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM positions WHERE status != ?",
+                    (PositionStatus.CLOSED.value,),
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.OperationalError:
+            logger.warning("positions table not found during hydration")
             return
+
+        for row in rows:
+            trade_id = int(row["id"])
+            if trade_id in self._active_orders:
+                continue
+            status_str: str = str(row["status"])
+            try:
+                status: PositionStatus = PositionStatus(status_str)
+            except ValueError:
+                logger.debug("Skipping row with unknown status %s", status_str)
+                continue
+
+            active = _ActiveOrder(
+                trade_id=trade_id,
+                ticker=str(row["ticker"]),
+                exchange=str(row["exchange"]),
+                alpaca_entry_order_id=row["alpaca_order_id"],
+                alpaca_stop_order_id=row["alpaca_stop_order_id"],
+                alpaca_target_order_id=row["alpaca_target_order_id"],
+                alpaca_trail_order_id=row["alpaca_trail_order_id"],
+                status=status,
+                entry_shares=float(row["quantity"] or 0),
+                filled_shares=float(row["quantity"] or 0)
+                if status != PositionStatus.ENTRY_PENDING
+                else 0.0,
+                entry_price=float(row["entry_price"] or 0),
+                stop_price=float(row["stop_price"] or 0),
+                target_price=float(row["target_price"] or 0),
+                hold_type=str(row["hold_type"]),
+                strategy_id=row["strategy_id"],
+            )
+            self._active_orders[trade_id] = active
+            for oid in (
+                active.alpaca_entry_order_id,
+                active.alpaca_stop_order_id,
+                active.alpaca_target_order_id,
+                active.alpaca_trail_order_id,
+            ):
+                if oid is not None:
+                    self._alpaca_to_trade[str(oid)] = trade_id
 
     async def _check_order_statuses(self) -> None:
-        """Check status of all tracked orders via Alpaca API."""
+        """Check status of all tracked orders via Alpaca API.
+
+        Rehydrates ``_active_orders`` from the DB (tick model) and, for
+        each ENTRY_PENDING order, also enforces the configured entry
+        timeout using Alpaca's ``submitted_at`` timestamp.
+        """
+        self._hydrate_active_orders()
+
         client: TradingClient = self._gw.client
+        timeout_seconds: int = int(
+            self._config._get("entry", "entry_timeout_seconds", default=300)
+        )
+        min_fill_pct: float = float(
+            self._config._get("entry", "partial_fill_min_pct", default=0.50)
+        )
+        now: datetime = datetime.now(tz=ET)
 
         for trade_id, active in list(self._active_orders.items()):
             # Check entry order
@@ -175,9 +238,6 @@ class OrderManager:
                             active.ticker, active.filled_shares,
                             active.entry_price, trade_id,
                         )
-                        if active.timeout_task is not None:
-                            active.timeout_task.cancel()
-                            active.timeout_task = None
                         await self._transition_to_open(trade_id, active.filled_shares)
 
                     elif order.status.value in ("canceled", "expired", "rejected"):
@@ -191,6 +251,20 @@ class OrderManager:
 
                     elif order.status.value == "partially_filled":
                         active.filled_shares = float(order.filled_qty or 0)
+                        await self._maybe_timeout_entry(
+                            trade_id, active, order,
+                            now=now,
+                            timeout_seconds=timeout_seconds,
+                            min_fill_pct=min_fill_pct,
+                        )
+                    else:
+                        # Still open/accepted/new — check age-based timeout.
+                        await self._maybe_timeout_entry(
+                            trade_id, active, order,
+                            now=now,
+                            timeout_seconds=timeout_seconds,
+                            min_fill_pct=min_fill_pct,
+                        )
 
                 except Exception:
                     logger.warning(
@@ -297,15 +371,7 @@ class OrderManager:
             self._active_orders[trade_id] = active
             self._alpaca_to_trade[alpaca_order_id] = trade_id
 
-            self._update_position_field(trade_id, "ib_order_id", alpaca_order_id)
-
-            timeout_seconds: int = int(
-                self._config._get("entry", "entry_timeout_seconds", default=300)
-            )
-            active.timeout_task = asyncio.create_task(
-                self._entry_timeout(trade_id, alpaca_order_id, timeout_seconds),
-                name=f"entry-timeout-{trade_id}",
-            )
+            self._update_position_field(trade_id, "alpaca_order_id", alpaca_order_id)
 
             return trade_id
 
@@ -314,22 +380,34 @@ class OrderManager:
             self._update_position_status(trade_id, PositionStatus.CLOSED)
             return None
 
-    async def _entry_timeout(
-        self, trade_id: int, alpaca_order_id: str, timeout_seconds: int,
+    async def _maybe_timeout_entry(
+        self,
+        trade_id: int,
+        active: _ActiveOrder,
+        order: AlpacaOrder,
+        *,
+        now: datetime,
+        timeout_seconds: int,
+        min_fill_pct: float,
     ) -> None:
-        """Cancel the entry if not filled within the timeout."""
-        try:
-            await asyncio.sleep(timeout_seconds)
-        except asyncio.CancelledError:
+        """Cancel a stale ENTRY_PENDING order if it has exceeded timeout.
+
+        Age is computed from Alpaca's ``submitted_at`` so the check is
+        idempotent across ticks.  A partial fill above ``min_fill_pct``
+        is accepted; anything less is cancelled (and any partial fill
+        emergency-flattened).
+        """
+        submitted_at: datetime | None = getattr(order, "submitted_at", None)
+        if submitted_at is None:
+            return
+        if submitted_at.tzinfo is None:
+            submitted_at = submitted_at.replace(tzinfo=ET)
+
+        age: timedelta = now - submitted_at
+        if age.total_seconds() < timeout_seconds:
             return
 
-        active: _ActiveOrder | None = self._active_orders.get(trade_id)
-        if active is None or active.status != PositionStatus.ENTRY_PENDING:
-            return
-
-        min_fill_pct: float = float(
-            self._config._get("entry", "partial_fill_min_pct", default=0.50)
-        )
+        alpaca_order_id: str = str(order.id)
         min_fill_qty: float = max(0.001, active.entry_shares * min_fill_pct)
 
         if active.filled_shares >= min_fill_qty:
@@ -341,13 +419,16 @@ class OrderManager:
             await self._transition_to_open(trade_id, active.filled_shares)
         else:
             logger.info(
-                "Entry timeout: cancelling %s (filled %.4f/%.4f, trade_id=%d)",
-                active.ticker, active.filled_shares, active.entry_shares, trade_id,
+                "Entry timeout: cancelling %s (filled %.4f/%.4f, age=%.0fs, trade_id=%d)",
+                active.ticker, active.filled_shares, active.entry_shares,
+                age.total_seconds(), trade_id,
             )
             await self.cancel_order(alpaca_order_id)
 
             if active.filled_shares > 0:
-                await self.emergency_flatten(active.ticker, active.filled_shares, active.exchange)
+                await self.emergency_flatten(
+                    active.ticker, active.filled_shares, active.exchange,
+                )
 
             self._update_position_status(trade_id, PositionStatus.CLOSED)
             active.status = PositionStatus.CLOSED
@@ -387,7 +468,7 @@ class OrderManager:
             if active is not None:
                 active.alpaca_trail_order_id = order_id
             self._alpaca_to_trade[order_id] = trade_id
-            self._update_position_field(trade_id, "ib_trail_order_id", order_id)
+            self._update_position_field(trade_id, "alpaca_trail_order_id", order_id)
             self._update_position_field(trade_id, "trailing_active", 1)
             self._update_position_field(trade_id, "trailing_distance", trail_pct)
             return order_id
@@ -723,10 +804,10 @@ class OrderManager:
     def _update_position_field(self, trade_id: int, field_name: str, value: Any) -> None:
         now_str: str = datetime.now(tz=ET).isoformat()
         allowed_fields: frozenset[str] = frozenset({
-            "status", "ib_order_id", "ib_stop_order_id", "ib_target_order_id",
-            "ib_trail_order_id", "oca_group", "quantity", "entry_price",
-            "stop_price", "target_price", "trailing_active", "trailing_distance",
-            "highest_price",
+            "status", "alpaca_order_id", "alpaca_stop_order_id",
+            "alpaca_target_order_id", "alpaca_trail_order_id", "oca_group",
+            "quantity", "entry_price", "stop_price", "target_price",
+            "trailing_active", "trailing_distance", "highest_price",
         })
         if field_name not in allowed_fields:
             logger.error("Attempted to update disallowed field: %s", field_name)

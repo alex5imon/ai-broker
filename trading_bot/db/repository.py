@@ -164,14 +164,14 @@ def save_position(conn: sqlite3.Connection, position: dict[str, Any]) -> int:
             ticker, exchange, currency, sector, quantity, entry_price,
             entry_time, status, stop_price, target_price,
             trailing_active, trailing_distance, hold_type, phase,
-            ib_order_id, ib_stop_order_id, ib_target_order_id,
-            ib_trail_order_id, oca_group, highest_price
+            alpaca_order_id, alpaca_stop_order_id, alpaca_target_order_id,
+            alpaca_trail_order_id, oca_group, highest_price
         ) VALUES (
             :ticker, :exchange, :currency, :sector, :quantity, :entry_price,
             :entry_time, :status, :stop_price, :target_price,
             :trailing_active, :trailing_distance, :hold_type, :phase,
-            :ib_order_id, :ib_stop_order_id, :ib_target_order_id,
-            :ib_trail_order_id, :oca_group, :highest_price
+            :alpaca_order_id, :alpaca_stop_order_id, :alpaca_target_order_id,
+            :alpaca_trail_order_id, :oca_group, :highest_price
         )
         """,
         {
@@ -189,10 +189,10 @@ def save_position(conn: sqlite3.Connection, position: dict[str, Any]) -> int:
             "trailing_distance": position.get("trailing_distance"),
             "hold_type": position["hold_type"],
             "phase": position["phase"],
-            "ib_order_id": position.get("ib_order_id"),
-            "ib_stop_order_id": position.get("ib_stop_order_id"),
-            "ib_target_order_id": position.get("ib_target_order_id"),
-            "ib_trail_order_id": position.get("ib_trail_order_id"),
+            "alpaca_order_id": position.get("alpaca_order_id"),
+            "alpaca_stop_order_id": position.get("alpaca_stop_order_id"),
+            "alpaca_target_order_id": position.get("alpaca_target_order_id"),
+            "alpaca_trail_order_id": position.get("alpaca_trail_order_id"),
             "oca_group": position.get("oca_group"),
             "highest_price": position.get("highest_price"),
         },
@@ -216,8 +216,8 @@ def update_position(conn: sqlite3.Connection, position_id: int, updates: dict[st
     # Build SET clause dynamically from the supplied keys
     allowed_columns: set[str] = {
         "status", "stop_price", "target_price", "trailing_active",
-        "trailing_distance", "ib_order_id", "ib_stop_order_id",
-        "ib_target_order_id", "ib_trail_order_id", "oca_group",
+        "trailing_distance", "alpaca_order_id", "alpaca_stop_order_id",
+        "alpaca_target_order_id", "alpaca_trail_order_id", "oca_group",
         "highest_price", "quantity",
     }
     set_parts: list[str] = []

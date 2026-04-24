@@ -761,14 +761,32 @@ class TradingBot:
                 current_price,
             )
 
-            # Spread check for non-emergency exits
+            # Spread check for non-emergency exits. Track first-defer time
+            # in tick_state; once the spread has been wide for longer than
+            # ``spread_max_delay_seconds``, force a market exit instead of
+            # deferring again.
+            force_market_exit: bool = False
             if not exit_decision.is_emergency:
                 if not self._exit_manager.check_spread_for_exit(ticker):
-                    logger.info(
-                        "%s: spread too wide for non-emergency exit — deferring",
-                        ticker,
+                    defer_resolved = self._resolve_spread_defer(
+                        ticker=ticker,
+                        now=now_et,
+                        max_delay_s=self._exit_manager.spread_max_delay_seconds,
                     )
-                    continue
+                    if not defer_resolved:
+                        logger.info(
+                            "%s: spread too wide for non-emergency exit — deferring",
+                            ticker,
+                        )
+                        continue
+                    logger.warning(
+                        "%s: spread-defer age exceeded %ds — forcing market exit",
+                        ticker,
+                        self._exit_manager.spread_max_delay_seconds,
+                    )
+                    force_market_exit = True
+                else:
+                    self._clear_spread_defer(ticker)
 
             qty: int = int(position.get("quantity", 0))
             if qty <= 0:
@@ -785,8 +803,9 @@ class TradingBot:
             # Cancel existing orders for this ticker first
             await self._order_manager.cancel_all_for_ticker(ticker)
 
-            if exit_decision.use_market_order:
+            if exit_decision.use_market_order or force_market_exit:
                 await self._order_manager.emergency_flatten(ticker, qty, exchange)
+                self._clear_spread_defer(ticker)
             else:
                 # Limit sell at mid-price
                 bid_ask = self._market_data.get_bid_ask(ticker)
@@ -818,6 +837,66 @@ class TradingBot:
                         "Limit exit failed for %s — falling back to market", ticker
                     )
                     await self._order_manager.emergency_flatten(ticker, qty, exchange)
+                else:
+                    self._clear_spread_defer(ticker)
+
+    # ------------------------------------------------------------------
+    # Spread defer tracking (per-ticker tick_state rows)
+    # ------------------------------------------------------------------
+
+    def _spread_defer_key(self, ticker: str) -> str:
+        return f"spread_defer:{ticker}"
+
+    def _resolve_spread_defer(
+        self, *, ticker: str, now: datetime, max_delay_s: int,
+    ) -> bool:
+        """Record/inspect spread-defer state for *ticker*.
+
+        Returns True iff the ticker has been deferred for longer than
+        ``max_delay_s`` and the caller should force a market exit; False
+        means the caller should defer this tick.
+        """
+        key: str = self._spread_defer_key(ticker)
+        now_iso: str = now.isoformat()
+        try:
+            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
+            try:
+                row = repo.load_tick_state(conn, key)
+                if row is None:
+                    repo.save_tick_state(conn, key, last_bar_ts=now_iso, state={})
+                    return False
+                first_iso: str | None = row.get("last_bar_ts")
+                if not first_iso:
+                    repo.save_tick_state(conn, key, last_bar_ts=now_iso, state={})
+                    return False
+                try:
+                    first_dt: datetime = datetime.fromisoformat(first_iso)
+                except ValueError:
+                    repo.save_tick_state(conn, key, last_bar_ts=now_iso, state={})
+                    return False
+                if first_dt.tzinfo is None:
+                    first_dt = first_dt.replace(tzinfo=_EASTERN)
+                return (now - first_dt).total_seconds() >= max_delay_s
+            finally:
+                conn.close()
+        except Exception:
+            logger.exception("spread-defer bookkeeping failed for %s", ticker)
+            return False
+
+    def _clear_spread_defer(self, ticker: str) -> None:
+        """Remove a spread-defer record after a successful exit."""
+        key: str = self._spread_defer_key(ticker)
+        try:
+            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
+            try:
+                conn.execute(
+                    "DELETE FROM tick_state WHERE strategy_id = ?", (key,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            logger.debug("clear spread-defer failed for %s", ticker, exc_info=True)
 
     # ------------------------------------------------------------------
     # Wind-down
