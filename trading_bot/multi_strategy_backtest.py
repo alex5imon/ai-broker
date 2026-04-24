@@ -618,6 +618,8 @@ class MultiStrategyBacktester:
             "stop_price": trade.stop_price,
             "highest_price": trade.highest_price,
             "target_price": trade.target_price,
+            "entry_time": trade.entry_time,
+            "hold_type": trade.hold_type,
         }
         exit_signal: ExitSignal = strategy.evaluate_exit(
             position=position_dict,

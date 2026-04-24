@@ -9,12 +9,14 @@ from trading_bot.strategy.strategies.mean_reversion import MeanReversionStrategy
 from trading_bot.strategy.strategies.trend_following import TrendFollowingStrategy
 from trading_bot.strategy.strategies.breakout import BreakoutStrategy
 from trading_bot.strategy.strategies.sentiment_combo import SentimentComboStrategy
+from trading_bot.strategy.strategies.overnight_drift import OvernightDriftStrategy
 
 STRATEGY_REGISTRY: dict[str, type[StrategyBase]] = {
     "mean_reversion": MeanReversionStrategy,
     "trend_following": TrendFollowingStrategy,
     "breakout": BreakoutStrategy,
     "sentiment_combo": SentimentComboStrategy,
+    "overnight_drift": OvernightDriftStrategy,
 }
 
 

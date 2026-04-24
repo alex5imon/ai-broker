@@ -500,6 +500,14 @@ multi_strategy:
       rv_low_threshold: 12.0
       rsi_oversold_high_vol: 25
       rsi_oversold_low_vol: 30
+      # Bollinger Band confirmation (backlog #4, enabled 2026-04-24).
+      # Require price to have touched the lower BB within the last 3 bars
+      # and closed back above it. Second independent mean-reversion signal
+      # complementing RSI — raises conviction, should lift PF.
+      require_bb_confirm: true
+      bb_period: 20
+      bb_std: 2.0
+      bb_lookback_bars: 3
 
     trend_following:
       enabled: true
@@ -525,7 +533,30 @@ multi_strategy:
       enabled: true
       allocation_usd: 1000.0
       max_positions: 2
-      sentiment_threshold: 0.15
+      # Entry filter tune 2026-04-24:
+      #   sentiment_threshold 0.15 -> 0.25 (raise conviction)
+      #   min_technical_signals 1 -> 2 (required confluence) — ROLLED BACK
+      #     back to 1 after 13-yr SPY backtest showed confluence filter was
+      #     too tight: 45 trades -> 2 trades, PF 1.05 -> 0.79. Threshold
+      #     bump retained; confluence filter reverted.
+      sentiment_threshold: 0.25
       min_technical_signals: 1
       stop_loss_pct: 0.015
       take_profit_pct: 0.025
+
+    # Overnight Drift (backlog #11, enabled 2026-04-24).
+    # Buy on the last 5-min bar of the session, sell on the first bar
+    # of the next session. Captures the historical overnight equity
+    # premium. 3% disaster stop caps gap-down tail risk.
+    overnight_drift:
+      enabled: true
+      allocation_usd: 1000.0
+      max_positions: 1
+      # Entry fires on the 15:45 5-min bar (covers 15:45-15:49:59 ET).
+      # Must fire BEFORE wind-down (15:50) because the backtester skips
+      # new entries once wind-down starts. This gives ~15 min before close.
+      entry_window_start: "15:40"
+      entry_window_end: "15:45"
+      stop_loss_pct: 0.03
+      position_pct: 0.95
+      fractional_shares: true
