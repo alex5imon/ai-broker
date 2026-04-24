@@ -1,0 +1,53 @@
+name: heartbeat
+
+# Watchdog: during NYSE hours, verify the bot workflow has run recently.
+# If the last successful run is older than the threshold, fail the job —
+# GitHub emails the repo admin on workflow failure by default.
+
+on:
+  schedule:
+    # Every 30 min inside a weekday UTC window that covers NYSE 09:30-16:00 ET.
+    - cron: "*/30 14-20 * * 1-5"
+  workflow_dispatch: {}
+
+permissions:
+  actions: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    env:
+      GH_TOKEN: ${{ github.token }}
+      STALE_MINUTES: "20"
+      BOT_WORKFLOW: "bot.yml"
+    steps:
+      - name: Check last successful bot run
+        run: |
+          set -euo pipefail
+
+          last_ts=$(gh run list \
+            --repo "${{ github.repository }}" \
+            --workflow "$BOT_WORKFLOW" \
+            --status success \
+            --limit 1 \
+            --json updatedAt \
+            --jq '.[0].updatedAt // empty')
+
+          if [ -z "$last_ts" ]; then
+            echo "::error::No successful $BOT_WORKFLOW run found at all."
+            exit 1
+          fi
+
+          last_epoch=$(date -u -d "$last_ts" +%s)
+          now_epoch=$(date -u +%s)
+          age_min=$(( (now_epoch - last_epoch) / 60 ))
+
+          echo "Last successful run: $last_ts ($age_min min ago)"
+
+          if [ "$age_min" -gt "$STALE_MINUTES" ]; then
+            echo "::error::Bot heartbeat stale: $age_min min > $STALE_MINUTES min threshold."
+            exit 1
+          fi
+
+          echo "Heartbeat OK."
