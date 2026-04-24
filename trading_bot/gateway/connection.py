@@ -34,6 +34,13 @@ class GatewayConnection:
         self._paper: bool = bool(alpaca_cfg.get("paper", False))
         self._max_retries: int = int(alpaca_cfg.get("max_retries", 5))
         self._retry_backoff: int = int(alpaca_cfg.get("retry_backoff_seconds", 30))
+        # Suppress ntfy alerts for short transient reconnects. Only emit the
+        # "connection lost" / "reconnected" ntfy pair when the outage has
+        # persisted past this threshold. Exhausted-retries CRITICAL alerts
+        # bypass this gate. Default 120s (= typical Alpaca blip is <30s).
+        self._alert_threshold_seconds: int = int(
+            alpaca_cfg.get("reconnect_alert_threshold_seconds", 120)
+        )
 
         self._notifier: Notifier = notifier
         self._client: TradingClient | None = None
@@ -171,31 +178,62 @@ class GatewayConnection:
             return
 
     async def _handle_disconnect(self) -> None:
-        """Attempt to re-establish connectivity."""
+        """Attempt to re-establish connectivity.
+
+        ntfy alerts are suppressed for short transient outages: a "lost"
+        alert only fires once the outage has exceeded
+        ``_alert_threshold_seconds``, and the matching "reconnected" alert
+        only fires if we already sent the "lost". This avoids pinging the
+        user for every sub-minute Alpaca REST blip. Exhausted-retries
+        CRITICAL alerts are not gated — they always fire.
+        """
         if self._disconnect_time is None:
             self._disconnect_time = time.monotonic()
+        # Capture locally: self._disconnect_time gets cleared inside
+        # connect() on success, which used to leave downtime at 0 (bug).
+        down_at: float = self._disconnect_time
 
-        await self._notifier.gateway_alert(
-            "Alpaca API connection lost. Attempting reconnect...",
-            is_critical=False,
+        logger.warning(
+            "Alpaca connection lost at t=%.0f — entering retry loop",
+            down_at,
         )
+
+        notified_lost: bool = False
 
         for attempt in range(1, self._max_retries + 1):
             wait: int = self._retry_backoff * (2 ** (attempt - 1))
             logger.info("Reconnect attempt %d/%d in %ds", attempt, self._max_retries, wait)
             await asyncio.sleep(wait)
 
-            if await self.connect():
-                downtime: float = 0.0
-                if self._disconnect_time is not None:
-                    downtime = time.monotonic() - self._disconnect_time
-                self._disconnect_time = None
+            # Before retrying, decide whether this outage has earned a
+            # user-facing alert. Cheap to re-check; avoids a separate task.
+            elapsed: float = time.monotonic() - down_at
+            if not notified_lost and elapsed >= self._alert_threshold_seconds:
                 await self._notifier.gateway_alert(
-                    f"Alpaca reconnected after {downtime:.0f}s downtime",
+                    f"Alpaca API connection lost for {elapsed:.0f}s. "
+                    "Attempting reconnect...",
                     is_critical=False,
                 )
+                notified_lost = True
+
+            if await self.connect():
+                # connect() clears self._disconnect_time on success — use
+                # our local snapshot to compute real downtime.
+                downtime: float = time.monotonic() - down_at
+
+                if notified_lost:
+                    await self._notifier.gateway_alert(
+                        f"Alpaca reconnected after {downtime:.0f}s downtime",
+                        is_critical=False,
+                    )
+                else:
+                    logger.info(
+                        "Alpaca reconnected after %.0fs (silent — under %ds threshold)",
+                        downtime, self._alert_threshold_seconds,
+                    )
                 return
 
+        # Retries exhausted — always alert, regardless of threshold.
         await self._notifier.gateway_alert(
             f"Alpaca connection lost — {self._max_retries} attempts failed. "
             "Retrying every 5 min.",
@@ -205,14 +243,17 @@ class GatewayConnection:
 
     async def _connection_wait_loop(self) -> None:
         """Retry every 5 minutes indefinitely.  The bot never exits."""
+        # Snapshot disconnect_time BEFORE retrying: connect() clears the
+        # attribute on success, which would otherwise zero out the
+        # downtime figure reported to the user.
+        down_at: float | None = self._disconnect_time
         while True:
             await asyncio.sleep(300)
             logger.info("Connection-wait: attempting reconnect")
             if await self.connect():
-                downtime: float = 0.0
-                if self._disconnect_time is not None:
-                    downtime = time.monotonic() - self._disconnect_time
-                self._disconnect_time = None
+                downtime: float = (
+                    time.monotonic() - down_at if down_at is not None else 0.0
+                )
                 logger.info("Connection restored after extended outage (%.0fs)", downtime)
                 await self._notifier.gateway_alert(
                     f"Alpaca reconnected after extended outage ({downtime:.0f}s downtime)",
