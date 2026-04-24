@@ -1,0 +1,4 @@
+alpaca-py>=0.30.0
+pandas>=2.2.0
+pandas-market-calendars>=4.4.0
+python-dotenv>=1.0.1
