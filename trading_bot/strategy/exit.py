@@ -389,6 +389,11 @@ class ExitManager:
 
         return True
 
+    @property
+    def spread_max_delay_seconds(self) -> int:
+        """Max seconds an exit may be deferred due to wide spreads."""
+        return self._spread_max_delay_s
+
     # ------------------------------------------------------------------
     # Emergency exit factory
     # ------------------------------------------------------------------
