@@ -24,6 +24,12 @@ alpaca:
   data_feed: "iex"                   # "iex" (free) or "sip" (paid, all exchanges)
   max_retries: 5
   retry_backoff_seconds: 30
+  # Suppress ntfy noise from transient Alpaca REST blips. The "connection
+  # lost" / "reconnected" pair only fires when the outage has persisted
+  # past this threshold. Exhausted-retries CRITICAL alerts always fire
+  # regardless. Default 120s — Alpaca transient blips are almost always
+  # under a minute; outages worth notifying about are longer.
+  reconnect_alert_threshold_seconds: 120
 
 # -----------------------------------------------------------------------------
 # Market Data
