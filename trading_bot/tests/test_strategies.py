@@ -454,3 +454,82 @@ class TestComparisonReport:
     def test_empty_report(self) -> None:
         assert pick_winner({}) is None
         assert render_comparison_text({}) == "No strategy data available."
+
+
+# ---------------------------------------------------------------------------
+# Overnight Drift — live-path entry_time parsing regression
+# ---------------------------------------------------------------------------
+#
+# The live path reads positions from SQLite where ``entry_time`` is stored as
+# TEXT (ISO string), while the backtester supplies it as a ``datetime``.
+# Regression test for the parser that must accept both forms.
+
+
+class TestOvernightDriftEntryTime:
+    """evaluate_exit must accept both datetime and ISO-string entry_time."""
+
+    def _build_df(self, day: str, hh_mm: str = "09:35") -> pd.DataFrame:
+        ts = pd.Timestamp(f"{day} {hh_mm}:00")
+        return pd.DataFrame(
+            {"open": [100.0], "high": [101.0], "low": [99.0], "close": [100.5], "volume": [1000]},
+            index=[ts],
+        )
+
+    def _strategy(self) -> Any:
+        from trading_bot.strategy.strategies.overnight_drift import OvernightDriftStrategy
+        return OvernightDriftStrategy(config={"max_positions": 1})
+
+    def test_exit_fires_next_session_with_string_entry_time(self) -> None:
+        # Live-path shape: entry_time as ISO string from SQLite.
+        strat = self._strategy()
+        position = {
+            "entry_price": 100.0,
+            "stop_price": 97.0,
+            "entry_time": "2026-04-23T15:45:00",
+            "hold_type": "swing",
+        }
+        df = self._build_df("2026-04-24", "09:35")
+        signal = strat.evaluate_exit(position=position, current_price=100.4, df_5min=df)
+        assert signal.should_exit is True
+        assert signal.reason == "overnight_exit"
+
+    def test_exit_fires_next_session_with_datetime_entry_time(self) -> None:
+        # Backtester shape: entry_time as datetime.
+        from datetime import datetime as _dt
+        strat = self._strategy()
+        position = {
+            "entry_price": 100.0,
+            "stop_price": 97.0,
+            "entry_time": _dt(2026, 4, 23, 15, 45),
+            "hold_type": "swing",
+        }
+        df = self._build_df("2026-04-24", "09:35")
+        signal = strat.evaluate_exit(position=position, current_price=100.4, df_5min=df)
+        assert signal.should_exit is True
+        assert signal.reason == "overnight_exit"
+
+    def test_no_exit_on_same_session(self) -> None:
+        strat = self._strategy()
+        position = {
+            "entry_price": 100.0,
+            "stop_price": 97.0,
+            "entry_time": "2026-04-24T15:45:00",
+            "hold_type": "swing",
+        }
+        df = self._build_df("2026-04-24", "15:50")
+        signal = strat.evaluate_exit(position=position, current_price=100.2, df_5min=df)
+        assert signal.should_exit is False
+
+    def test_stop_loss_takes_priority(self) -> None:
+        strat = self._strategy()
+        position = {
+            "entry_price": 100.0,
+            "stop_price": 97.0,
+            "entry_time": "2026-04-24T15:45:00",
+            "hold_type": "swing",
+        }
+        df = self._build_df("2026-04-24", "15:50")
+        signal = strat.evaluate_exit(position=position, current_price=96.5, df_5min=df)
+        assert signal.should_exit is True
+        assert signal.reason == "stop_loss"
+        assert signal.is_emergency is True

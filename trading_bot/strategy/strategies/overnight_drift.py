@@ -17,7 +17,7 @@ The next-day-open exit is evaluated by this strategy's ``evaluate_exit``.
 from __future__ import annotations
 
 import logging
-from datetime import time
+from datetime import date, datetime, time
 from typing import Any
 
 import pandas as pd
@@ -125,10 +125,9 @@ class OvernightDriftStrategy(StrategyBase):
     ) -> ExitSignal:
         entry_price: float = float(position.get("entry_price", 0))
         stop_price: float = float(coalesce(position, "stop_price", 0))
-        entry_time = position.get("entry_time")
 
-        # Disaster stop — redundant with the backtester's stop check but
-        # belt-and-braces for the live path.
+        # Disaster stop — redundant with the backtester's intrabar stop
+        # check but belt-and-braces for the live path.
         if stop_price > 0 and current_price <= stop_price:
             return ExitSignal(
                 should_exit=True,
@@ -137,14 +136,17 @@ class OvernightDriftStrategy(StrategyBase):
                 use_market_order=True,
             )
 
-        if df_5min is None or len(df_5min) == 0 or entry_time is None:
+        entry_date: date | None = _position_entry_date(position)
+        if entry_date is None:
             return ExitSignal(should_exit=False)
 
-        bar_ts = df_5min.index[-1]
-        bar_dt = bar_ts.to_pydatetime() if hasattr(bar_ts, "to_pydatetime") else bar_ts
+        bar_date: date | None = _latest_bar_date(df_5min)
+        if bar_date is None:
+            # No bar data — fall back to "now" (live path may not pass bars).
+            bar_date = datetime.now().date()
 
         # Exit on the first bar of any later trading day.
-        if bar_dt.date() > entry_time.date():
+        if bar_date > entry_date:
             return ExitSignal(
                 should_exit=True,
                 reason="overnight_exit",
@@ -152,9 +154,9 @@ class OvernightDriftStrategy(StrategyBase):
                 use_market_order=True,
             )
 
-        # Safety net — if something weird keeps the position open into a
-        # second day, force-close.
-        if (bar_dt.date() - entry_time.date()).days >= 2:
+        # Safety net — if something keeps the position open past 2 days
+        # (weekend or unusual halt), force-close.
+        if (bar_date - entry_date).days >= 2:
             return ExitSignal(
                 should_exit=True,
                 reason="overnight_timeout",
@@ -190,4 +192,53 @@ def _last_bar_time(df_5min: pd.DataFrame) -> time | None:
         dt = ts
     if hasattr(dt, "time"):
         return dt.time()
+    return None
+
+
+def _latest_bar_date(df_5min: pd.DataFrame | None) -> date | None:
+    """Return the date of the last bar's index, if available."""
+    if df_5min is None or len(df_5min) == 0:
+        return None
+    ts = df_5min.index[-1]
+    if hasattr(ts, "to_pydatetime"):
+        ts = ts.to_pydatetime()
+    if hasattr(ts, "date"):
+        return ts.date()
+    return None
+
+
+def _position_entry_date(position: dict[str, Any]) -> date | None:
+    """Extract entry date from a position dict.
+
+    The backtester supplies ``entry_time`` as a ``datetime``; the live path
+    reads positions from SQLite where ``entry_time`` is a TEXT column (ISO
+    string). Handle both, plus a few reasonable fallback keys.
+    """
+    raw = position.get("entry_time")
+    if raw is None:
+        raw = position.get("entry_date")
+    if raw is None:
+        return None
+
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, date):
+        return raw
+
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None
+        # datetime.fromisoformat handles most ISO 8601 shapes we'd emit,
+        # including trailing "Z" via the replacement below.
+        try:
+            return datetime.fromisoformat(s.replace("Z", "+00:00")).date()
+        except ValueError:
+            pass
+        # Fall back to the date portion only.
+        try:
+            return date.fromisoformat(s[:10])
+        except ValueError:
+            return None
+
     return None
