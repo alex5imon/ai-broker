@@ -66,6 +66,16 @@ class MeanReversionStrategy(StrategyBase):
         self._rsi_oversold_high_vol: float = float(config.get("rsi_oversold_high_vol", 25))
         self._rsi_oversold_low_vol: float = float(config.get("rsi_oversold_low_vol", 30))
         self._rv_lookback_days: int = int(config.get("rv_lookback_days", 20))
+        # Bollinger Band confirmation (#4 from return_improvement_todos).
+        # Require that price touched or penetrated the lower Bollinger Band
+        # within a recent lookback AND has closed back above the band. Acts
+        # as a second independent mean-reversion signal that complements RSI.
+        # Opt-in — disabled by default so the validated RSI-only path is
+        # unchanged until a backtest confirms lift.
+        self._require_bb_confirm: bool = bool(config.get("require_bb_confirm", False))
+        self._bb_period: int = int(config.get("bb_period", 20))
+        self._bb_std: float = float(config.get("bb_std", 2.0))
+        self._bb_lookback_bars: int = int(config.get("bb_lookback_bars", 3))
 
     @staticmethod
     def _realized_vol_pct(df_daily: pd.DataFrame, lookback_days: int = 20) -> float | None:
@@ -106,6 +116,44 @@ class MeanReversionStrategy(StrategyBase):
         if rv <= self._rv_low_threshold:
             return self._rsi_oversold_low_vol, f"low-vol (rv={rv:.1f}%)"
         return self._rsi_oversold, f"normal-vol (rv={rv:.1f}%)"
+
+    def _check_bb_bounce(self, df_5min: pd.DataFrame) -> bool:
+        """True when a recent lower-band touch has been followed by a close
+        back above the lower band.
+
+        Computes Bollinger Bands inline to avoid depending on precomputed
+        indicators, since the backtester does not enrich the df with BB
+        columns. Lookback window ``bb_lookback_bars`` mirrors the TODO
+        description ("within 3 bars of RSI oversold recovery").
+        """
+        if len(df_5min) < self._bb_period + self._bb_lookback_bars:
+            return False
+
+        df = df_5min.copy()
+        df.columns = [c.lower() for c in df.columns]
+        for col in ("close", "low"):
+            if col not in df.columns:
+                return False
+
+        close = df["close"].astype(float)
+        low = df["low"].astype(float)
+        bb_mid = close.rolling(self._bb_period).mean()
+        bb_std = close.rolling(self._bb_period).std(ddof=0)
+        bb_lower = bb_mid - self._bb_std * bb_std
+
+        if bb_lower.isna().iloc[-1] or math.isnan(float(close.iloc[-1])):
+            return False
+
+        # Current close must be above the current lower band.
+        if float(close.iloc[-1]) <= float(bb_lower.iloc[-1]):
+            return False
+
+        # In the recent lookback (excluding the current bar), some bar's low
+        # must have touched/penetrated the lower band.
+        tail_low = low.iloc[-(self._bb_lookback_bars + 1):-1]
+        tail_band = bb_lower.iloc[-(self._bb_lookback_bars + 1):-1]
+        touched = (tail_low <= tail_band).any()
+        return bool(touched)
 
     def evaluate_entry(
         self,
@@ -155,6 +203,15 @@ class MeanReversionStrategy(StrategyBase):
             ema = df_e["close"].ewm(span=self._ema_confirm_period, adjust=False).mean()
             current_ema = float(ema.iloc[-1])
             if current_price < current_ema:
+                return None
+
+        # Bollinger Band confirmation — second independent mean-reversion
+        # signal. Price must have touched the lower band recently and
+        # reverted above it.
+        bb_confirmed: bool = False
+        if self._require_bb_confirm:
+            bb_confirmed = self._check_bb_bounce(df_5min)
+            if not bb_confirmed:
                 return None
 
         trail_pct: float | None = None
@@ -226,6 +283,7 @@ class MeanReversionStrategy(StrategyBase):
                 "was_oversold": True,
                 "oversold_threshold": rsi_oversold,
                 "vol_regime": vol_regime,
+                "bb_confirmed": bb_confirmed,
             },
             sentiment_score=sentiment_score,
             trail_activation_price=trail_activation_price,
