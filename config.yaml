@@ -439,7 +439,13 @@ backtesting:
 # -----------------------------------------------------------------------------
 multi_strategy:
   enabled: true
-  total_allocation_usd: 4000.0
+  # 2026-04-24 objective reframe: sentiment_combo disabled (low edge
+  # after 2 iterations). Its $1000 redistributed +$500 each to
+  # mean_reversion and breakout — the two highest-PF sleeves in the
+  # 13-year SPY backtest. Sentiment signal is still consumed by the
+  # bot-wide entry filters (entry.sentiment_block_threshold and
+  # sentiment.market_reduce_threshold), just not as a standalone sleeve.
+  total_allocation_usd: 5000.0
   comparison_period_days: 252
 
   # Market regime filter — blocks new entries when SPY < 50-day SMA.
@@ -456,7 +462,10 @@ multi_strategy:
     # they produce comparable backtest evidence.
     mean_reversion:
       enabled: true
-      allocation_usd: 1000.0
+      # Bumped 1000 -> 1500 after 2026-04-24 objective reframe:
+      # absorbed half of the disabled sentiment_combo allocation.
+      # Top PF strategy (1.63) with the added BB confirmation.
+      allocation_usd: 1500.0
       max_positions: 3          # hold up to 3 concurrent diversified ETF positions
       rsi_period: 14
       rsi_oversold: 28
@@ -522,23 +531,29 @@ multi_strategy:
 
     breakout:
       enabled: true
-      allocation_usd: 1000.0
+      # Bumped 1000 -> 1500 after 2026-04-24 objective reframe:
+      # absorbed half of the disabled sentiment_combo allocation.
+      # Highest PF strategy (2.94) in the 13-year SPY backtest.
+      allocation_usd: 1500.0
       max_positions: 1
       breakout_period: 20
       exit_period: 10
       volume_multiplier: 1.5
       stop_loss_pct: 0.03
 
+    # Sentiment Combo DISABLED 2026-04-24 (objective reframe).
+    # Two tuning iterations exhausted the parameter search:
+    #   iter 1 baseline: 45 trades, PF 1.05, +2.67% over 13 yr
+    #   iter 2 tighter:   2 trades, PF 0.79
+    # Underlying hypothesis ("sentiment + 1 technical = tradeable edge
+    # on ETFs") didn't validate. Sentiment is still used bot-wide as
+    # a risk filter / size modifier — see entry.sentiment_block_threshold
+    # and sentiment.market_reduce_threshold. Left in config for future
+    # re-enable (e.g. archetype switch to earnings-driven single stocks).
     sentiment_combo:
-      enabled: true
-      allocation_usd: 1000.0
+      enabled: false
+      allocation_usd: 0.0
       max_positions: 2
-      # Entry filter tune 2026-04-24:
-      #   sentiment_threshold 0.15 -> 0.25 (raise conviction)
-      #   min_technical_signals 1 -> 2 (required confluence) — ROLLED BACK
-      #     back to 1 after 13-yr SPY backtest showed confluence filter was
-      #     too tight: 45 trades -> 2 trades, PF 1.05 -> 0.79. Threshold
-      #     bump retained; confluence filter reverted.
       sentiment_threshold: 0.25
       min_technical_signals: 1
       stop_loss_pct: 0.015
