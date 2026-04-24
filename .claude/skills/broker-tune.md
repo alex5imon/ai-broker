@@ -221,6 +221,49 @@ conn.close()
 
 Replace `[description]` with a summary of what was changed and why.
 
-## Step 7: Summarize
+## Step 7: Check for Iteration Stagnation
+
+After every tuning round, append the resulting backtest eval to the
+per-strategy iteration history and run the stagnation detector. This is
+how we find out when parameter tuning has hit a local optimum and a
+structural pivot is needed rather than more knob-twiddling.
+
+```bash
+cd /Users/alex/Broker
+
+# 1. Run a backtest with the new config (see broker-backtest.md)
+python -m trading_bot.multi_strategy_backtest --from 2017-01-01 --to 2018-01-01 --spy
+
+# 2. Score it per strategy (writes reports/backtest_eval_<strategy>_<ts>.json)
+python3 scripts/evaluate_backtest_from_json.py --latest
+
+# 3. Append the eval to that strategy's iteration history, noting the change
+python3 .claude/skills/strategy-pivot-designer/scripts/detect_stagnation.py \
+    --append-eval reports/backtest_eval_mean_reversion_<ts>.json \
+    --history reports/iteration_history_mean_reversion.json \
+    --strategy-id mean_reversion \
+    --changes "Tightened stop_loss_pct 2.0 -> 1.5"
+
+# 4. Detect stagnation once ≥3 iterations exist
+python3 .claude/skills/strategy-pivot-designer/scripts/detect_stagnation.py \
+    --history reports/iteration_history_mean_reversion.json \
+    --output-dir reports/
+```
+
+The detector returns one of three recommendations:
+
+- **`continue`**: keep iterating on parameters — progress is still being made
+- **`pivot`**: parameter search exhausted; the strategy's architecture
+  needs to change (different entry trigger, different exit logic, etc.).
+  Triggers include `plateau`, `overfitting`, `cost_defeat`, `tail_risk`.
+- **`abandon`**: multiple severe triggers; the core hypothesis is likely
+  wrong
+
+When `pivot` is returned, surface the trigger IDs to the user and suggest
+a structural redesign rather than another parameter sweep. The
+`references/pivot_techniques.md` under the skill has three patterns
+(assumption inversion, archetype switch, objective reframe).
+
+## Step 8: Summarize
 
 Present a final summary of all changes made (or no changes if the user declined). Note which phase the changes are optimized for, and remind the user that parameter changes take effect on the next bot restart unless hot-reload is supported.

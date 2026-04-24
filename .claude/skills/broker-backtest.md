@@ -83,9 +83,46 @@ If the user is tuning, compare against the baseline validated metrics:
 
 Any tune that regresses these materially should be flagged.
 
-## Step 7: Next Steps
+## Step 7: Run the backtest-expert Evaluation
+
+After the JSON is written, score each strategy against the backtest-expert
+5-dimension framework (Sample Size / Expectancy / Risk Mgmt / Robustness /
+Execution Realism). Outputs land in `reports/` with per-strategy verdicts:
+Deploy / Refine / Abandon.
+
+```bash
+cd /Users/alex/Broker
+python3 scripts/evaluate_backtest_from_json.py --latest
+# or pass an explicit path:
+python3 scripts/evaluate_backtest_from_json.py \
+    backtest_results/multi_strategy_2008-06-01_to_2021-05-01_20260417T232746.json
+```
+
+The wrapper loads the vendored skill at
+`.claude/skills/backtest-expert/scripts/evaluate_backtest.py` and writes
+`reports/backtest_eval_<strategy>_<timestamp>.{json,md}` per strategy.
+Surface the verdict line for every strategy in your summary to the user,
+and explicitly name any that returned `Refine` or `Abandon`.
+
+## Step 8: Append to Iteration History (Optional)
+
+If the user is iterating on a strategy, append each eval to that
+strategy's iteration history so `strategy-pivot-designer` can detect
+stagnation later (see `broker-tune.md`):
+
+```bash
+python3 .claude/skills/strategy-pivot-designer/scripts/detect_stagnation.py \
+    --append-eval reports/backtest_eval_mean_reversion_<ts>.json \
+    --history reports/iteration_history_mean_reversion.json \
+    --strategy-id mean_reversion \
+    --changes "<one-line description of what changed this iteration>"
+```
+
+## Step 9: Next Steps
 
 Offer:
 1. Another date range or mode
 2. Parameter tune — edit `config.yaml` under `multi_strategy.strategies.*`
-3. Paper-trade validation — the next step after backtest passes
+3. Run `broker-postmortem` against the backtest for per-strategy TP/FP
+   attribution
+4. Paper-trade validation — the next step after backtest passes
