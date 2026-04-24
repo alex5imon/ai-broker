@@ -1,8 +1,10 @@
-"""Main trading bot orchestrator.
+"""Main trading bot orchestrator — stateless GHA tick entrypoint.
 
-Ties all subsystems together: Alpaca gateway, market data, strategy,
-execution, risk management, notifications, and reporting.  This module
-is the single entry point for the running bot process.
+Each invocation runs a single ``tick()``: connect, reconcile state, refresh
+quotes, evaluate entries/exits for the current market window, and exit.  The
+per-tick business logic (pre-market scan, entry scan, exit check, wind-down,
+phase transition, daily summary) is persisted via the SQLite ``tick_state`` +
+``risk_circuit_state`` tables so the next tick resumes where this one left off.
 
 Usage::
 
@@ -16,7 +18,6 @@ import asyncio
 import json
 import logging
 import logging.handlers
-import signal
 import sqlite3
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -72,61 +73,6 @@ _MARKET_TZ: dict[Market, ZoneInfo] = {
 
 
 # ---------------------------------------------------------------------------
-# Minimal async HTTP health server
-# ---------------------------------------------------------------------------
-
-
-async def _run_health_server(host: str, port: int, bot: "TradingBot") -> None:
-    """Serve a JSON health-check endpoint on ``http://host:port/health``.
-
-    GET /         -> same as /health
-    GET /health   -> 200 JSON with status, phase, connected, equity_gbp
-    """
-    from aiohttp import web
-
-    async def health(request: web.Request) -> web.Response:  # noqa: ARG001
-        account_summary: dict[str, Any] = {}
-        try:
-            account_summary = await bot._gateway.get_account_summary()
-        except Exception:
-            # Health endpoint must not fail; gateway errors are logged elsewhere.
-            logger.warning("Health endpoint: account summary fetch failed", exc_info=True)
-
-        equity_str: str | None = account_summary.get("NetLiquidation")
-        try:
-            equity: float = float(equity_str) if equity_str else 0.0
-        except (TypeError, ValueError):
-            equity = 0.0
-
-        payload: dict[str, Any] = {
-            "status": "ok",
-            "phase": bot._config.get_phase().value,
-            "connected": bot._gateway.is_connected,
-            "equity_gbp": equity,
-            "shutdown": bot._shutdown,
-        }
-        return web.json_response(payload)
-
-    app: web.Application = web.Application()
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
-
-    runner: web.AppRunner = web.AppRunner(app)
-    await runner.setup()
-    site: web.TCPSite = web.TCPSite(runner, host, port)
-    await site.start()
-    logger.info("Health server listening on http://%s:%d/health", host, port)
-
-    try:
-        while True:
-            await asyncio.sleep(60)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        await runner.cleanup()
-
-
-# ---------------------------------------------------------------------------
 # TradingBot
 # ---------------------------------------------------------------------------
 
@@ -143,7 +89,6 @@ class TradingBot:
         self._config: Config = config
         self._mode: str = mode  # "premarket" | "normal" | "close-only"
         self._dry_run: bool = dry_run
-        self._shutdown: bool = False
 
         raw: dict[str, Any] = config._raw  # raw dict for modules that accept it
         db_path: str = config.db_path
@@ -253,21 +198,12 @@ class TradingBot:
             config=raw,
         )
 
-        # --- Bot runtime state ---
-        self._start_time: datetime = datetime.now(tz=_EASTERN)
-        self._last_phase_check_date: date | None = None
-        self._daily_summary_saved_date: date | None = None
-
-        # Per-(Market, date) flags preventing duplicate runs
-        self._pre_market_done: dict[tuple[Market, date], bool] = {}
-        self._wind_down_done: dict[tuple[Market, date], bool] = {}
-
+        # --- Per-tick runtime state ---
+        # Active watchlist is rebuilt each tick from tick_state (pre-market
+        # scan persists its ranked list), or falls back to config.watchlist.
         self._active_watchlist: dict[Market, list[str]] = {
             Market.US: [],
         }
-
-        # Background asyncio tasks — cancelled on shutdown
-        self._bg_tasks: list[asyncio.Task[None]] = []
 
         logger.info(
             "TradingBot initialised (phase=%s, mode=%s, account=%s, dry_run=%s)",
@@ -280,281 +216,198 @@ class TradingBot:
             logger.info("*** DRY RUN MODE — no orders will be placed ***")
 
     # ------------------------------------------------------------------
-    # Startup
+    # Tick entrypoint
     # ------------------------------------------------------------------
 
-    async def start(self) -> None:
-        """Full startup sequence (see module docstring for step overview)."""
+    async def tick(self) -> None:
+        """Run one full scheduling cycle and exit.
 
-        # 1. Setup logging
-        self._setup_logging()
-        logger.info("=== TradingBot startup (mode=%s) ===", self._mode)
-
-        # 2. Run DB migrations
-        logger.info("Running DB migrations: %s", self._db_path)
-        try:
-            run_migrations(self._db_path)
-        except Exception:
-            logger.exception("DB migration failed — cannot continue")
-            raise
-
-        # 3. Start notifier (creates aiohttp session and drain task)
-        await self._notifier.start()
-
-        # 4. Connect to Alpaca — retry until connected
-        logger.info("Connecting to Alpaca...")
-        connected: bool = False
-        while not connected:
-            connected = await self._gateway.connect()
-            if not connected:
-                logger.warning("Alpaca connection failed; retrying in 30 seconds")
-                await asyncio.sleep(30)
-        logger.info("Alpaca connected")
-
-        # 5. State recovery — reconcile IB vs SQLite
-        logger.info("Running state recovery...")
-        try:
-            recovery_result = await self._state_recovery.recover()
-            logger.info("State recovery: %s", recovery_result.summary())
-        except Exception:
-            logger.exception("State recovery error (non-fatal)")
-
-        # 6. Start background tasks
-        await self._start_background_tasks()
-
-        # 7. Phase 0 is a no-op on Alpaca (fresh account, no IB legacy to clean up).
-        # Record the 0→1 transition once so subsequent startups skip silently.
-        if not self._is_phase0_complete():
-            self._record_phase_transition(
-                from_phase=0, to_phase=1,
-                reason="Alpaca account — no portfolio cleanup required",
-            )
-
-        # 8. Startup notification
-        open_positions: int = self._count_open_positions()
-        startup_mode: str = f"{self._mode} [DRY RUN]" if self._dry_run else self._mode
-        await self._notifier.bot_startup(
-            phase=self._config.get_phase().value,
-            positions=open_positions,
-            mode=startup_mode,
-        )
-
-        # 9. Main loop
-        await self.main_loop()
-
-    # ------------------------------------------------------------------
-    # Shutdown
-    # ------------------------------------------------------------------
-
-    async def shutdown(self) -> None:
-        """Graceful shutdown sequence."""
-        logger.info("=== TradingBot shutdown initiated ===")
-        self._shutdown = True
-
-        # Cancel pending entry orders only.
-        # Stop-loss GTC orders are deliberately left alive — they protect positions.
-        logger.info("Cancelling pending entry orders...")
-        try:
-            from alpaca.trading.requests import GetOrdersRequest
-            from alpaca.trading.enums import QueryOrderStatus
-            request = GetOrdersRequest(status=QueryOrderStatus.OPEN)
-            open_orders = self._gateway.client.get_orders(filter=request)
-            for order in open_orders:
-                if order.type and order.type.value in ("limit", "market"):
-                    self._gateway.client.cancel_order_by_id(str(order.id))
-                    logger.info(
-                        "Shutdown: cancelled entry order %s (%s)",
-                        str(order.id), order.symbol,
-                    )
-        except Exception:
-            logger.exception("Error cancelling entry orders during shutdown")
-
-        # Cancel background tasks
-        for task in self._bg_tasks:
-            if not task.done():
-                task.cancel()
-        if self._bg_tasks:
-            await asyncio.gather(*self._bg_tasks, return_exceptions=True)
-        self._bg_tasks.clear()
-        logger.info("Background tasks stopped")
-
-        # Generate daily report and save summary
-        today_et: date = datetime.now(tz=_EASTERN).date()
-        today_str: str = today_et.isoformat()
-        try:
-            logger.info("Saving daily summary for %s", today_str)
-            await self._save_daily_summary(today_et)
-        except Exception:
-            logger.exception("Error saving daily summary during shutdown")
-
-        try:
-            self._report_generator.generate_daily_report(today_str)
-        except Exception:
-            logger.exception("Error generating daily report during shutdown")
-
-        # Multi-strategy comparison report
-        if self._strategy_manager is not None:
-            try:
-                report = generate_comparison(self._db_path)
-                if report:
-                    report_text = render_comparison_text(report)
-                    logger.info("Strategy comparison:\n%s", report_text)
-            except Exception:
-                logger.exception("Error generating strategy comparison report")
-
-        # Shutdown notification
-        try:
-            await self._notifier.bot_shutdown(daily_pnl=self._risk_manager.daily_pnl_gbp)
-        except Exception:
-            logger.exception("Error sending shutdown notification")
-
-        # Disconnect from IB
-        try:
-            await self._gateway.disconnect()
-        except Exception:
-            logger.exception("Error disconnecting gateway")
-
-        # Flush notifier queue
-        try:
-            await self._notifier.shutdown()
-        except Exception:
-            logger.exception("Error shutting down notifier")
-
-        logger.info("=== TradingBot shutdown complete ===")
-
-    # ------------------------------------------------------------------
-    # Main loop
-    # ------------------------------------------------------------------
-
-    async def main_loop(self) -> None:
-        """Main loop. Runs until _shutdown=True.
-
-        Each iteration (every scan_interval seconds):
-        1. Check if today is a trading day.
-        2. Check bot operating hours (07:45–21:00 GMT).
-        3. Check phase transition (once per day at/after US close).
-        4. US window: pre-market scan, execution, wind-down.
-        5. Always: check_exits() for all open positions.
-        6. Sleep scan_interval seconds.
+        Responsibilities per tick:
+        1. Connect to Alpaca (abort tick on failure).
+        2. Refresh FX rate.
+        3. Reconcile broker state with SQLite.
+        4. Poll outstanding order statuses.
+        5. For the US market, run pre-market scan / entry scan / exit check /
+           wind-down depending on the current window.  Each stage is guarded by
+           a day-scoped flag persisted to ``tick_state``.
+        6. Run phase-transition + daily-summary checks once per day after
+           wind-down has completed.
         """
-        logger.info("Entering main loop (mode=%s)", self._mode)
+        self._setup_logging()
+        logger.info("=== tick start (mode=%s, dry_run=%s) ===", self._mode, self._dry_run)
 
-        # Live-only warmup safety period. Paper/dry-run always skip — bars are
-        # available via REST, so there's nothing to warm up.
-        is_live: bool = not self._dry_run and not self._config.alpaca_paper
-        if is_live and self._is_late_start():
-            logger.info("Late start detected — running live-mode warmup")
-            await self._live_warmup()
+        now_et: datetime = datetime.now(tz=_EASTERN)
+        today_et: date = now_et.date()
 
-        scan_interval: int = self._config.get_scan_interval()
+        # --- 1. Trading-day gate ---
+        if not self._config.is_trading_day(today_et, Market.US):
+            logger.info("Non-trading day (%s) — tick exits", today_et.isoformat())
+            return
 
-        while not self._shutdown:
+        # --- 2. Operating-hours gate (bot_start_gmt..bot_end_gmt) ---
+        now_utc: datetime = datetime.now(tz=TZ_UTC)
+        bot_start_gmt: time = _parse_time(
+            self._config._get("schedule", "bot_start_gmt") or "07:45"
+        )
+        bot_end_gmt: time = _parse_time(
+            self._config._get("schedule", "bot_end_gmt") or "21:00"
+        )
+        if not (bot_start_gmt <= now_utc.time() <= bot_end_gmt):
+            logger.info(
+                "Outside operating hours (%s GMT) — tick exits",
+                now_utc.strftime("%H:%M"),
+            )
+            return
+
+        # --- 3. Connect to Alpaca ---
+        connected: bool = await self._gateway.connect()
+        if not connected:
+            logger.error("Alpaca connect failed — tick aborts")
+            return
+
+        try:
+            # --- 4. FX refresh ---
             try:
-                now_et: datetime = datetime.now(tz=_EASTERN)
-                today_et: date = now_et.date()
-
-                # --- Trading day check ---
-                us_is_trading: bool = self._config.is_trading_day(today_et, Market.US)
-
-                if not us_is_trading:
-                    logger.info(
-                        "No markets trading today (%s) — sleeping until midnight ET",
-                        today_et.isoformat(),
-                    )
-                    await self._sleep_until_next_day()
-                    continue
-
-                # --- Bot operating hours: 07:45–21:00 GMT ---
-                now_utc: datetime = datetime.now(tz=TZ_UTC)
-                bot_start_gmt: time = _parse_time(
-                    self._config._get("schedule", "bot_start_gmt") or "07:45"
-                )
-                bot_end_gmt: time = _parse_time(
-                    self._config._get("schedule", "bot_end_gmt") or "21:00"
-                )
-                now_gmt_time: time = now_utc.time()
-
-                if not (bot_start_gmt <= now_gmt_time <= bot_end_gmt):
-                    # Heartbeat at INFO so the external watchdog sees a fresh
-                    # log entry while the bot is legitimately idle outside
-                    # operating hours. Fires once per minute.
-                    logger.info(
-                        "Outside operating hours (%s GMT) — sleeping 60s",
-                        now_utc.strftime("%H:%M"),
-                    )
-                    await asyncio.sleep(60)
-                    continue
-
-                # --- Daily risk counters reset on date rollover ---
-                if today_et != self._risk_manager._trading_day:
-                    self._risk_manager.reset_daily()
-
-                # --- Phase transition check (once per day after US close) ---
-                await self._maybe_check_phase_transition(today_et)
-
-                # --- Daily summary save ---
-                await self._maybe_save_daily_summary(today_et)
-
-                # ----------------------------------------------------------------
-                # US market
-                # ----------------------------------------------------------------
-                if us_is_trading:
-                    us_key: tuple[Market, date] = (Market.US, today_et)
-
-                    # Pre-market scan runs exactly once per trading day. If the
-                    # bot started mid-session, this fires on the first iteration
-                    # that lands inside any active market window.
-                    market_active: bool = (
-                        self._is_market_in_premarket(Market.US)
-                        or self._is_market_in_execution(Market.US)
-                        or self._is_market_in_winddown(Market.US)
-                    )
-                    if (
-                        market_active
-                        and not self._pre_market_done.get(us_key, False)
-                        and self._mode in ("premarket", "normal")
-                    ):
-                        try:
-                            await self.pre_market_scan(Market.US)
-                        except Exception:
-                            logger.exception(
-                                "Pre-market scan failed — falling back to bare watchlist subscribe"
-                            )
-                            for ticker in self._config.get_watchlist(Market.US):
-                                try:
-                                    await self._market_data.subscribe(ticker, "US")
-                                except Exception:
-                                    logger.debug(
-                                        "Fallback subscribe failed for %s", ticker, exc_info=True
-                                    )
-                            self._pre_market_done[us_key] = True
-
-                    if (
-                        self._is_market_in_execution(Market.US)
-                        and self._mode not in ("close-only",)
-                    ):
-                        await self.scan_for_entries(Market.US)
-
-                    if (
-                        self._is_market_in_winddown(Market.US)
-                        and not self._wind_down_done.get(us_key, False)
-                    ):
-                        await self.wind_down(Market.US)
-                        self._wind_down_done[us_key] = True
-
-                # ----------------------------------------------------------------
-                # Always: exits — even during pre-market and wind-down
-                # ----------------------------------------------------------------
-                await self.check_exits()
-
-            except asyncio.CancelledError:
-                logger.info("Main loop cancelled")
-                break
+                await self._fx.refresh()
             except Exception:
-                # Never exit on error — log and continue
-                logger.exception("Unhandled exception in main loop — continuing")
+                logger.warning("FX refresh failed — using cached rate", exc_info=True)
 
-            await asyncio.sleep(scan_interval)
+            # --- 5. State recovery (reconcile broker vs SQLite) ---
+            try:
+                recovery_result = await self._state_recovery.recover()
+                logger.info("State recovery: %s", recovery_result.summary())
+            except Exception:
+                logger.exception("State recovery failed (non-fatal)")
+
+            # --- 6. Poll order statuses ---
+            try:
+                await self._order_manager._check_order_statuses()
+            except Exception:
+                logger.warning("Order status poll failed", exc_info=True)
+
+            # --- 7. Phase 0 one-time marker (Alpaca has no legacy cleanup) ---
+            if not self._is_phase0_complete():
+                self._record_phase_transition(
+                    from_phase=0, to_phase=1,
+                    reason="Alpaca account — no portfolio cleanup required",
+                )
+
+            # --- 8. Day-scoped flags (persisted via tick_state "__day__") ---
+            flags: dict[str, Any] = self._load_day_flags(today_et)
+
+            # --- 9. Daily risk counter reset (only once per day) ---
+            if today_et != self._risk_manager._trading_day:
+                self._risk_manager.reset_daily()
+
+            # --- 10. Watchlist bootstrap: seed quotes via bulk REST ---
+            watchlist_tickers: list[str] = self._config.get_watchlist(Market.US)
+            try:
+                await self._market_data.refresh_quotes(watchlist_tickers)
+            except Exception:
+                logger.warning("refresh_quotes failed for watchlist", exc_info=True)
+
+            # --- 11. Pre-market scan (once per day, within any active window) ---
+            market_active: bool = (
+                self._is_market_in_premarket(Market.US)
+                or self._is_market_in_execution(Market.US)
+                or self._is_market_in_winddown(Market.US)
+            )
+            if (
+                market_active
+                and not flags.get("pre_market_done", False)
+                and self._mode in ("premarket", "normal")
+            ):
+                try:
+                    await self.pre_market_scan(Market.US)
+                except Exception:
+                    logger.exception("Pre-market scan failed")
+                flags["pre_market_done"] = True
+                # Persist the ranked watchlist too so the next tick can re-use it.
+                flags["ranked_us_watchlist"] = self._active_watchlist.get(Market.US, [])
+                self._save_day_flags(today_et, flags)
+            else:
+                # Restore ranked watchlist from flags if pre-market already ran
+                ranked: list[str] = flags.get("ranked_us_watchlist") or []
+                if ranked:
+                    self._active_watchlist[Market.US] = ranked
+
+            # --- 12. Entry scan ---
+            if (
+                self._is_market_in_execution(Market.US)
+                and self._mode != "close-only"
+            ):
+                try:
+                    await self.scan_for_entries(Market.US)
+                except Exception:
+                    logger.exception("Entry scan failed")
+
+            # --- 13. Exit check (always) ---
+            try:
+                await self.check_exits()
+            except Exception:
+                logger.exception("Exit check failed")
+
+            # --- 14. Wind-down (once per day within wind-down window) ---
+            if (
+                self._is_market_in_winddown(Market.US)
+                and not flags.get("wind_down_done", False)
+            ):
+                try:
+                    await self.wind_down(Market.US)
+                except Exception:
+                    logger.exception("Wind-down failed")
+                flags["wind_down_done"] = True
+                self._save_day_flags(today_et, flags)
+
+            # --- 15. After-close daily tasks ---
+            await self._maybe_check_phase_transition(today_et, flags)
+            await self._maybe_save_daily_summary(today_et, flags)
+
+        finally:
+            # Always disconnect and close notifier session so file descriptors
+            # aren't left dangling between cron invocations.
+            try:
+                await self._gateway.disconnect()
+            except Exception:
+                logger.warning("Gateway disconnect failed", exc_info=True)
+            try:
+                await self._notifier.shutdown()
+            except Exception:
+                logger.warning("Notifier shutdown failed", exc_info=True)
+
+        logger.info("=== tick complete ===")
+
+    # ------------------------------------------------------------------
+    # Day-flag persistence (tick_state with strategy_id="__day__")
+    # ------------------------------------------------------------------
+
+    def _load_day_flags(self, today: date) -> dict[str, Any]:
+        """Load day-scoped flags for *today*; reset if stored row is stale."""
+        today_str: str = today.isoformat()
+        try:
+            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
+            try:
+                row = repo.load_tick_state(conn, "__day__")
+                if row and row.get("last_bar_ts") == today_str:
+                    return dict(row.get("state") or {})
+            finally:
+                conn.close()
+        except Exception:
+            logger.warning("Failed to load day flags", exc_info=True)
+        return {}
+
+    def _save_day_flags(self, today: date, flags: dict[str, Any]) -> None:
+        try:
+            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
+            try:
+                repo.save_tick_state(
+                    conn, "__day__", last_bar_ts=today.isoformat(), state=flags
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            logger.warning("Failed to save day flags", exc_info=True)
 
     # ------------------------------------------------------------------
     # Pre-market scan
@@ -568,20 +421,11 @@ class TradingBot:
         4. Rank tickers: composite(sentiment, gap_pct) descending.
         5. Store result in self._active_watchlist[market].
         """
-        today_et: date = datetime.now(tz=_EASTERN).date()
-        done_key: tuple[Market, date] = (market, today_et)
-        if self._pre_market_done.get(done_key, False):
-            logger.debug(
-                "Pre-market scan already ran today for %s — skipping", market.value
-            )
-            return
-
         logger.info("Pre-market scan starting for %s", market.value)
         watchlist: list[str] = self._config.get_watchlist(market)
 
         if not watchlist:
             logger.warning("Empty watchlist for %s — skipping pre-market scan", market.value)
-            self._pre_market_done[done_key] = True
             return
 
         exchange_str: str = "US"
@@ -601,15 +445,12 @@ class TradingBot:
                 # Benign: Finnhub often returns 403 on ETFs; sentiment is optional.
                 logger.debug("Sentiment refresh failed for %s", ticker, exc_info=True)
 
-        # 3. Subscribe to market data
+        # 3. Subscribe to market data (REST seed — no WebSocket wait needed)
         for ticker in watchlist:
             try:
                 await self._market_data.subscribe(ticker, exchange_str)
             except Exception:
                 logger.exception("Market data sub failed for %s", ticker)
-
-        # Brief pause for data to arrive
-        await asyncio.sleep(2.0)
 
         # 4. Rank tickers
         ranked: list[str] = await self._rank_watchlist(watchlist, market, exchange_str)
@@ -622,7 +463,6 @@ class TradingBot:
             len(ranked),
             ranked,
         )
-        self._pre_market_done[done_key] = True
 
     async def _rank_watchlist(
         self, watchlist: list[str], market: Market, exchange_str: str
@@ -701,9 +541,6 @@ class TradingBot:
         exchange_str: str = "US"
 
         for ticker in watchlist:
-            if self._shutdown:
-                break
-
             # Top-level risk gate before each candidate
             can_trade, reason = self._risk_manager.can_trade()
             if not can_trade:
@@ -1058,7 +895,10 @@ class TradingBot:
                 await self._order_manager.emergency_flatten(ticker, qty, exchange)
                 continue
 
-            # Place limit sell, wait 5 minutes, switch to market if unfilled
+            # Tick-model wind-down: place a DAY limit sell and exit.  Alpaca
+            # auto-cancels the DAY order at close, so any unfilled portion
+            # becomes a market-on-close candidate for the next wind-down tick
+            # (or for the exit-check logic driving emergency_flatten).
             try:
                 from alpaca.trading.requests import LimitOrderRequest
                 from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
@@ -1072,25 +912,10 @@ class TradingBot:
                     limit_price=round(limit_price, 2),
                 )
                 order = self._gateway.client.submit_order(order_data=request)
-                alpaca_order_id: str = str(order.id)
                 logger.info(
                     "Wind-down limit placed: SELL %d %s @ %.2f (order_id=%s)",
-                    qty, ticker, limit_price, alpaca_order_id,
+                    qty, ticker, limit_price, str(order.id),
                 )
-
-                # Wait 5 minutes
-                await asyncio.sleep(5 * 60)
-
-                order_status = self._gateway.client.get_order_by_id(alpaca_order_id)
-                if order_status.status.value not in ("filled", "canceled", "expired"):
-                    logger.info(
-                        "%s: wind-down limit not filled after 5 min — switching to market",
-                        ticker,
-                    )
-                    self._gateway.client.cancel_order_by_id(alpaca_order_id)
-                    await asyncio.sleep(1.0)
-                    await self._order_manager.emergency_flatten(ticker, qty, exchange)
-
             except Exception:
                 logger.exception(
                     "Wind-down order error for %s — trying market flatten", ticker
@@ -1144,14 +969,12 @@ class TradingBot:
             )
             return
 
-        # Subscribe market data for Phase 0 positions
+        # Subscribe market data for Phase 0 positions (sync REST seed)
         for pos_dict in positions_for_assessment:
             try:
                 await self._market_data.subscribe(pos_dict["ticker"], "US")
             except Exception:
                 logger.exception("Phase 0 market data sub failed for %s", pos_dict["ticker"])
-
-        await asyncio.sleep(3.0)  # allow prices to populate
 
         logger.info("Phase 0: assessing %d positions", len(positions_for_assessment))
         assessments = await self._portfolio_assessor.assess_portfolio(
@@ -1526,44 +1349,6 @@ class TradingBot:
         wd_end: time = self._config.get_wind_down_end(market)
         return wd_start <= now_local <= wd_end
 
-    def _is_late_start(self) -> bool:
-        """Return True if bot started more than 20 minutes after the configured start."""
-        start_utc: datetime = self._start_time.astimezone(TZ_UTC)
-        bot_start_str: str = (
-            self._config._get("schedule", "bot_start_gmt") or "07:45"
-        )
-        bot_start_t: time = _parse_time(bot_start_str)
-        expected_utc: datetime = start_utc.replace(
-            hour=bot_start_t.hour,
-            minute=bot_start_t.minute,
-            second=0,
-            microsecond=0,
-        )
-        return start_utc > (expected_utc + timedelta(minutes=20))
-
-    # ------------------------------------------------------------------
-    # Warmup
-    # ------------------------------------------------------------------
-
-    async def _live_warmup(self) -> None:
-        """Live-mode only: subscribe to data and idle 15 minutes before trading."""
-        warmup_minutes: int = int(
-            self._config._get("schedule", "warmup_minutes") or 15
-        )
-        logger.info(
-            "Warmup: subscribing to data for %d minutes (no trading)", warmup_minutes
-        )
-
-        watchlist: list[str] = self._config.get_watchlist(Market.US)
-        for ticker in watchlist:
-            try:
-                await self._market_data.subscribe(ticker, "US")
-            except Exception:
-                logger.exception("Warmup: sub failed for %s", ticker)
-
-        await asyncio.sleep(warmup_minutes * 60)
-        logger.info("Warmup complete — trading enabled")
-
     # ------------------------------------------------------------------
     # Logging setup
     # ------------------------------------------------------------------
@@ -1625,90 +1410,16 @@ class TradingBot:
             root.addHandler(console_handler)
 
     # ------------------------------------------------------------------
-    # Background tasks
+    # Daily task helpers (driven by tick-scoped flags)
     # ------------------------------------------------------------------
 
-    async def _start_background_tasks(self) -> None:
-        """Launch all background coroutines as asyncio Tasks."""
-        logger.info("Starting background tasks...")
-
-        # 1. Gateway heartbeat
-        await self._gateway.start_heartbeat()
-        if self._gateway._heartbeat_task is not None:
-            self._bg_tasks.append(self._gateway._heartbeat_task)
-
-        # 2. FX refresh loop
-        self._bg_tasks.append(
-            asyncio.create_task(self._fx_refresh_loop(), name="fx-refresh")
-        )
-
-        # 3. Market data staleness monitor
-        self._bg_tasks.append(
-            asyncio.create_task(
-                self._market_data.staleness_monitor(), name="staleness-monitor"
-            )
-        )
-
-        # 3b. Order status polling
-        await self._order_manager.start_order_polling()
-        if self._order_manager._poll_task is not None:
-            self._bg_tasks.append(self._order_manager._poll_task)
-
-        # 4. Health server
-        if self._config.health_enabled:
-            self._bg_tasks.append(
-                asyncio.create_task(
-                    _run_health_server(
-                        self._config.health_host,
-                        self._config.health_port,
-                        self,
-                    ),
-                    name="health-server",
-                )
-            )
-
-        # 5. ntfy kill-switch listener
-        self._bg_tasks.append(
-            asyncio.create_task(
-                self._notifier.listen_kill_switch(self._on_kill_switch),
-                name="kill-switch-listener",
-            )
-        )
-
-        logger.info("Background tasks started (%d tasks)", len(self._bg_tasks))
-
-    async def _fx_refresh_loop(self) -> None:
-        """Refresh GBP/USD rate every 60 seconds."""
-        try:
-            while not self._shutdown:
-                try:
-                    await self._fx.refresh()
-                except Exception:
-                    logger.warning("FX refresh error", exc_info=True)
-                await asyncio.sleep(60)
-        except asyncio.CancelledError:
-            pass
-
-    async def _on_kill_switch(self) -> None:
-        """Callback triggered by ntfy kill-switch topic."""
-        logger.critical("Kill switch received — flattening all positions")
-        if self._dry_run:
-            logger.info("[DRY RUN] Would emergency-flatten all positions (kill switch)")
-            self._shutdown = True
-            return
-        await self._risk_manager.handle_kill_switch(self._gateway)
-        self._shutdown = True
-
-    # ------------------------------------------------------------------
-    # Daily task helpers
-    # ------------------------------------------------------------------
-
-    async def _maybe_check_phase_transition(self, today: date) -> None:
+    async def _maybe_check_phase_transition(
+        self, today: date, flags: dict[str, Any]
+    ) -> None:
         """Run phase transition check once per day, after US market close."""
-        if self._last_phase_check_date == today:
+        if flags.get("phase_check_done", False):
             return
 
-        # Only after US wind-down ends
         now_et: datetime = datetime.now(tz=_EASTERN)
         us_wd_end: time = self._config.get_wind_down_end(Market.US)
         check_after_minute: int = (us_wd_end.minute + 5) % 60
@@ -1718,14 +1429,17 @@ class TradingBot:
         if now_et.time() < check_after:
             return
 
-        self._last_phase_check_date = today
         equity: float = await self._get_account_equity_gbp()
         if equity > 0:
             await self._check_phase_transition(equity)
+        flags["phase_check_done"] = True
+        self._save_day_flags(today, flags)
 
-    async def _maybe_save_daily_summary(self, today: date) -> None:
+    async def _maybe_save_daily_summary(
+        self, today: date, flags: dict[str, Any]
+    ) -> None:
         """Save daily summary once per day, shortly after US wind-down ends."""
-        if self._daily_summary_saved_date == today:
+        if flags.get("daily_summary_saved", False):
             return
 
         now_et: datetime = datetime.now(tz=_EASTERN)
@@ -1737,8 +1451,9 @@ class TradingBot:
         if now_et.time() < save_after:
             return
 
-        self._daily_summary_saved_date = today
         await self._save_daily_summary(today)
+        flags["daily_summary_saved"] = True
+        self._save_day_flags(today, flags)
 
     async def _save_daily_summary(self, today: date) -> None:
         """Compute and persist daily metrics, then send a summary notification."""
@@ -1879,17 +1594,6 @@ class TradingBot:
             df = df.set_index("date")
         return df
 
-    async def _sleep_until_next_day(self) -> None:
-        """Sleep until midnight US/Eastern (start of next potential trading day)."""
-        now_et: datetime = datetime.now(tz=_EASTERN)
-        midnight_et: datetime = now_et.replace(
-            hour=0, minute=0, second=0, microsecond=0
-        ) + timedelta(days=1)
-        sleep_seconds: float = (midnight_et - now_et).total_seconds()
-        logger.info("Sleeping %.0f seconds until midnight ET", sleep_seconds)
-        await asyncio.sleep(max(60.0, sleep_seconds))
-
-
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
@@ -1936,10 +1640,9 @@ def _parse_args() -> argparse.Namespace:
 
 
 async def _async_main() -> None:
-    """Async entrypoint: parse args, load config, run bot."""
+    """Async entrypoint: parse args, load config, run a single tick."""
     args = _parse_args()
 
-    # Minimal bootstrap logging before Config loads (Config also logs)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -1948,28 +1651,11 @@ async def _async_main() -> None:
     config: Config = Config.load(args.config)
     bot: TradingBot = TradingBot(config, mode=args.mode, dry_run=args.dry_run)
 
-    # Register OS signals for graceful shutdown
-    loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
-
-    def _handle_signal(sig: int) -> None:
-        logger.info(
-            "Signal %s received — requesting shutdown",
-            signal.Signals(sig).name,
-        )
-        bot._shutdown = True
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _handle_signal, sig)
-
     try:
-        await bot.start()
+        await bot.tick()
     except Exception:
-        logger.exception("TradingBot raised an unhandled exception")
-    finally:
-        try:
-            await bot.shutdown()
-        except Exception:
-            logger.exception("Error during final shutdown")
+        logger.exception("TradingBot tick raised an unhandled exception")
+        raise
 
 
 def main() -> None:
