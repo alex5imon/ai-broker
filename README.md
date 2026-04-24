@@ -35,12 +35,14 @@ python -m bot.backtest --start 2026-01-02T14:30 --end 2026-01-02T20:00
 
 Runs every 5 min in a weekday UTC window. Code gates actual trading with `calendar.py` + Alpaca clock.
 
-Repo secrets required:
-- `ALPACA_API_KEY_ID`
-- `ALPACA_API_SECRET`
+Repo secrets required (both pairs):
+- `ALPACA_PAPER_KEY_ID`
+- `ALPACA_PAPER_SECRET`
+- `ALPACA_LIVE_KEY_ID`
+- `ALPACA_LIVE_SECRET`
 
-Repo variable (optional):
-- `ALPACA_ENV` — defaults to `paper`. Set to `live` to flip.
+Repo variable:
+- `ALPACA_ENV` — defaults to `paper`. Set to `live` to flip to live trading. The workflow selects the matching key pair automatically.
 
 ## Pulling logs back locally
 
