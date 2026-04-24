@@ -1,22 +1,25 @@
-"""Real-time and historical market data management via Alpaca.
+"""Market data via Alpaca REST API.
 
-Handles real-time quote/trade subscriptions via Alpaca WebSocket,
-staleness detection, and historical bar requests via Alpaca Data API.
+Refactored to REST-only for the tick model (Phase 2).  The WebSocket streaming
+path (StockDataStream, _on_quote/_on_trade handlers, staleness_monitor) has
+been removed because GHA cron invocations are too short to maintain a stream.
+
+Public methods that were async remain ``async def`` for caller compatibility;
+their bodies are now synchronous.  A new ``refresh_quotes(tickers)`` method
+bulk-fetches latest quotes via REST and updates the subscription cache; the
+tick orchestrator should call it once per tick before strategy evaluation.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.live import StockDataStream
-from alpaca.data.models import Bar, Quote, Trade
 from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.enums import DataFeed
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
@@ -29,15 +32,10 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 ET: ZoneInfo = ZoneInfo("US/Eastern")
 
-# Hard ceiling for a single synchronous Alpaca REST call. urllib3's internal
-# retries can hang indefinitely on stale sockets after laptop sleep / network
-# flap; this ensures an errant call cannot freeze the asyncio event loop.
-REST_CALL_TIMEOUT_S: float = 30.0
-
 
 @dataclass
 class MarketDataSubscription:
-    """Tracks a single market data subscription."""
+    """Cached market data for a ticker, populated by REST refresh_quotes()."""
 
     ticker: str
     exchange: str
@@ -52,10 +50,12 @@ class MarketDataSubscription:
 
 
 class MarketDataManager:
-    """Manages real-time market data via Alpaca WebSocket and REST API.
+    """REST-only market data access for the tick-model bot.
 
-    Subscribes to real-time quotes for watchlist symbols, detects stale
-    feeds, and serves historical bar requests for strategy calculations.
+    Maintains an in-memory subscription cache so strategy code can keep using
+    ``get_latest_price`` / ``get_bid_ask`` / ``get_spread_pct``.  Populate the
+    cache with ``refresh_quotes(tickers)`` once per tick.  Historical bars are
+    fetched on demand via ``get_historical_bars``.
     """
 
     def __init__(
@@ -74,8 +74,6 @@ class MarketDataManager:
         self._staleness_threshold_s: int = int(
             md_cfg.get("staleness_threshold_seconds", 30)
         )
-        # When false, mass staleness still logs but doesn't halt trading,
-        # and is_stale() always reports False. See config.yaml for rationale.
         self._pause_on_staleness: bool = bool(
             md_cfg.get("pause_on_mass_staleness", True)
         )
@@ -91,109 +89,26 @@ class MarketDataManager:
             secret_key=secret_key,
         )
 
-        self._stream: StockDataStream = StockDataStream(
-            api_key=api_key,
-            secret_key=secret_key,
-            feed=DataFeed(self._data_feed),
-        )
-        self._stream_task: asyncio.Task[None] | None = None
-        self._stream_running: bool = False
-
         self._trading_paused: bool = False
         self._running: bool = False
 
     # -------------------------------------------------------------------------
-    # Stream lifecycle
+    # Stream lifecycle — kept as no-op coroutines for caller compat.  Will be
+    # removed once main.py is rewritten as a stateless tick.
     # -------------------------------------------------------------------------
 
     async def start_stream(self) -> None:
-        """Start the Alpaca WebSocket data stream in a background task.
-
-        Per-symbol handlers are registered by subscribe() — do NOT call
-        subscribe_quotes/subscribe_trades here without symbols, alpaca-py
-        rejects that with ValueError.
-        """
-        if self._stream_running:
-            return
-
-        self._stream_running = True
-        self._stream_task = asyncio.create_task(
-            self._run_stream(), name="alpaca-data-stream"
-        )
-        logger.info("Alpaca data stream started (feed=%s)", self._data_feed)
-
-    async def _run_stream(self) -> None:
-        """Run the WebSocket stream.  Reconnects automatically on disconnect."""
-        try:
-            await self._stream._run_forever()
-        except asyncio.CancelledError:
-            logger.info("Data stream cancelled")
-        except Exception:
-            logger.exception("Data stream error — will restart on next subscribe")
-            self._stream_running = False
+        logger.debug("start_stream is a no-op in the tick model")
 
     async def stop_stream(self) -> None:
-        """Stop the data stream."""
-        self._stream_running = False
-        if self._stream_task is not None and not self._stream_task.done():
-            self._stream_task.cancel()
-            try:
-                await self._stream_task
-            except asyncio.CancelledError:
-                pass
-            self._stream_task = None
-        try:
-            await self._stream.close()
-        except Exception:
-            # Benign on shutdown: stream may already be half-closed.
-            logger.debug("Error closing data stream", exc_info=True)
+        logger.debug("stop_stream is a no-op in the tick model")
 
     # -------------------------------------------------------------------------
-    # Quote / Trade callbacks
-    # -------------------------------------------------------------------------
-
-    async def _on_quote(self, quote: Quote) -> None:
-        """Handle incoming quote from Alpaca WebSocket."""
-        ticker: str = str(quote.symbol)
-        sub: MarketDataSubscription | None = self._subscriptions.get(ticker)
-        if sub is None:
-            return
-
-        now: datetime = datetime.now(tz=ET)
-        sub.bid = float(quote.bid_price) if quote.bid_price else sub.bid
-        sub.ask = float(quote.ask_price) if quote.ask_price else sub.ask
-        if sub.bid and sub.ask:
-            sub.last_price = (sub.bid + sub.ask) / 2.0
-        sub.last_tick_time = now
-
-        if sub.is_stale:
-            logger.info("Market data recovered for %s", ticker)
-            sub.is_stale = False
-            sub.excluded = False
-
-    async def _on_trade(self, trade: Trade) -> None:
-        """Handle incoming trade from Alpaca WebSocket."""
-        ticker: str = str(trade.symbol)
-        sub: MarketDataSubscription | None = self._subscriptions.get(ticker)
-        if sub is None:
-            return
-
-        now: datetime = datetime.now(tz=ET)
-        sub.last_price = float(trade.price)
-        sub.volume = int(trade.size) if trade.size else sub.volume
-        sub.last_tick_time = now
-
-        if sub.is_stale:
-            logger.info("Market data recovered for %s", ticker)
-            sub.is_stale = False
-            sub.excluded = False
-
-    # -------------------------------------------------------------------------
-    # Subscribe / unsubscribe
+    # Subscribe / unsubscribe — register cache entries only (no WebSocket).
     # -------------------------------------------------------------------------
 
     async def subscribe(self, ticker: str, exchange: str = "US") -> None:
-        """Subscribe to real-time quotes for a ticker."""
+        """Register a cache entry for *ticker* and seed it with a REST quote."""
         if ticker in self._subscriptions and not self._subscriptions[ticker].excluded:
             logger.debug("Already subscribed to %s, skipping", ticker)
             return
@@ -207,13 +122,11 @@ class MarketDataManager:
         )
         self._subscriptions[ticker] = sub
 
-        # Fetch initial quote via REST
         try:
-            request = StockLatestQuoteRequest(symbol_or_symbols=ticker, feed=self._data_feed)
-            quotes = await asyncio.wait_for(
-                asyncio.to_thread(self._historical_client.get_stock_latest_quote, request),
-                timeout=REST_CALL_TIMEOUT_S,
+            request = StockLatestQuoteRequest(
+                symbol_or_symbols=ticker, feed=self._data_feed
             )
+            quotes = self._historical_client.get_stock_latest_quote(request)
             if ticker in quotes:
                 q = quotes[ticker]
                 sub.bid = float(q.bid_price) if q.bid_price else None
@@ -224,89 +137,97 @@ class MarketDataManager:
             # Benign: free IEX paper often returns no quote before market open.
             logger.debug("Initial quote fetch failed for %s", ticker, exc_info=True)
 
-        # Subscribe via WebSocket.
-        #
-        # alpaca-py's subscribe_quotes/subscribe_trades take a fast path while
-        # the stream isn't connected (just storing handlers) but once the WS
-        # is connected they call asyncio.run_coroutine_threadsafe(...).result()
-        # — which deadlocks if invoked from the same event loop that is
-        # running the stream. Dispatch to a worker thread so .result() can
-        # wait while our event loop continues to drive the stream.
-        try:
-            await asyncio.to_thread(
-                self._stream.subscribe_quotes, self._on_quote, ticker
-            )
-            await asyncio.to_thread(
-                self._stream.subscribe_trades, self._on_trade, ticker
-            )
-        except Exception:
-            logger.exception("WebSocket subscribe failed for %s", ticker)
-
-        if not self._stream_running:
-            await self.start_stream()
-
-        logger.info("Subscribed to market data for %s", ticker)
+        logger.debug("Subscribed to market data for %s", ticker)
 
     async def unsubscribe(self, ticker: str) -> None:
-        """Unsubscribe from market data for a ticker."""
-        sub: MarketDataSubscription | None = self._subscriptions.get(ticker)
-        if sub is None:
-            return
-
-        try:
-            await asyncio.to_thread(self._stream.unsubscribe_quotes, ticker)
-            await asyncio.to_thread(self._stream.unsubscribe_trades, ticker)
-        except Exception:
-            # Benign: subscription may already be gone or stream closed.
-            logger.debug("Error unsubscribing from %s", ticker, exc_info=True)
-
-        del self._subscriptions[ticker]
-        logger.info("Unsubscribed from market data for %s", ticker)
+        """Drop the cache entry for *ticker*."""
+        if ticker in self._subscriptions:
+            del self._subscriptions[ticker]
+            logger.debug("Unsubscribed from market data for %s", ticker)
 
     async def subscribe_watchlist(self, market: str) -> None:
         """Subscribe to all tickers in the watchlist for a given market."""
         watchlist_cfg: dict[str, Any] = self._config.get("watchlist", {})
         tickers: list[str] = list(watchlist_cfg.get(market.lower(), []))
 
-        logger.info("Subscribing to %d %s watchlist tickers", len(tickers), market.upper())
-
+        logger.info(
+            "Subscribing to %d %s watchlist tickers", len(tickers), market.upper()
+        )
         for ticker in tickers:
             await self.subscribe(ticker, "US")
-            await asyncio.sleep(0.05)
 
     async def unsubscribe_all(self) -> None:
-        """Unsubscribe from all active market data subscriptions."""
-        tickers: list[str] = list(self._subscriptions.keys())
+        """Drop all cache entries."""
+        self._subscriptions.clear()
+
+    # -------------------------------------------------------------------------
+    # REST quote refresh — the tick-model replacement for WebSocket streaming.
+    # -------------------------------------------------------------------------
+
+    async def refresh_quotes(self, tickers: list[str]) -> None:
+        """Bulk-fetch latest quotes via REST and update the subscription cache.
+
+        Subscriptions are created on the fly for any ticker not already tracked.
+        The per-ticker ``last_tick_time`` is set to *now* on success.
+        """
+        if not tickers:
+            return
+
+        now: datetime = datetime.now(tz=ET)
+        try:
+            request = StockLatestQuoteRequest(
+                symbol_or_symbols=tickers, feed=self._data_feed
+            )
+            quotes = self._historical_client.get_stock_latest_quote(request)
+        except Exception:
+            logger.exception("Bulk quote refresh failed for %d tickers", len(tickers))
+            return
+
         for ticker in tickers:
-            await self.unsubscribe(ticker)
+            sub = self._subscriptions.get(ticker)
+            if sub is None:
+                sub = MarketDataSubscription(
+                    ticker=ticker,
+                    exchange="US",
+                    subscribed_at=now,
+                )
+                self._subscriptions[ticker] = sub
+
+            q = quotes.get(ticker)
+            if q is None:
+                continue
+            sub.bid = float(q.bid_price) if q.bid_price else sub.bid
+            sub.ask = float(q.ask_price) if q.ask_price else sub.ask
+            if sub.bid and sub.ask:
+                sub.last_price = (sub.bid + sub.ask) / 2.0
+            sub.last_tick_time = now
+            if sub.is_stale:
+                logger.info("Market data recovered for %s", ticker)
+                sub.is_stale = False
+                sub.excluded = False
 
     # -------------------------------------------------------------------------
     # Price / quote accessors
     # -------------------------------------------------------------------------
 
     def get_latest_price(self, ticker: str) -> float | None:
-        """Get the last traded price for a ticker."""
         sub: MarketDataSubscription | None = self._subscriptions.get(ticker)
         if sub is None:
             return None
         return sub.last_price
 
     def get_bid_ask(self, ticker: str) -> tuple[float, float] | None:
-        """Get current bid and ask prices."""
         sub: MarketDataSubscription | None = self._subscriptions.get(ticker)
         if sub is None:
             return None
-
         if sub.bid is not None and sub.ask is not None and sub.bid > 0 and sub.ask > 0:
             return (sub.bid, sub.ask)
         return None
 
     def get_spread_pct(self, ticker: str) -> float | None:
-        """Get current bid-ask spread as a percentage of mid-price."""
         ba: tuple[float, float] | None = self.get_bid_ask(ticker)
         if ba is None:
             return None
-
         bid, ask = ba
         mid: float = (bid + ask) / 2.0
         if mid <= 0:
@@ -314,14 +235,12 @@ class MarketDataManager:
         return (ask - bid) / mid
 
     def get_volume(self, ticker: str) -> int | None:
-        """Get today's cumulative volume for a ticker."""
         sub: MarketDataSubscription | None = self._subscriptions.get(ticker)
         if sub is None:
             return None
         return sub.volume if sub.volume > 0 else None
 
     def get_ticker_object(self, ticker: str) -> MarketDataSubscription | None:
-        """Get the subscription object for a ticker."""
         return self._subscriptions.get(ticker)
 
     # -------------------------------------------------------------------------
@@ -336,10 +255,7 @@ class MarketDataManager:
         duration: str = "1 D",
         what_to_show: str = "TRADES",
     ) -> list[dict[str, Any]]:
-        """Request historical data bars from Alpaca.
-
-        Returns a list of dicts with keys: open, high, low, close, volume, date.
-        """
+        """Fetch historical bars from Alpaca (synchronous under the async wrapper)."""
         timeframe: TimeFrame = self._parse_bar_size(bar_size)
         start: datetime = self._parse_duration(duration)
 
@@ -350,17 +266,8 @@ class MarketDataManager:
                 start=start,
                 feed=self._data_feed,
             )
-            bars_response = await asyncio.wait_for(
-                asyncio.to_thread(self._historical_client.get_stock_bars, request),
-                timeout=REST_CALL_TIMEOUT_S,
-            )
+            bars_response = self._historical_client.get_stock_bars(request)
             bars_data = bars_response.data.get(ticker, [])
-        except asyncio.TimeoutError:
-            logger.error(
-                "Historical bars timeout (>%.0fs) for %s (%s, %s)",
-                REST_CALL_TIMEOUT_S, ticker, bar_size, duration,
-            )
-            return []
         except Exception:
             logger.exception(
                 "Failed to fetch historical bars for %s (%s, %s)",
@@ -391,7 +298,6 @@ class MarketDataManager:
 
     @staticmethod
     def _parse_bar_size(bar_size: str) -> TimeFrame:
-        """Convert IB-style bar size string to Alpaca TimeFrame."""
         bar_size_lower: str = bar_size.lower().strip()
         if bar_size_lower in ("1 min", "1min"):
             return TimeFrame(1, TimeFrameUnit.Minute)
@@ -407,7 +313,6 @@ class MarketDataManager:
 
     @staticmethod
     def _parse_duration(duration: str) -> datetime:
-        """Convert IB-style duration string to a start datetime."""
         now: datetime = datetime.now(tz=ET)
         parts: list[str] = duration.strip().split()
         if len(parts) != 2:
@@ -425,12 +330,11 @@ class MarketDataManager:
         return now - timedelta(days=amount)
 
     # -------------------------------------------------------------------------
-    # Staleness detection
+    # Staleness detection — retained as a per-tick check against last_tick_time.
+    # The long-running staleness_monitor loop is gone (no process to run it).
     # -------------------------------------------------------------------------
 
     def is_stale(self, ticker: str) -> bool:
-        # When streaming-based pauses are disabled, strategies rely on REST
-        # bar fetches for freshness, so always report not-stale here.
         if not self._pause_on_staleness:
             return False
         sub: MarketDataSubscription | None = self._subscriptions.get(ticker)
@@ -452,28 +356,20 @@ class MarketDataManager:
         return self._trading_paused
 
     async def staleness_monitor(self) -> None:
-        """Background loop checking for stale market data."""
-        self._running = True
-        logger.info("Staleness monitor started")
-
-        while self._running:
-            try:
-                await asyncio.sleep(5.0)
-                await self._check_staleness()
-            except asyncio.CancelledError:
-                logger.info("Staleness monitor cancelled")
-                break
-            except Exception:
-                logger.exception("Error in staleness monitor loop")
-                await asyncio.sleep(5.0)
-
-        logger.info("Staleness monitor stopped")
+        """No-op: the tick model has no long-running monitor loop."""
+        logger.debug("staleness_monitor is a no-op in the tick model")
 
     def stop_monitor(self) -> None:
         self._running = False
 
     async def _check_staleness(self) -> None:
-        """Check all subscriptions for staleness."""
+        """Mark subscriptions as stale when their last_tick_time is too old.
+
+        The mass-staleness circuit breaker sets ``trading_paused`` and sends a
+        notification when more than ``mass_staleness_pct`` of subscriptions
+        have gone stale.  In the tick model this is invoked at most once per
+        tick by the orchestrator.
+        """
         now: datetime = datetime.now(tz=ET)
         threshold: timedelta = timedelta(seconds=self._staleness_threshold_s)
 
@@ -499,48 +395,47 @@ class MarketDataManager:
                     )
                 stale_count += 1
 
-        if total_subscribed > 0:
-            stale_ratio: float = stale_count / total_subscribed
-            mass_pct: float = float(
-                self._config.get("market_data", {}).get("mass_staleness_pct", 0.50)
+        if total_subscribed == 0:
+            return
+
+        stale_ratio: float = stale_count / total_subscribed
+        md_cfg: dict[str, Any] = self._config.get("market_data", {})
+        mass_pct: float = float(md_cfg.get("mass_staleness_pct", 0.50))
+        resume_pct: float = float(md_cfg.get("mass_staleness_resume_pct", 0.25))
+
+        if stale_ratio > mass_pct and not self._trading_paused:
+            if self._pause_on_staleness:
+                self._trading_paused = True
+            logger.critical(
+                "Mass staleness: %d/%d symbols stale (%.0f%%)%s",
+                stale_count, total_subscribed, stale_ratio * 100,
+                "" if self._pause_on_staleness
+                else " (pause disabled - trading continues via REST bars)",
             )
-            resume_pct: float = float(
-                self._config.get("market_data", {}).get("mass_staleness_resume_pct", 0.25)
+            if not self._pause_on_staleness:
+                return
+            await self._notifier.send(
+                title="CRITICAL: Mass Market Data Staleness",
+                message=(
+                    f"Market data stale for {stale_count}/{total_subscribed} "
+                    f"symbols ({stale_ratio:.0%}). Trading paused."
+                ),
+                priority=5,
+                tags=["warning", "market_data"],
             )
 
-            if stale_ratio > mass_pct and not self._trading_paused:
-                if self._pause_on_staleness:
-                    self._trading_paused = True
-                logger.critical(
-                    "Mass staleness: %d/%d symbols stale (%.0f%%)%s",
-                    stale_count, total_subscribed, stale_ratio * 100,
-                    "" if self._pause_on_staleness else " (pause disabled — trading continues via REST bars)",
-                )
-                if not self._pause_on_staleness:
-                    # Don't send a pause notification or fall into the pause branch.
-                    return
-                await self._notifier.send(
-                    title="CRITICAL: Mass Market Data Staleness",
-                    message=(
-                        f"Market data stale for {stale_count}/{total_subscribed} "
-                        f"symbols ({stale_ratio:.0%}). Trading paused."
-                    ),
-                    priority=5,
-                    tags=["warning", "market_data"],
-                )
-
-            elif self._trading_paused and stale_ratio < resume_pct:
-                self._trading_paused = False
-                logger.info(
-                    "Mass staleness resolved: %d/%d (%.0f%%). Resuming.",
-                    stale_count, total_subscribed, stale_ratio * 100,
-                )
-                await self._notifier.send(
-                    title="Market Data Recovered",
-                    message=(
-                        f"Stale count dropped to {stale_count}/{total_subscribed} "
-                        f"({stale_ratio:.0%}). Trading resumed."
-                    ),
-                    priority=3,
-                    tags=["market_data"],
-                )
+        elif self._trading_paused and stale_ratio < resume_pct:
+            self._trading_paused = False
+            logger.info(
+                "Mass staleness resolved: %d/%d (%.0f%%). Resuming.",
+                stale_count, total_subscribed, stale_ratio * 100,
+            )
+            await self._notifier.send(
+                title="Market Data Recovered",
+                message=(
+                    f"Stale count dropped to {stale_count}/{total_subscribed} "
+                    f"({stale_ratio:.0%}). Trading resumed."
+                ),
+                priority=3,
+                tags=["market_data"],
+            )
