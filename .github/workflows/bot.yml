@@ -41,8 +41,8 @@ jobs:
       - name: Run bot
         env:
           ALPACA_ENV: ${{ vars.ALPACA_ENV || 'paper' }}
-          ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
-          ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
+          ALPACA_API_KEY_ID: ${{ vars.ALPACA_ENV == 'live' && secrets.ALPACA_LIVE_KEY_ID || secrets.ALPACA_PAPER_KEY_ID }}
+          ALPACA_API_SECRET: ${{ vars.ALPACA_ENV == 'live' && secrets.ALPACA_LIVE_SECRET || secrets.ALPACA_PAPER_SECRET }}
           BOT_LOG_DIR: logs
           BOT_STATE_DIR: state
         run: python -m bot.run
