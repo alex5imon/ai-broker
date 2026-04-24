@@ -475,7 +475,10 @@ class TradingBot:
                 now_gmt_time: time = now_utc.time()
 
                 if not (bot_start_gmt <= now_gmt_time <= bot_end_gmt):
-                    logger.debug(
+                    # Heartbeat at INFO so the external watchdog sees a fresh
+                    # log entry while the bot is legitimately idle outside
+                    # operating hours. Fires once per minute.
+                    logger.info(
                         "Outside operating hours (%s GMT) — sleeping 60s",
                         now_utc.strftime("%H:%M"),
                     )

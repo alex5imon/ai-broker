@@ -238,16 +238,19 @@ class StateRecovery:
             stop_price = round(avg_cost * (1.0 + stop_pct), 2)
 
         try:
+            # Alpaca requires a positive qty; side (SELL for long, BUY for
+            # short) determines whether the order closes or opens exposure.
+            order_qty: int = abs(qty)
             request = StopOrderRequest(
                 symbol=ticker,
-                qty=qty,
+                qty=order_qty,
                 side=side,
                 type=OrderType.STOP,
                 time_in_force=TimeInForce.GTC,
                 stop_price=stop_price,
             )
             self._gw.client.submit_order(order_data=request)
-            logger.info("Emergency stop placed for %s: %s %d @ stop %.2f", ticker, side.value, qty, stop_price)
+            logger.info("Emergency stop placed for %s: %s %d @ stop %.2f", ticker, side.value, order_qty, stop_price)
         except Exception:
             logger.exception("Failed to place emergency stop for %s", ticker)
 

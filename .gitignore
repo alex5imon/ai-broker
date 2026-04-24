@@ -10,8 +10,9 @@ logs/
 *.plist
 .pytest_cache/
 *.egg-info/
-data/
-backtest_data/
+/data/
+/backtest_data/
+*.bak
 dist/
 build/
 backtest_results/
