@@ -11,7 +11,7 @@ Perform a comprehensive review of today's trading performance across both market
 Query the database for all of today's trades, split by market:
 
 ```bash
-cd /Users/alex/Broker
+cd <project-root>
 python3 -c "
 import sqlite3
 from datetime import datetime
@@ -39,7 +39,7 @@ conn.close()
 ```
 
 Also check for the daily report file:
-- `/Users/alex/Broker/reports/daily_YYYY-MM-DD.html`
+- `reports/daily_YYYY-MM-DD.html`
 
 ## Step 2: Summarize Key Metrics (By Market and Combined)
 
@@ -77,7 +77,7 @@ Avg hold time:     Xm           Xm           Xm
 Compare today's performance against the daily compound growth target (0.3-0.5% per day):
 
 ```bash
-cd /Users/alex/Broker
+cd <project-root>
 python3 -c "
 import sqlite3
 conn = sqlite3.connect('trading_bot/data/trading_bot.db')
@@ -109,7 +109,7 @@ For USD positions, show the FX impact:
 - Net FX gain/loss on USD positions
 
 ```bash
-cd /Users/alex/Broker
+cd <project-root>
 python3 -c "
 import sqlite3
 from datetime import datetime
@@ -143,7 +143,7 @@ This is important because a profitable USD trade can become less profitable (or 
 Report current phase and progress:
 
 ```bash
-cd /Users/alex/Broker
+cd <project-root>
 python3 -c "
 import sqlite3
 conn = sqlite3.connect('trading_bot/data/trading_bot.db')
@@ -166,7 +166,7 @@ conn.close()
 Read the last 5 trading days:
 
 ```bash
-cd /Users/alex/Broker
+cd <project-root>
 python3 -c "
 import sqlite3
 conn = sqlite3.connect('trading_bot/data/trading_bot.db')

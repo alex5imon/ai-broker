@@ -9,7 +9,7 @@ websocket subscription, bracket-order plumbing, and DB schema.
 ### Usage
 
 ```bash
-cd /Users/alex/Broker
+cd <project-root>
 source .venv/bin/activate
 SSL_CERT_FILE=$(python -c 'import certifi; print(certifi.where())') \
     python scripts/smoke_paper.py

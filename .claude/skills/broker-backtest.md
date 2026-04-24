@@ -27,7 +27,7 @@ Ask the user what they want to validate:
 ## Step 3: Run the Backtest
 
 ```bash
-cd /Users/alex/Broker
+cd <project-root>
 
 # Single-day (requires ALPACA_API_KEY/SECRET_KEY in .env)
 python -m trading_bot.backtest --date YYYY-MM-DD
@@ -91,7 +91,7 @@ Execution Realism). Outputs land in `reports/` with per-strategy verdicts:
 Deploy / Refine / Abandon.
 
 ```bash
-cd /Users/alex/Broker
+cd <project-root>
 python3 scripts/evaluate_backtest_from_json.py --latest
 # or pass an explicit path:
 python3 scripts/evaluate_backtest_from_json.py \

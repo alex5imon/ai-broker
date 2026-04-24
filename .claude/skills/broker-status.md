@@ -66,8 +66,8 @@ Note: This is a simplified check and does not account for holidays. Flag if it i
 
 Find and read today's log file. Check common locations:
 
-- `/Users/alex/Broker/logs/trading_YYYY-MM-DD.log`
-- `/Users/alex/Broker/trading_bot.log`
+- `logs/trading_YYYY-MM-DD.log`
+- `trading_bot.log`
 
 Use today's date. Read the last 100 lines to get recent activity.
 
@@ -76,7 +76,7 @@ Use today's date. Read the last 100 lines to get recent activity.
 Query for open positions across both LSE and US:
 
 ```bash
-cd /Users/alex/Broker
+cd <project-root>
 python3 -c "
 import sqlite3
 from datetime import datetime
@@ -99,7 +99,7 @@ Report each open position with: ticker, market (LSE/US), side, entry price, curr
 Query the database for today's closed trades, converting USD P&L to GBP:
 
 ```bash
-cd /Users/alex/Broker
+cd <project-root>
 python3 -c "
 import sqlite3
 from datetime import datetime
@@ -134,7 +134,7 @@ conn.close()
 Check the current phase and progress toward the next phase:
 
 ```bash
-cd /Users/alex/Broker
+cd <project-root>
 python3 -c "
 import sqlite3, yaml
 conn = sqlite3.connect('trading_bot/data/trading_bot.db')
@@ -160,7 +160,7 @@ conn.close()
 
 # Check config for daily limit and phase thresholds
 try:
-    with open('/Users/alex/Broker/config.yaml') as f:
+    with open('config.yaml') as f:
         config = yaml.safe_load(f)
     risk = config.get('risk', {})
     print(f'Daily trade limit: {risk.get(\"max_daily_trades\", \"not set\")}')
@@ -181,7 +181,7 @@ Report the breakdown of settled and unsettled cash:
 - Show how much buying power is actually available
 
 ```bash
-cd /Users/alex/Broker
+cd <project-root>
 python3 -c "
 import sqlite3
 conn = sqlite3.connect('trading_bot/data/trading_bot.db')
@@ -199,7 +199,7 @@ conn.close()
 Search today's log for errors and warnings:
 
 ```bash
-grep -i "ERROR\|WARNING\|CRITICAL" /Users/alex/Broker/logs/trading_$(date +%Y-%m-%d).log | tail -20
+grep -i "ERROR\|WARNING\|CRITICAL" logs/trading_$(date +%Y-%m-%d).log | tail -20
 ```
 
 Categorize and summarize any issues found.

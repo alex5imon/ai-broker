@@ -30,7 +30,7 @@ ground truth exit prices).
 ### From a backtest
 
 ```bash
-cd /Users/alex/Broker
+cd <project-root>
 
 # Most recent backtest (find with: ls -t backtest_results/*.json | head -1)
 python3 scripts/postmortem_from_trades.py \
