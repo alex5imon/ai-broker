@@ -16,6 +16,7 @@ logs/
 dist/
 build/
 backtest_results/
+reports/
 .DS_Store
 .claude/*
 !.claude/skills/
