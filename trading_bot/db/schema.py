@@ -247,6 +247,30 @@ CREATE INDEX IF NOT EXISTS idx_positions_strategy ON positions(strategy_id);
 CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy_id);
 CREATE INDEX IF NOT EXISTS idx_settlements_strategy ON settlements(strategy_id);
 
+-- Tick model state: per-strategy state carried across stateless GHA cron runs.
+-- Replaces in-memory coordinator state that previously lived only in the
+-- long-running asyncio loop.  state_json is a free-form blob so new fields
+-- can be added without further migrations.
+CREATE TABLE IF NOT EXISTS tick_state (
+    strategy_id     TEXT PRIMARY KEY,
+    last_bar_ts     TEXT,
+    last_run_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    state_json      TEXT NOT NULL DEFAULT '{}',
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Risk circuit breaker state: persists drawdown limits, consecutive-loss
+-- counters, kill switches, etc. across runs.  The key is either 'global'
+-- for account-wide circuits or a strategy_id for per-strategy circuits.
+CREATE TABLE IF NOT EXISTS risk_circuit_state (
+    key             TEXT PRIMARY KEY,
+    tripped         INTEGER NOT NULL DEFAULT 0,
+    tripped_at      TEXT,
+    reason          TEXT,
+    state_json      TEXT NOT NULL DEFAULT '{}',
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS schema_version (
     version         INTEGER PRIMARY KEY,
@@ -257,7 +281,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 
 _SEED_VERSION_SQL: str = (
     "INSERT OR IGNORE INTO schema_version (version, description) "
-    "VALUES (?, 'V6 schema - positions.strategy_id NOT NULL');"
+    "VALUES (?, 'V7 schema - tick_state + risk_circuit_state');"
 )
 
 # Expected tables — used for quick health check
@@ -276,6 +300,8 @@ _EXPECTED_TABLES: frozenset[str] = frozenset(
         "phase0_assessments",
         "backtest_results",
         "strategy_portfolios",
+        "tick_state",
+        "risk_circuit_state",
         "schema_version",
     }
 )
