@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
+from alpaca.data.enums import DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
@@ -38,6 +39,7 @@ def fetch_recent_bars(
         timeframe=TimeFrame(bar_minutes, TimeFrameUnit.Minute),
         start=start,
         end=now,
+        feed=DataFeed.IEX,
     )
     resp = client.get_stock_bars(req).df
 
