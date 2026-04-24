@@ -2,17 +2,21 @@
 
 Fetches GBP/USD rate from a free API (with fallback to a static rate)
 for converting USD positions and P&L to GBP for reporting.
+
+Phase 4 (tick model): the ``refresh_loop`` background task is gone
+because a stateless cron tick has nothing to loop over.  ``refresh()``
+keeps its ``async def`` signature for caller compat but performs a
+synchronous ``requests`` call.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
-import aiohttp
+import requests
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -44,7 +48,6 @@ class FXManager:
 
         self._rate: float | None = None
         self._last_update: datetime | None = None
-        self._running: bool = False
 
     # -------------------------------------------------------------------------
     # Rate fetching
@@ -53,49 +56,21 @@ class FXManager:
     async def refresh(self) -> None:
         """Fetch current GBP/USD rate from the free exchange rate API."""
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(_EXCHANGE_RATE_URL, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status != 200:
-                        logger.warning("FX API returned status %d", resp.status)
-                        return
-                    data: dict[str, Any] = await resp.json()
-                    rates: dict[str, float] = data.get("rates", {})
-                    usd_rate: float | None = rates.get("USD")
-                    if usd_rate and usd_rate > 0:
-                        self._rate = usd_rate
-                        self._last_update = datetime.now(tz=ET)
-                        logger.debug("GBP/USD rate updated: %.5f", self._rate)
-                    else:
-                        logger.warning("No USD rate in API response")
+            resp = requests.get(_EXCHANGE_RATE_URL, timeout=10)
+            if resp.status_code != 200:
+                logger.warning("FX API returned status %d", resp.status_code)
+                return
+            data: dict[str, Any] = resp.json()
+            rates: dict[str, float] = data.get("rates", {})
+            usd_rate: float | None = rates.get("USD")
+            if usd_rate and usd_rate > 0:
+                self._rate = usd_rate
+                self._last_update = datetime.now(tz=ET)
+                logger.debug("GBP/USD rate updated: %.5f", self._rate)
+            else:
+                logger.warning("No USD rate in API response")
         except Exception:
-            # Benign: falls back to cached/fallback rate; next tick will retry.
             logger.debug("Failed to fetch GBP/USD rate from API", exc_info=True)
-
-    async def refresh_loop(self) -> None:
-        """Background loop refreshing FX rate periodically."""
-        self._running = True
-        logger.info(
-            "FX refresh loop started (interval=%ds, fallback=%.4f)",
-            self._refresh_interval_s, self._fallback_rate,
-        )
-
-        while self._running:
-            try:
-                await self.refresh()
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                logger.warning("Error in FX refresh loop", exc_info=True)
-
-            try:
-                await asyncio.sleep(self._refresh_interval_s)
-            except asyncio.CancelledError:
-                break
-
-        logger.info("FX refresh loop stopped")
-
-    def stop(self) -> None:
-        self._running = False
 
     # -------------------------------------------------------------------------
     # Rate accessors
