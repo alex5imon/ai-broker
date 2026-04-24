@@ -1,16 +1,21 @@
-"""Alpaca Trading API connection manager with health monitoring."""
+"""Alpaca Trading API connection manager.
+
+Refactored for the tick model (Phase 2c): the long-running heartbeat task and
+reconnect alerting logic have been removed because a GHA cron tick is too
+short to benefit from them.  ``connect()`` validates credentials by fetching
+the account; if it fails the tick aborts.  Public methods keep ``async def``
+signatures for caller compat while bodies are synchronous REST calls.
+"""
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
-import time
 from typing import Any
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.models import Position as AlpacaPosition
 from alpaca.trading.models import Order as AlpacaOrder
+from alpaca.trading.models import Position as AlpacaPosition
 from alpaca.trading.models import TradeAccount
 
 from trading_bot.notifications.notifier import Notifier
@@ -19,11 +24,11 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 
 class GatewayConnection:
-    """Manages the connection to Alpaca Trading API.
+    """Manages the Alpaca Trading API client for a single tick.
 
-    Unlike IB Gateway, Alpaca uses a REST API — there is no persistent
-    socket connection.  "Connected" means the API keys are valid and
-    we can reach the service.  Health checks poll the account endpoint.
+    Alpaca is REST-only — there is no persistent socket to maintain.  The
+    ``connect()`` call validates credentials and caches the ``TradingClient``;
+    the tick orchestrator calls it once at the start of each run.
     """
 
     def __init__(self, config: dict[str, Any], notifier: Notifier) -> None:
@@ -32,32 +37,19 @@ class GatewayConnection:
         self._api_key: str = os.environ.get("ALPACA_API_KEY", "")
         self._secret_key: str = os.environ.get("ALPACA_SECRET_KEY", "")
         self._paper: bool = bool(alpaca_cfg.get("paper", False))
-        self._max_retries: int = int(alpaca_cfg.get("max_retries", 5))
-        self._retry_backoff: int = int(alpaca_cfg.get("retry_backoff_seconds", 30))
-        # Suppress ntfy alerts for short transient reconnects. Only emit the
-        # "connection lost" / "reconnected" ntfy pair when the outage has
-        # persisted past this threshold. Exhausted-retries CRITICAL alerts
-        # bypass this gate. Default 120s (= typical Alpaca blip is <30s).
-        self._alert_threshold_seconds: int = int(
-            alpaca_cfg.get("reconnect_alert_threshold_seconds", 120)
-        )
 
         self._notifier: Notifier = notifier
         self._client: TradingClient | None = None
 
         self._connected: bool = False
-        self._heartbeat_task: asyncio.Task[None] | None = None
-        self._last_heartbeat: float = 0.0
-        self._connect_time: float = 0.0
-        self._disconnect_time: float | None = None
+        self._account_id: str = ""
 
     # ------------------------------------------------------------------
-    # Public interface
+    # Properties
     # ------------------------------------------------------------------
 
     @property
     def client(self) -> TradingClient:
-        """The Alpaca TradingClient instance."""
         if self._client is None:
             raise RuntimeError("Not connected to Alpaca — call connect() first")
         return self._client
@@ -68,25 +60,14 @@ class GatewayConnection:
 
     @property
     def account_id(self) -> str:
-        """Alpaca account number (fetched on connect)."""
         return self._account_id
-
-    @property
-    def last_heartbeat(self) -> float:
-        return self._last_heartbeat
-
-    @property
-    def uptime_seconds(self) -> float:
-        if self._connect_time == 0.0:
-            return 0.0
-        return time.monotonic() - self._connect_time
 
     # ------------------------------------------------------------------
     # Connect / Disconnect
     # ------------------------------------------------------------------
 
     async def connect(self) -> bool:
-        """Validate Alpaca credentials by fetching the account.  Returns True on success."""
+        """Validate Alpaca credentials by fetching the account."""
         if not self._api_key or not self._secret_key:
             logger.error(
                 "ALPACA_API_KEY and ALPACA_SECRET_KEY must be set as environment variables"
@@ -104,11 +85,8 @@ class GatewayConnection:
                 paper=self._paper,
             )
             account: TradeAccount = self._client.get_account()
-            self._account_id: str = str(account.account_number)
+            self._account_id = str(account.account_number)
             self._connected = True
-            self._connect_time = time.monotonic()
-            self._last_heartbeat = time.monotonic()
-            self._disconnect_time = None
 
             logger.info(
                 "Connected to Alpaca (account=%s, equity=$%s, status=%s)",
@@ -124,154 +102,26 @@ class GatewayConnection:
             return False
 
     async def disconnect(self) -> None:
-        """Mark as disconnected.  Alpaca REST has no persistent connection to close."""
-        if self._heartbeat_task is not None:
-            self._heartbeat_task.cancel()
-            try:
-                await self._heartbeat_task
-            except asyncio.CancelledError:
-                pass
-            self._heartbeat_task = None
-
+        """Clear the cached client.  No persistent connection to close."""
         self._connected = False
         self._client = None
-        logger.info("Disconnected from Alpaca")
+        logger.debug("Disconnected from Alpaca")
 
     # ------------------------------------------------------------------
-    # Heartbeat
+    # Heartbeat — no-op in the tick model.  Kept as a coroutine stub so
+    # any remaining callers (main.py) can still ``await`` it without
+    # raising.  Remove once main.py is rewritten as a stateless tick.
     # ------------------------------------------------------------------
 
     async def start_heartbeat(self) -> None:
-        """Launch periodic health check as a background task."""
-        if self._heartbeat_task is not None:
-            self._heartbeat_task.cancel()
-            try:
-                await self._heartbeat_task
-            except asyncio.CancelledError:
-                pass
-        self._heartbeat_task = asyncio.create_task(
-            self._heartbeat_loop(), name="alpaca-heartbeat"
-        )
-
-    async def _heartbeat_loop(self) -> None:
-        """Poll the account endpoint every 60 seconds to verify connectivity."""
-        try:
-            while True:
-                await asyncio.sleep(60)
-                try:
-                    if self._client is None:
-                        self._connected = False
-                        await self._handle_disconnect()
-                        continue
-
-                    self._client.get_account()
-                    self._last_heartbeat = time.monotonic()
-                    self._connected = True
-                    logger.debug("Heartbeat OK")
-
-                except Exception:
-                    logger.warning("Heartbeat failed", exc_info=True)
-                    self._connected = False
-                    await self._handle_disconnect()
-
-        except asyncio.CancelledError:
-            return
-
-    async def _handle_disconnect(self) -> None:
-        """Attempt to re-establish connectivity.
-
-        ntfy alerts are suppressed for short transient outages: a "lost"
-        alert only fires once the outage has exceeded
-        ``_alert_threshold_seconds``, and the matching "reconnected" alert
-        only fires if we already sent the "lost". This avoids pinging the
-        user for every sub-minute Alpaca REST blip. Exhausted-retries
-        CRITICAL alerts are not gated — they always fire.
-        """
-        if self._disconnect_time is None:
-            self._disconnect_time = time.monotonic()
-        # Capture locally: self._disconnect_time gets cleared inside
-        # connect() on success, which used to leave downtime at 0 (bug).
-        down_at: float = self._disconnect_time
-
-        logger.warning(
-            "Alpaca connection lost at t=%.0f — entering retry loop",
-            down_at,
-        )
-
-        notified_lost: bool = False
-
-        for attempt in range(1, self._max_retries + 1):
-            wait: int = self._retry_backoff * (2 ** (attempt - 1))
-            logger.info("Reconnect attempt %d/%d in %ds", attempt, self._max_retries, wait)
-            await asyncio.sleep(wait)
-
-            # Before retrying, decide whether this outage has earned a
-            # user-facing alert. Cheap to re-check; avoids a separate task.
-            elapsed: float = time.monotonic() - down_at
-            if not notified_lost and elapsed >= self._alert_threshold_seconds:
-                await self._notifier.gateway_alert(
-                    f"Alpaca API connection lost for {elapsed:.0f}s. "
-                    "Attempting reconnect...",
-                    is_critical=False,
-                )
-                notified_lost = True
-
-            if await self.connect():
-                # connect() clears self._disconnect_time on success — use
-                # our local snapshot to compute real downtime.
-                downtime: float = time.monotonic() - down_at
-
-                if notified_lost:
-                    await self._notifier.gateway_alert(
-                        f"Alpaca reconnected after {downtime:.0f}s downtime",
-                        is_critical=False,
-                    )
-                else:
-                    logger.info(
-                        "Alpaca reconnected after %.0fs (silent — under %ds threshold)",
-                        downtime, self._alert_threshold_seconds,
-                    )
-                return
-
-        # Retries exhausted — always alert, regardless of threshold.
-        await self._notifier.gateway_alert(
-            f"Alpaca connection lost — {self._max_retries} attempts failed. "
-            "Retrying every 5 min.",
-            is_critical=True,
-        )
-        await self._connection_wait_loop()
-
-    async def _connection_wait_loop(self) -> None:
-        """Retry every 5 minutes indefinitely.  The bot never exits."""
-        # Snapshot disconnect_time BEFORE retrying: connect() clears the
-        # attribute on success, which would otherwise zero out the
-        # downtime figure reported to the user.
-        down_at: float | None = self._disconnect_time
-        while True:
-            await asyncio.sleep(300)
-            logger.info("Connection-wait: attempting reconnect")
-            if await self.connect():
-                downtime: float = (
-                    time.monotonic() - down_at if down_at is not None else 0.0
-                )
-                logger.info("Connection restored after extended outage (%.0fs)", downtime)
-                await self._notifier.gateway_alert(
-                    f"Alpaca reconnected after extended outage ({downtime:.0f}s downtime)",
-                    is_critical=False,
-                )
-                return
+        logger.debug("start_heartbeat is a no-op in the tick model")
 
     # ------------------------------------------------------------------
     # Account queries
     # ------------------------------------------------------------------
 
     async def get_account_summary(self) -> dict[str, Any]:
-        """Retrieve account cash, equity, and buying power.
-
-        Returns a dict with keys matching the old IB interface for
-        compatibility: ``NetLiquidation``, ``TotalCashValue``,
-        ``BuyingPower``, ``SettledCash``.
-        """
+        """Retrieve account cash, equity, and buying power."""
         if not self.is_connected or self._client is None:
             logger.warning("get_account_summary called while disconnected")
             return {}
