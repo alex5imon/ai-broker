@@ -129,8 +129,7 @@ class MeanReversionStrategy(StrategyBase):
         if len(df_5min) < self._bb_period + self._bb_lookback_bars:
             return False
 
-        df = df_5min.copy()
-        df.columns = [c.lower() for c in df.columns]
+        df = df_5min.rename(columns=str.lower)
         for col in ("close", "low"):
             if col not in df.columns:
                 return False
@@ -189,8 +188,7 @@ class MeanReversionStrategy(StrategyBase):
             return None
 
         # Volume confirmation: current bar volume must exceed average
-        df_e: pd.DataFrame = df_5min.copy()
-        df_e.columns = [c.lower() for c in df_e.columns]
+        df_e: pd.DataFrame = df_5min.rename(columns=str.lower)
         vol_avg: float = float(df_e["volume"].rolling(20).mean().iloc[-1])
         current_vol: float = float(df_e["volume"].iloc[-1])
         if vol_avg <= 0 or current_vol < self._volume_multiplier * vol_avg:

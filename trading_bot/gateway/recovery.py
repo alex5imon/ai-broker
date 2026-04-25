@@ -17,12 +17,13 @@ from zoneinfo import ZoneInfo
 from alpaca.trading.models import Position as AlpacaPosition
 from alpaca.trading.models import Order as AlpacaOrder
 
+from trading_bot.constants import TZ_EASTERN
 from trading_bot.gateway.connection import GatewayConnection
 from trading_bot.notifications.notifier import Notifier
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-ET: ZoneInfo = ZoneInfo("US/Eastern")
+ET: ZoneInfo = TZ_EASTERN
 
 
 @dataclass
@@ -309,6 +310,11 @@ class StateRecovery:
     def _close_db_position(self, position_id: int, reason: str) -> None:
         now: str = datetime.now(tz=ET).isoformat()
         conn: sqlite3.Connection = sqlite3.connect(self._db_path)
+        # Use Row factory so the audit-table INSERT below references columns
+        # by name. Positional indexing into ``row[1]…row[14]`` breaks
+        # silently when the positions table schema gets reordered or
+        # extended by a future migration.
+        conn.row_factory = sqlite3.Row
         try:
             conn.execute(
                 "UPDATE positions SET status = 'CLOSED', updated_at = ? WHERE id = ?",
@@ -323,12 +329,22 @@ class StateRecovery:
                        (ticker, exchange, currency, side, entry_time,
                         entry_price, quantity, exit_time, exit_reason,
                         hold_type, phase, notes)
-                       VALUES (?, ?, ?, 'SELL', ?, ?, ?, ?, ?, ?, ?,
+                       VALUES (:ticker, :exchange, :currency, 'SELL',
+                               :entry_time, :entry_price, :quantity,
+                               :exit_time, :exit_reason, :hold_type, :phase,
                                'Auto-closed by state recovery')""",
-                    (
-                        row[1], row[2], row[3], row[7], row[6],
-                        row[5], now, reason, row[13], row[14],
-                    ),
+                    {
+                        "ticker": row["ticker"],
+                        "exchange": row["exchange"],
+                        "currency": row["currency"],
+                        "entry_time": row["entry_time"],
+                        "entry_price": row["entry_price"],
+                        "quantity": row["quantity"],
+                        "exit_time": now,
+                        "exit_reason": reason,
+                        "hold_type": row["hold_type"],
+                        "phase": row["phase"],
+                    },
                 )
             conn.commit()
         except sqlite3.OperationalError:

@@ -14,8 +14,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
@@ -28,18 +27,13 @@ from alpaca.trading.requests import (
     LimitOrderRequest,
     MarketOrderRequest,
     StopLossRequest,
-    StopOrderRequest,
     TakeProfitRequest,
     TrailingStopOrderRequest,
 )
 
 from trading_bot.constants import (
-    TICKER_EXCHANGE,
-    Currency,
-    Exchange,
+    TZ_EASTERN,
     ExitReason,
-    HoldType,
-    Market,
     PositionStatus,
 )
 
@@ -50,7 +44,7 @@ if TYPE_CHECKING:
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-ET: ZoneInfo = ZoneInfo("US/Eastern")
+ET: ZoneInfo = TZ_EASTERN
 
 
 # ---------------------------------------------------------------------------
@@ -720,14 +714,6 @@ class OrderManager:
                 self._alpaca_to_trade.pop(oid, None)
 
     # ------------------------------------------------------------------
-    # Contract / Order builders (compatibility)
-    # ------------------------------------------------------------------
-
-    def _make_contract(self, ticker: str, exchange: str) -> str:
-        """Return the symbol string.  Alpaca uses plain ticker symbols."""
-        return ticker
-
-    # ------------------------------------------------------------------
     # Database helpers
     # ------------------------------------------------------------------
 
@@ -736,6 +722,9 @@ class OrderManager:
         try:
             conn: sqlite3.Connection = sqlite3.connect(self._db_path)
             try:
+                # Both inserts share a single transaction. If the trades
+                # insert fails we ROLLBACK so we never leave a positions
+                # row without its matching trades audit row.
                 cursor = conn.execute(
                     "INSERT INTO positions "
                     "(ticker, exchange, currency, sector, quantity, entry_price, "
@@ -765,9 +754,7 @@ class OrderManager:
                         now_str,
                     ),
                 )
-                conn.commit()
                 trade_id: int = cursor.lastrowid  # type: ignore[assignment]
-                logger.info("Created position record: %s trade_id=%d", decision.ticker, trade_id)
 
                 conn.execute(
                     "INSERT INTO trades "
@@ -791,6 +778,10 @@ class OrderManager:
                     ),
                 )
                 conn.commit()
+                logger.info(
+                    "Created position record: %s trade_id=%d",
+                    decision.ticker, trade_id,
+                )
                 return trade_id
             finally:
                 conn.close()
@@ -801,25 +792,32 @@ class OrderManager:
     def _update_position_status(self, trade_id: int, status: PositionStatus) -> None:
         self._update_position_field(trade_id, "status", status.value)
 
-    def _update_position_field(self, trade_id: int, field_name: str, value: Any) -> None:
-        now_str: str = datetime.now(tz=ET).isoformat()
-        allowed_fields: frozenset[str] = frozenset({
+    # Pre-built UPDATE statements per allowed column. The column name is
+    # part of the static SQL; misuse of this helper (e.g. attacker- or
+    # config-controlled field name) cannot reach ``conn.execute`` with a
+    # column outside this map. Far harder to misuse than a dynamic
+    # f-string with a separate allowlist.
+    _POSITION_UPDATE_SQL: dict[str, str] = {
+        col: f"UPDATE positions SET {col} = ?, updated_at = ? WHERE id = ?"
+        for col in (
             "status", "alpaca_order_id", "alpaca_stop_order_id",
             "alpaca_target_order_id", "alpaca_trail_order_id", "oca_group",
             "quantity", "entry_price", "stop_price", "target_price",
             "trailing_active", "trailing_distance", "highest_price",
-        })
-        if field_name not in allowed_fields:
+        )
+    }
+
+    def _update_position_field(self, trade_id: int, field_name: str, value: Any) -> None:
+        sql: str | None = self._POSITION_UPDATE_SQL.get(field_name)
+        if sql is None:
             logger.error("Attempted to update disallowed field: %s", field_name)
             return
 
+        now_str: str = datetime.now(tz=ET).isoformat()
         try:
             conn: sqlite3.Connection = sqlite3.connect(self._db_path)
             try:
-                conn.execute(
-                    f"UPDATE positions SET {field_name} = ?, updated_at = ? WHERE id = ?",
-                    (value, now_str, trade_id),
-                )
+                conn.execute(sql, (value, now_str, trade_id))
                 conn.commit()
             finally:
                 conn.close()

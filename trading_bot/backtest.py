@@ -21,15 +21,15 @@ import logging
 import math
 import sqlite3
 import uuid
-from dataclasses import dataclass, field, asdict
-from datetime import date, datetime, timedelta, timezone
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from trading_bot.config import Config
-from trading_bot.data_cache import load_cached, save_to_cache
+from trading_bot.data_cache import load_cached
 from trading_bot.constants import (
     GICS_SECTOR,
     TICKER_EXCHANGE,
@@ -37,7 +37,6 @@ from trading_bot.constants import (
     HoldType,
     Market,
     TZ_EASTERN,
-    TZ_UTC,
 )
 from trading_bot.db.repository import save_backtest_result
 from trading_bot.strategy.technical import TechnicalAnalyzer

@@ -7,7 +7,6 @@ the current phase via Config.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import sqlite3
 import time
@@ -18,9 +17,7 @@ from zoneinfo import ZoneInfo
 
 from trading_bot.constants import (
     GICS_SECTOR,
-    ExitReason,
-    Phase,
-    PositionStatus,
+    TZ_EASTERN,
 )
 
 if TYPE_CHECKING:
@@ -32,7 +29,7 @@ if TYPE_CHECKING:
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-ET: ZoneInfo = ZoneInfo("US/Eastern")
+ET: ZoneInfo = TZ_EASTERN
 
 
 class RiskManager:
@@ -81,6 +78,13 @@ class RiskManager:
 
         # Commission budget state
         self._commission_cooldown_until: datetime | None = None
+
+        # Daily-loss-limit and commission-stop flags.  Plain booleans rather
+        # than the previous getattr-shadow-property pattern; declaring them
+        # in __init__ makes the state visible to type checkers and to any
+        # reader scanning for object state.
+        self._daily_loss_limit_hit: bool = False
+        self._commission_stop_active: bool = False
 
     # ------------------------------------------------------------------
     # Top-level gate
@@ -161,14 +165,6 @@ class RiskManager:
                 self._config.daily_loss_limit_pct * 100,
             )
         return breached
-
-    @property
-    def _daily_loss_limit_hit(self) -> bool:
-        return getattr(self, "_loss_limit_flag", False)
-
-    @_daily_loss_limit_hit.setter
-    def _daily_loss_limit_hit(self, value: bool) -> None:
-        self._loss_limit_flag: bool = value
 
     def check_max_positions(self, current_count: int) -> bool:
         """Return ``True`` if max concurrent positions reached."""
@@ -407,9 +403,23 @@ class RiskManager:
         )
         self._pause_until = pause_until
 
-        # Fire-and-forget notification
-        asyncio.ensure_future(
-            self._notifier.drawdown_alert(drawdown_pct, pause_days)
+        # Synchronous send — risk-manager methods run from sync code
+        # (``can_trade()``).  Scheduling via ``asyncio.ensure_future`` could be
+        # silently dropped if the tick exits before the task runs, and would
+        # raise ``RuntimeError`` if no event loop is running (e.g. in tests).
+        self._notifier.send_sync(
+            "\U0001f4c9 [DRAWDOWN BREAKER] Triggered",
+            (
+                f"Drawdown: {drawdown_pct:.1%} from 5-day peak\n"
+                f"Trading paused for {pause_days} day(s)"
+            ),
+            priority=int(
+                self._config._get(
+                    "notifications", "priorities", "drawdown_breaker",
+                    default=5,
+                )
+            ),
+            tags=["chart_with_downwards_trend"],
         )
 
     def check_order_rejections(self) -> bool:
@@ -457,14 +467,12 @@ class RiskManager:
             )
             self._pause_until = pause_until
 
-            asyncio.ensure_future(
-                self._notifier.send(
-                    "Order Rejections",
-                    f"{len(self._recent_rejections)} rejections in {window_minutes} min. "
-                    f"Pausing new entries for {pause_minutes} min.",
-                    priority=4,
-                    tags=["warning"],
-                )
+            self._notifier.send_sync(
+                "Order Rejections",
+                f"{len(self._recent_rejections)} rejections in {window_minutes} min. "
+                f"Pausing new entries for {pause_minutes} min.",
+                priority=4,
+                tags=["warning"],
             )
             return True
 
@@ -553,14 +561,6 @@ class RiskManager:
             return "warning"
 
         return None
-
-    @property
-    def _commission_stop_active(self) -> bool:
-        return getattr(self, "_comm_stop_flag", False)
-
-    @_commission_stop_active.setter
-    def _commission_stop_active(self, value: bool) -> None:
-        self._comm_stop_flag: bool = value
 
     # ------------------------------------------------------------------
     # Trade recording

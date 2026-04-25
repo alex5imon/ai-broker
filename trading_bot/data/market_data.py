@@ -21,8 +21,9 @@ from zoneinfo import ZoneInfo
 
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
-from alpaca.data.enums import DataFeed
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+from trading_bot.constants import TZ_EASTERN
 
 if TYPE_CHECKING:
     from trading_bot.gateway import GatewayConnection
@@ -30,7 +31,7 @@ if TYPE_CHECKING:
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-ET: ZoneInfo = ZoneInfo("US/Eastern")
+ET: ZoneInfo = TZ_EASTERN
 
 
 @dataclass
@@ -93,17 +94,6 @@ class MarketDataManager:
         self._running: bool = False
 
     # -------------------------------------------------------------------------
-    # Stream lifecycle — kept as no-op coroutines for caller compat.  Will be
-    # removed once main.py is rewritten as a stateless tick.
-    # -------------------------------------------------------------------------
-
-    async def start_stream(self) -> None:
-        logger.debug("start_stream is a no-op in the tick model")
-
-    async def stop_stream(self) -> None:
-        logger.debug("stop_stream is a no-op in the tick model")
-
-    # -------------------------------------------------------------------------
     # Subscribe / unsubscribe — register cache entries only (no WebSocket).
     # -------------------------------------------------------------------------
 
@@ -144,17 +134,6 @@ class MarketDataManager:
         if ticker in self._subscriptions:
             del self._subscriptions[ticker]
             logger.debug("Unsubscribed from market data for %s", ticker)
-
-    async def subscribe_watchlist(self, market: str) -> None:
-        """Subscribe to all tickers in the watchlist for a given market."""
-        watchlist_cfg: dict[str, Any] = self._config.get("watchlist", {})
-        tickers: list[str] = list(watchlist_cfg.get(market.lower(), []))
-
-        logger.info(
-            "Subscribing to %d %s watchlist tickers", len(tickers), market.upper()
-        )
-        for ticker in tickers:
-            await self.subscribe(ticker, "US")
 
     async def unsubscribe_all(self) -> None:
         """Drop all cache entries."""

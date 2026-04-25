@@ -21,7 +21,6 @@ import pandas as pd
 from trading_bot.config import Config
 from trading_bot.constants import (
     GICS_SECTOR,
-    ExitReason,
     HoldType,
     Market,
     Phase,
@@ -37,7 +36,7 @@ from trading_bot.strategy.technical import TechnicalAnalyzer
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-ET: ZoneInfo = ZoneInfo("US/Eastern")
+ET: ZoneInfo = TZ_EASTERN
 
 
 # ---------------------------------------------------------------------------

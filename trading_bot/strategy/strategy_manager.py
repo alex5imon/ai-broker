@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from trading_bot.constants import GICS_SECTOR, HoldType
+from trading_bot.constants import GICS_SECTOR, TZ_EASTERN
 from trading_bot.execution.order_manager import EntryDecision as OMEntryDecision
 from trading_bot.execution.virtual_portfolio import PortfolioManager, VirtualPortfolio
 from trading_bot.strategy.base import ExitSignal, StrategyBase, StrategyDecision
@@ -18,7 +18,7 @@ from trading_bot.strategy.regime_filter import RegimeFilter
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-ET: ZoneInfo = ZoneInfo("US/Eastern")
+ET: ZoneInfo = TZ_EASTERN
 
 
 class StrategyManager:
