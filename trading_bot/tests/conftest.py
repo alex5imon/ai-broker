@@ -144,9 +144,16 @@ def mock_gateway():
 
 @pytest.fixture
 def mock_notifier():
-    """Mock notifier that records calls."""
+    """Mock notifier that records calls.
+
+    ``send_sync`` is genuinely synchronous on the real ``Notifier`` (see
+    :func:`trading_bot.notifications.notifier.Notifier.send_sync`); using
+    ``AsyncMock`` for that attribute would emit ``coroutine was never
+    awaited`` warnings from the sync risk-manager paths.
+    """
     notifier = AsyncMock()
     notifier.send = AsyncMock(return_value=None)
+    notifier.send_sync = MagicMock(return_value=None)
     notifier.gateway_alert = AsyncMock(return_value=None)
     notifier.drawdown_alert = AsyncMock(return_value=None)
     notifier.kill_switch = AsyncMock(return_value=None)

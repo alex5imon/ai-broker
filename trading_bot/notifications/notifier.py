@@ -134,8 +134,10 @@ class Notifier:
     ) -> None:
         emoji: str = "\u2705" if pnl >= 0 else "\u274c"
         title: str = f"{emoji} [POSITION CLOSED] {ticker}"
+        # P&L is denominated in USD \u2014 Alpaca trades execute in USD and there
+        # is no FX conversion in this notification path.
         message: str = (
-            f"P&L: {pnl:+.2f}\n"
+            f"P&L: ${pnl:+.2f}\n"
             f"Hold time: {hold_time}\n"
             f"Exit reason: {exit_reason}"
         )
@@ -144,7 +146,7 @@ class Notifier:
 
     async def stop_loss_hit(self, ticker: str, loss: float) -> None:
         title: str = f"\U0001f6d1 [STOP LOSS] {ticker}"
-        message: str = f"Loss: {loss:+.2f}"
+        message: str = f"Loss: ${loss:+.2f}"
         priority: int = self._priorities.get("stop_loss_hit", 4)
         await self.send(title, message, priority, tags=["rotating_light"])
 
@@ -241,19 +243,6 @@ class Notifier:
         await self.send(title, message, priority, tags=["stop_button"])
 
     # ------------------------------------------------------------------
-    # Kill-switch listener — no-op in the tick model.  The SSE listener
-    # assumed a long-running asyncio process; GHA cron invocations are
-    # too short to hold an SSE connection open, and the kill switch is
-    # now enforced via the risk_circuit_state table.
-    # ------------------------------------------------------------------
-
-    async def listen_kill_switch(self, callback: Any) -> None:
-        logger.info(
-            "listen_kill_switch is a no-op in the tick model "
-            "(kill switch enforced via risk_circuit_state)"
-        )
-
-    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
@@ -328,10 +317,30 @@ class Notifier:
 
         return False
 
+    @staticmethod
+    def _osa_safe(value: str) -> str:
+        """Strip everything an AppleScript string literal can interpret.
+
+        AppleScript's quoted-string syntax interprets ``\\``, ``"``, backticks,
+        and ``$`` (when the calling context is a shell, not osascript itself,
+        but we still want to be conservative).  Notification text is
+        bot-generated today, but anything that ever flows in from external
+        sources (Alpaca error strings echoing tickers, news headlines, etc.)
+        could otherwise smuggle in characters that break out of the literal.
+        """
+        cleaned: str = value.encode("ascii", "ignore").decode("ascii")
+        # Drop any byte that could carry meaning inside the AppleScript
+        # source we're about to assemble.  Whitespace is collapsed to a
+        # single space so multi-line messages still render legibly.
+        return "".join(
+            ch if (ch.isprintable() and ch not in '"\\`$') else " "
+            for ch in cleaned
+        ).strip()
+
     def _send_osascript(self, title: str, message: str) -> None:
         """Best-effort macOS native notification fallback."""
-        clean_title: str = title.encode("ascii", "ignore").decode("ascii").strip()
-        clean_msg: str = message.replace('"', '\\"').replace("\n", " | ")
+        clean_title: str = self._osa_safe(title)
+        clean_msg: str = self._osa_safe(message)
         script: str = (
             f'display notification "{clean_msg}" '
             f'with title "{clean_title}"'
