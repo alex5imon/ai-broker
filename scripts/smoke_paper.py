@@ -226,10 +226,13 @@ def check_db_schema() -> str:
 
 async def run() -> int:
     load_env()
-    api_key = os.environ.get("ALPACA_API_KEY")
-    secret = os.environ.get("ALPACA_SECRET_KEY")
+    # Resolve ALPACA_PAPER_KEY_ID/SECRET (or LIVE) → ALPACA_API_KEY/SECRET_KEY.
+    sys.path.insert(0, str(REPO_ROOT))
+    from trading_bot.env import resolve_alpaca_env
+    api_key, secret, _ = resolve_alpaca_env()
     if not api_key or not secret:
-        print(f"{RED}SMOKE FAILED: ALPACA_API_KEY / ALPACA_SECRET_KEY not set{RESET}")
+        print(f"{RED}SMOKE FAILED: Alpaca paper credentials not set "
+              f"(need ALPACA_PAPER_KEY_ID / ALPACA_PAPER_SECRET in .env){RESET}")
         return 1
 
     paper = load_paper_flag()

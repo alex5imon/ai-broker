@@ -108,21 +108,19 @@ print(f'  Watchlist: {len(c.get_watchlist(Market.US))} US tickers')
 # ---------------------------------------------------------------------------
 # 4. Verify Alpaca credentials + REST reachability
 # ---------------------------------------------------------------------------
-if [ -z "${ALPACA_API_KEY:-}" ] || [ -z "${ALPACA_SECRET_KEY:-}" ]; then
-    log "ERROR: ALPACA_API_KEY / ALPACA_SECRET_KEY are not set (.env or shell)."
-    exit 1
-fi
-
 log "Pinging Alpaca REST API..."
 if ! python3 -c "
-import sys
+import sys, os
+from trading_bot.env import resolve_alpaca_env
+api_key, secret, is_paper = resolve_alpaca_env()
+if not api_key or not secret:
+    print('ERROR: Alpaca credentials missing — set ALPACA_PAPER_KEY_ID / ALPACA_PAPER_SECRET '
+          '(or LIVE pair if ALPACA_ENV=live) in .env.', file=sys.stderr)
+    sys.exit(1)
 from alpaca.trading.client import TradingClient
-import yaml, os
-with open('${CONFIG}') as f:
-    paper = bool(yaml.safe_load(f).get('alpaca', {}).get('paper', True))
-client = TradingClient(os.environ['ALPACA_API_KEY'], os.environ['ALPACA_SECRET_KEY'], paper=paper)
+client = TradingClient(api_key, secret, paper=is_paper)
 acct = client.get_account()
-print(f'  Account: {acct.account_number} status={acct.status} equity=\${acct.equity} paper={paper}')
+print(f'  Account: {acct.account_number} status={acct.status} equity=\${acct.equity} paper={is_paper}')
 " 2>>"$TODAY_LOG" | while read -r line; do log "$line"; done; then
     log "ERROR: Alpaca REST ping failed — see log for traceback."
     python3 -c "
