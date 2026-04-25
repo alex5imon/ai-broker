@@ -11,7 +11,6 @@ import logging
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from jinja2 import Environment, FileSystemLoader, TemplateNotFound
 
