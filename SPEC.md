@@ -4,7 +4,6 @@
 **Date**: 2026-04-20
 **Status**: Active
 **Account**: Alpaca Paper Account, GBP base currency (for reporting)
-**Project root**: `~/Broker/` (moved from `~/Documents/Claude/Projects/Broker/` on 2026-04-17)
 
 ---
 
@@ -1240,7 +1239,7 @@ On every startup, the bot determines its current phase:
 
 ## Section 14: Configuration (config.yaml)
 
-The live config is at `~/Broker/config.yaml` — that file is the single source of truth. The snippet below is illustrative; whenever the live config and this spec disagree, the live config wins.
+The live config is at `config.yaml` in the project root — that file is the single source of truth. The snippet below is illustrative; whenever the live config and this spec disagree, the live config wins.
 
 ```yaml
 # =============================================================================

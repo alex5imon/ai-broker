@@ -9,7 +9,8 @@
 
 set -euo pipefail
 
-PROJECT_DIR="/Users/alex/Broker"
+# Derive project root from this script's location (scripts/ is one level deep).
+PROJECT_DIR="${PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 LOG_DIR="${PROJECT_DIR}/logs"
 WATCHDOG_LOG="${LOG_DIR}/watchdog.log"
 RESTART_TOMBSTONE="${LOG_DIR}/.watchdog_last_restart"

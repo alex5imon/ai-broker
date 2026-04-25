@@ -22,13 +22,11 @@ Autonomous adaptive US equity trading bot built with Python 3.10+ and the Alpaca
 
 ## Project Location
 
-The project lives at `~/Broker/` (previously `/Users/alex/Documents/Claude/Projects/Broker/`, moved on 2026-04-17 for permission reasons). All commands below assume `cd ~/Broker` first.
+All commands below assume you are at the project root (`cd` into it first).
 
 ## Key Commands
 
 ```bash
-cd ~/Broker
-
 # Run the bot
 python -m trading_bot.main
 
