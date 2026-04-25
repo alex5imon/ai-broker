@@ -1601,6 +1601,11 @@ class MultiStrategyBacktester:
                     else:
                         pos_value += trade.entry_price * trade.shares
                 total_now = st.cash_usd + pos_value
+                if total_now > st.peak_equity_usd:
+                    st.peak_equity_usd = total_now
+                dd_pct = (st.peak_equity_usd - total_now) / st.peak_equity_usd * 100
+                if dd_pct > st.max_drawdown_pct:
+                    st.max_drawdown_pct = dd_pct
                 total_before = day_start_equity[sid]
                 if total_before > 0:
                     st.daily_returns.append(
