@@ -111,7 +111,7 @@ class TestStrategyState:
     def test_initial_peak_matches_cash(self) -> None:
         strat = _make_strategy_mock()
         state = _StrategyState(strategy=strat, cash_usd=1000.0, initial_cash_usd=1000.0)
-        assert state.peak_cash_usd == 1000.0
+        assert state.peak_equity_usd == 1000.0
         assert state.open_positions == []
         assert state.closed_trades == []
 
@@ -380,9 +380,10 @@ class TestCloseTrade:
     def test_close_losing_trade(self, config: Config) -> None:
         engine = MultiStrategyBacktester(config)
         strat = _make_strategy_mock()
-        # Start with peak at 1000, cash at 900 (100 used for position)
+        # 100 used for the position; equity (cash + open_pos_value) is unchanged.
+        # max_drawdown_pct is updated by the daily mark-to-market loop, not by
+        # _close_trade itself, so we only assert P&L bookkeeping here.
         state = _StrategyState(strategy=strat, cash_usd=900.0, initial_cash_usd=1000.0)
-        state.peak_cash_usd = 1000.0
         now = datetime.now(TZ_ET)
         trade = StrategyTrade(
             strategy_id="test",
@@ -401,7 +402,6 @@ class TestCloseTrade:
 
         assert state.losses == 1
         assert trade.net_pnl_usd < 0
-        assert state.max_drawdown_pct > 0
 
 
 # ---------------------------------------------------------------------------
