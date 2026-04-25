@@ -11,7 +11,7 @@ Review the current watchlists for both LSE and US markets, analyze per-ticker pe
 Read both watchlists from `config.yaml`:
 
 ```bash
-cd /Users/alex/Broker
+cd <project-root>
 python3 -c "
 import yaml
 with open('config.yaml') as f:
@@ -30,7 +30,7 @@ for market in ['lse', 'us']:
 Query the database for per-ticker stats over the last 5-10 trading days, split by market:
 
 ```bash
-cd /Users/alex/Broker
+cd <project-root>
 python3 -c "
 import sqlite3
 conn = sqlite3.connect('trading_bot/data/trading_bot.db')

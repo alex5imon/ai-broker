@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — One-time setup for the IB trading bot on macOS.
+# install.sh — One-time setup for the Alpaca trading bot on macOS.
 #
 # What it does:
 #   1. Checks Python >= 3.10
@@ -10,7 +10,7 @@
 #   6. Verifies config.yaml exists
 #
 # Usage:
-#   cd /Users/alex/Broker
+#   cd <project-root>
 #   bash install.sh
 
 set -euo pipefail

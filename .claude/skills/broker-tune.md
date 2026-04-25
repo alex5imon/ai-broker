@@ -11,7 +11,7 @@ Analyze recent trading performance across both LSE and US markets and recommend 
 Read the current `config.yaml`:
 
 ```bash
-cat /Users/alex/Broker/config.yaml
+cat config.yaml
 ```
 
 Note all tunable parameters and their current values. Key parameter categories:
@@ -57,7 +57,7 @@ Note all tunable parameters and their current values. Key parameter categories:
 ## Step 2: Determine Current Phase
 
 ```bash
-cd /Users/alex/Broker
+cd <project-root>
 python3 -c "
 import sqlite3
 conn = sqlite3.connect('trading_bot/data/trading_bot.db')
@@ -80,7 +80,7 @@ Recommendations must be appropriate for the current phase:
 Query the last 5 trading days from the database, broken down by market:
 
 ```bash
-cd /Users/alex/Broker
+cd <project-root>
 python3 -c "
 import sqlite3, json
 conn = sqlite3.connect('trading_bot/data/trading_bot.db')
@@ -129,7 +129,7 @@ conn.close()
 Also check for recent config snapshots:
 
 ```bash
-cd /Users/alex/Broker
+cd <project-root>
 python3 -c "
 import sqlite3
 conn = sqlite3.connect('trading_bot/data/trading_bot.db')
@@ -201,7 +201,7 @@ If the user approves specific changes, edit `config.yaml` using the Edit tool. C
 After making changes, snapshot the full config:
 
 ```bash
-cd /Users/alex/Broker
+cd <project-root>
 python3 -c "
 import sqlite3, json, yaml
 from datetime import datetime
@@ -229,7 +229,7 @@ how we find out when parameter tuning has hit a local optimum and a
 structural pivot is needed rather than more knob-twiddling.
 
 ```bash
-cd /Users/alex/Broker
+cd <project-root>
 
 # 1. Run a backtest with the new config (see broker-backtest.md)
 python -m trading_bot.multi_strategy_backtest --from 2017-01-01 --to 2018-01-01 --spy

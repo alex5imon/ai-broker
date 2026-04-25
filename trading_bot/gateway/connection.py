@@ -36,7 +36,14 @@ class GatewayConnection:
 
         self._api_key: str = os.environ.get("ALPACA_API_KEY", "")
         self._secret_key: str = os.environ.get("ALPACA_SECRET_KEY", "")
-        self._paper: bool = bool(alpaca_cfg.get("paper", False))
+        # ALPACA_ENV (paper|live) is the canonical source — the resolver
+        # in trading_bot.env sets it consistently for local + GHA.  Fall back
+        # to the config.yaml flag only when ALPACA_ENV is unset.
+        env: str | None = os.environ.get("ALPACA_ENV")
+        if env is not None:
+            self._paper: bool = env.strip().lower() != "live"
+        else:
+            self._paper = bool(alpaca_cfg.get("paper", False))
 
         self._notifier: Notifier = notifier
         self._client: TradingClient | None = None

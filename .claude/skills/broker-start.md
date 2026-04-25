@@ -20,10 +20,10 @@ If this fails, tell the user to start IB Gateway and wait for it to be ready. Th
 
 ## Step 2: Validate config.yaml
 
-Verify that `config.yaml` exists in the project root (`/Users/alex/Broker/config.yaml`) and is valid YAML:
+Verify that `config.yaml` exists in the project root (`config.yaml`) and is valid YAML:
 
 ```bash
-python3 -c "import yaml; yaml.safe_load(open('/Users/alex/Broker/config.yaml'))"
+python3 -c "import yaml; yaml.safe_load(open('config.yaml'))"
 ```
 
 Check that required keys are present (at minimum: `watchlist`, `risk`, `strategy` sections, plus `lse` and `us` market sections).
@@ -87,7 +87,7 @@ If both markets are closed today, inform the user and stop.
 Query the account for settled cash availability:
 
 ```bash
-cd /Users/alex/Broker
+cd <project-root>
 python3 -c "
 import sqlite3
 conn = sqlite3.connect('trading_bot/data/trading_bot.db')
@@ -107,7 +107,7 @@ Report settled vs. unsettled cash (T+1 for all equities). If settled cash is ver
 Check if this is first run or if there are existing positions that have not been assessed:
 
 ```bash
-cd /Users/alex/Broker
+cd <project-root>
 python3 -c "
 import sqlite3
 conn = sqlite3.connect('trading_bot/data/trading_bot.db')
@@ -150,7 +150,7 @@ If Phase 0 is required (from Step 7), append `--phase0` to the flags.
 Navigate to the project directory and start the bot:
 
 ```bash
-cd /Users/alex/Broker
+cd <project-root>
 nohup python -m trading_bot.main [flags from Step 8] >> ~/trading_bot_reports/bot_$(date +%Y-%m-%d).log 2>&1 &
 echo "Bot started with PID $!"
 ```
