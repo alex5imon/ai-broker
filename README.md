@@ -5,10 +5,9 @@ GitHub Actions cron (every 5 min during NYSE hours) and persists state
 in SQLite across runs. Same codebase runs locally for paper/live and for
 backtesting.
 
-Targeting commission-free US equities via the Alpaca Trading API,
-starting from a paper account with ~£950 GBP base, then graduating
-through phases (micro → small → full) as equity and win-rate thresholds
-are met.
+Targets commission-free US equities on the Alpaca Trading API, starting
+on a paper account and graduating through phased risk profiles (Phase 1
+→ Phase 2 → Phase 3) as equity and win-rate thresholds are met.
 
 See [SPEC.md](SPEC.md) for the full design and [CLAUDE.md](CLAUDE.md) for
 agent-facing guidance.
@@ -44,7 +43,7 @@ backtest_data/            offline datasets (see CLAUDE.md)
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env      # fill in ALPACA_API_KEY / ALPACA_SECRET_KEY
+cp .env.example .env      # fill in ALPACA_PAPER_KEY_ID / ALPACA_PAPER_SECRET
 
 # One tick (what GHA runs)
 python -m trading_bot.main --mode normal
@@ -58,6 +57,34 @@ bash start_bot.sh
 # Tests
 pytest trading_bot/tests/
 ```
+
+## Trading Strategies
+
+The bot runs multiple strategy sleeves in parallel, each with its own
+virtual sub-portfolio and independent entry/exit logic. Trades are
+consolidated at the portfolio level for risk enforcement. All allocations
+and parameters are tunable under `multi_strategy.strategies.*` in
+[config.yaml](config.yaml).
+
+Live watchlist (Phase 1): SPY + QQQ + the 11 SPDR sector ETFs (XLK, XLF,
+XLV, XLY, XLP, XLE, XLI, XLB, XLU, XLRE, XLC) — pure ETFs only, to avoid
+earnings-gap risk.
+
+| Sleeve | Status | Allocation | Max Positions | Edge |
+|---|---|---|---|---|
+| **Mean Reversion** | Primary (validated) | $1,500 | 3 | RSI(14) oversold bounce on liquid ETFs with VIX-adaptive thresholds, ATR stops/targets, let-winners-run trailing. PF 1.54 on 13y SPY 5-min. |
+| **Breakout** | Active | $1,500 | 1 | 20-day high breakout with volume confirmation; exit at 10-day low or fixed stop. Highest PF (2.94) sleeve in the 13y SPY backtest. |
+| **Overnight Drift** | Active | $1,000 | 1 | Buy on the last 5-min bar of the session, sell on the first bar of the next session. Captures the overnight equity premium with a 3% disaster stop. |
+| **Trend Following** | Deprioritized | $1,000 | 1 | EMA 9/21 crossover + SMA(50) trend filter + volume. Retained for backtest comparisons; not intended for live capital. |
+| **Sentiment Combo** | Disabled | $0 | — | Finnhub sentiment + technical signal. Disabled 2026-04-24 after two tuning iterations failed to find an edge on ETFs. |
+
+Shared portfolio-level filters apply on top of each sleeve: market regime
+filter (no new entries when SPY is below its 50-day SMA), ATR-percentile
+volatility gate, earnings blackout, post-exit cooldown, settled-cash
+check, spread check, max positions, sector exposure, and (in daily mode)
+overnight gap filter.
+
+See [SPEC.md](SPEC.md) Sections 6 and 7 for the full entry / exit logic.
 
 ## Backtesting
 
@@ -113,7 +140,7 @@ Each invocation runs one `tick()` and exits:
 
 1. Trading-day + operating-hours gate.
 2. Connect to Alpaca (validate creds).
-3. Refresh FX rate (GBP/USD).
+3. Refresh FX rate.
 4. Reconcile broker state with SQLite.
 5. Poll outstanding order statuses.
 6. Pre-market scan / entry scan / exit check / wind-down —

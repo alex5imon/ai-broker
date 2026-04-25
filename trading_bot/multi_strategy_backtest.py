@@ -55,7 +55,7 @@ class _StrategyState:
     strategy: StrategyBase
     cash_usd: float
     initial_cash_usd: float
-    peak_cash_usd: float = 0.0
+    peak_equity_usd: float = 0.0
     total_pnl_usd: float = 0.0
     wins: int = 0
     losses: int = 0
@@ -67,7 +67,7 @@ class _StrategyState:
     daily_returns: list[float] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        self.peak_cash_usd = self.cash_usd
+        self.peak_equity_usd = self.cash_usd
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +538,11 @@ class MultiStrategyBacktester:
                     else:
                         pos_value += trade.entry_price * trade.shares
                 total_now = st.cash_usd + pos_value
+                if total_now > st.peak_equity_usd:
+                    st.peak_equity_usd = total_now
+                dd_pct = (st.peak_equity_usd - total_now) / st.peak_equity_usd * 100
+                if dd_pct > st.max_drawdown_pct:
+                    st.max_drawdown_pct = dd_pct
                 total_before = day_start_equity[sid]
                 if total_before > 0:
                     st.daily_returns.append(
@@ -656,13 +661,9 @@ class MultiStrategyBacktester:
         else:
             state.losses += 1
 
-        # Track peak equity and drawdown
-        if state.cash_usd > state.peak_cash_usd:
-            state.peak_cash_usd = state.cash_usd
-        dd = (state.peak_cash_usd - state.cash_usd) / state.peak_cash_usd * 100
-        if dd > state.max_drawdown_pct:
-            state.max_drawdown_pct = dd
-
+        # Peak equity and drawdown are tracked via mark-to-market in the
+        # daily loop (cash + open-position value), not on close — closing a
+        # position only moves the same equity from "open" into "cash".
         state.cooldowns[trade.ticker] = exit_time + timedelta(minutes=30)
         state.open_positions.remove(trade)
         state.closed_trades.append(trade)
@@ -1006,6 +1007,11 @@ class MultiStrategyBacktester:
                     else:
                         pos_value += trade.entry_price * trade.shares
                 total_now = st.cash_usd + pos_value
+                if total_now > st.peak_equity_usd:
+                    st.peak_equity_usd = total_now
+                dd_pct = (st.peak_equity_usd - total_now) / st.peak_equity_usd * 100
+                if dd_pct > st.max_drawdown_pct:
+                    st.max_drawdown_pct = dd_pct
                 total_before = day_start_equity[sid]
                 if total_before > 0:
                     st.daily_returns.append(
