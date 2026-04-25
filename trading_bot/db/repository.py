@@ -12,7 +12,6 @@ import logging
 import sqlite3
 from datetime import datetime, timedelta
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from trading_bot.constants import TZ_EASTERN
 

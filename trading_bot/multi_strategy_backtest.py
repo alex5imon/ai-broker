@@ -19,9 +19,7 @@ import argparse
 import asyncio
 import json
 import logging
-import math
 import statistics
-import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, time
 from typing import Any
@@ -32,13 +30,11 @@ import pandas as pd
 from trading_bot.config import Config
 from trading_bot.constants import (
     Exchange,
-    HoldType,
     TICKER_EXCHANGE,
     TZ_EASTERN,
-    TZ_UTC,
 )
 from trading_bot.data_cache import load_cached
-from trading_bot.strategy.base import ExitSignal, StrategyBase, StrategyDecision
+from trading_bot.strategy.base import ExitSignal, StrategyBase
 from trading_bot.strategy.strategies import create_strategies
 
 logger: logging.Logger = logging.getLogger(__name__)
