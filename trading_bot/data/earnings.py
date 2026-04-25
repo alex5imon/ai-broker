@@ -16,9 +16,11 @@ from zoneinfo import ZoneInfo
 
 import finnhub
 
+from trading_bot.constants import TZ_EASTERN
+
 logger: logging.Logger = logging.getLogger(__name__)
 
-ET: ZoneInfo = ZoneInfo("US/Eastern")
+ET: ZoneInfo = TZ_EASTERN
 
 
 class EarningsCalendar:

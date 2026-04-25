@@ -54,8 +54,9 @@ class BreakoutStrategy(StrategyBase):
         # Volume confirmation on 5-min bars
         if len(df_5min) < 21:
             return None
-        df_e: pd.DataFrame = df_5min.copy()
-        df_e.columns = [c.lower() for c in df_e.columns]
+        # ``rename`` returns a new lightweight wrapper (no row copy) — the
+        # caller's DataFrame is untouched, but we avoid a per-tick deep copy.
+        df_e: pd.DataFrame = df_5min.rename(columns=str.lower)
         vol_avg: float = float(df_e["volume"].rolling(20).mean().iloc[-1])
         current_vol: float = float(df_e["volume"].iloc[-1])
         if vol_avg <= 0 or current_vol < self._volume_multiplier * vol_avg:

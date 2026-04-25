@@ -40,7 +40,21 @@ def _migration_v5(conn: sqlite3.Connection) -> None:
     ALTERs and CREATEs below are guarded to skip already-applied changes.
     """
 
+    # All identifier-name interpolations below come from hardcoded tuples,
+    # NEVER from user input.  We keep the f-string form (sqlite parameters
+    # cannot bind identifiers) but make the identifier set explicit so
+    # this code is harder to misuse by future contributors.
+    _ALLOWED_TABLES: frozenset[str] = frozenset({"trades", "positions", "settlements"})
+    _RENAME_PAIRS: tuple[tuple[str, str], ...] = (
+        ("ib_order_id", "alpaca_order_id"),
+        ("ib_stop_order_id", "alpaca_stop_order_id"),
+        ("ib_target_order_id", "alpaca_target_order_id"),
+        ("ib_trail_order_id", "alpaca_trail_order_id"),
+    )
+
     def _has_column(table: str, column: str) -> bool:
+        if table not in _ALLOWED_TABLES:
+            raise ValueError(f"Unexpected table name: {table!r}")
         rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
         return any(r[1] == column for r in rows)
 
@@ -49,14 +63,9 @@ def _migration_v5(conn: sqlite3.Connection) -> None:
         if not _has_column(table, "strategy_id"):
             conn.execute(f"ALTER TABLE {table} ADD COLUMN strategy_id TEXT")
 
-    # Rename IB columns to Alpaca equivalents (skip when already renamed)
-    rename_pairs: list[tuple[str, str]] = [
-        ("ib_order_id", "alpaca_order_id"),
-        ("ib_stop_order_id", "alpaca_stop_order_id"),
-        ("ib_target_order_id", "alpaca_target_order_id"),
-        ("ib_trail_order_id", "alpaca_trail_order_id"),
-    ]
-    for old, new in rename_pairs:
+    # Rename IB columns to Alpaca equivalents (skip when already renamed).
+    # ``old``/``new`` come from the hardcoded ``_RENAME_PAIRS`` tuple above.
+    for old, new in _RENAME_PAIRS:
         if _has_column("positions", old) and not _has_column("positions", new):
             conn.execute(f"ALTER TABLE positions RENAME COLUMN {old} TO {new}")
 
