@@ -14,14 +14,14 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from trading_bot.config import Config
-from trading_bot.constants import ExitReason, HoldType, Market, Phase
+from trading_bot.constants import TZ_EASTERN, ExitReason, HoldType
 from trading_bot.data.fx import FXManager
 from trading_bot.data.market_data import MarketDataManager
 from trading_bot.utils import coalesce
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-ET: ZoneInfo = ZoneInfo("US/Eastern")
+ET: ZoneInfo = TZ_EASTERN
 
 
 # ---------------------------------------------------------------------------
