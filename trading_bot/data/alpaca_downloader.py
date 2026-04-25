@@ -18,7 +18,6 @@ import os
 import time
 from datetime import date, datetime, timedelta
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -27,12 +26,10 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 from trading_bot.config import Config
+from trading_bot.constants import TZ_EASTERN, TZ_UTC
 from trading_bot.data_cache import load_cached, save_to_cache
 
 logger: logging.Logger = logging.getLogger(__name__)
-
-TZ_EASTERN = ZoneInfo("US/Eastern")
-TZ_UTC = ZoneInfo("UTC")
 
 
 def _get_trading_days(start: date, end: date, config: Config) -> list[date]:

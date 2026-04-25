@@ -7,11 +7,8 @@ file under ``trading_bot/logs/``.
 from __future__ import annotations
 
 import logging
-import os
-from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 _LOG_DIR: Path = Path(__file__).resolve().parent / "logs"
 _LOG_FORMAT: str = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"

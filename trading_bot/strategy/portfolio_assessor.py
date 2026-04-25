@@ -19,12 +19,9 @@ from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-import numpy as np
 
 from trading_bot.config import Config
 from trading_bot.constants import (
-    Exchange,
-    Market,
     TZ_EASTERN,
 )
 from trading_bot.data.fx import FXManager
@@ -37,7 +34,7 @@ if TYPE_CHECKING:
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-ET: ZoneInfo = ZoneInfo("US/Eastern")
+ET: ZoneInfo = TZ_EASTERN
 
 
 # ---------------------------------------------------------------------------

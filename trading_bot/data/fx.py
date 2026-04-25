@@ -18,9 +18,11 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+from trading_bot.constants import TZ_EASTERN
+
 logger: logging.Logger = logging.getLogger(__name__)
 
-ET: ZoneInfo = ZoneInfo("US/Eastern")
+ET: ZoneInfo = TZ_EASTERN
 
 _EXCHANGE_RATE_URL: str = "https://open.er-api.com/v6/latest/GBP"
 

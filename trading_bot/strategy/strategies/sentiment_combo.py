@@ -9,7 +9,6 @@ import pandas as pd
 
 from trading_bot.constants import HoldType
 from trading_bot.strategy.base import ExitSignal, StrategyBase, StrategyDecision
-from trading_bot.strategy.technical import TechnicalAnalyzer
 from trading_bot.utils import coalesce
 
 logger: logging.Logger = logging.getLogger(__name__)

@@ -19,7 +19,7 @@ import json
 import logging
 import logging.handlers
 import sqlite3
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -50,13 +50,11 @@ from trading_bot.notifications.notifier import Notifier
 from trading_bot.execution.virtual_portfolio import PortfolioManager
 from trading_bot.reporting.daily_report import ReportGenerator
 from trading_bot.reporting.performance import PerformanceCalculator
-from trading_bot.reporting.strategy_comparison import generate_comparison, render_comparison_text
 from trading_bot.strategy.entry import EntryDecision, EntryEvaluator
 from trading_bot.strategy.strategies import create_strategies
 from trading_bot.strategy.strategy_manager import StrategyManager
 from trading_bot.strategy.regime_filter import RegimeFilter
 from trading_bot.strategy.exit import ExitManager
-from trading_bot.strategy.portfolio_assessor import PortfolioAssessor
 from trading_bot.strategy.technical import TechnicalAnalyzer
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -65,7 +63,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 # Timezone aliases
 # ---------------------------------------------------------------------------
 
-_EASTERN: ZoneInfo = ZoneInfo("US/Eastern")
+_EASTERN: ZoneInfo = TZ_EASTERN
 
 _MARKET_TZ: dict[Market, ZoneInfo] = {
     Market.US: _EASTERN,
@@ -126,13 +124,6 @@ class TradingBot:
             db_path=db_path,
         )
         self._exit_manager: ExitManager = ExitManager(config, self._market_data, self._fx)
-        self._portfolio_assessor: PortfolioAssessor = PortfolioAssessor(
-            config=config,
-            market_data=self._market_data,
-            sentiment=self._sentiment,
-            fx=self._fx,
-            notifier=self._notifier,
-        )
 
         # --- Execution layer ---
         self._order_manager: OrderManager = OrderManager(
@@ -1004,87 +995,14 @@ class TradingBot:
         logger.info("Wind-down complete for %s", market.value)
 
     # ------------------------------------------------------------------
-    # Phase 0
+    # Phase 0 cleanup orchestration was removed: the Alpaca account was
+    # opened fresh with no inherited positions, ``tick()`` short-circuits
+    # the (0 -> 1) transition by recording it directly in
+    # ``phase_transitions``, and the legacy ``run_phase0`` method was
+    # never called from anywhere in the live codebase.  See
+    # ``trading_bot/strategy/portfolio_assessor.py`` if you need to
+    # resurrect the scoring/cleanup logic.
     # ------------------------------------------------------------------
-
-    async def run_phase0(self) -> None:
-        """Phase 0 portfolio cleanup.
-
-        1. Get current IB positions.
-        2. Run PortfolioAssessor.assess_portfolio().
-        3. PortfolioAssessor.execute_cleanup() sends ntfy, waits 5 min, executes.
-        4. Record phase_transition(from=0, to=1) in DB.
-        """
-        logger.info("=== Phase 0: Portfolio Cleanup ===")
-
-        alpaca_positions = await self._gateway.get_positions()
-        positions_for_assessment: list[dict[str, Any]] = []
-
-        for pos in alpaca_positions:
-            qty: int = int(float(pos.qty or 0))
-            if qty == 0:
-                continue
-            ticker: str = str(pos.symbol)
-            exchange: str = str(pos.exchange or "US")
-            avg_cost: float = float(pos.avg_entry_price or 0)
-            market_value: float = float(pos.market_value or 0)
-            unrealized_pnl: float = float(pos.unrealized_pl or 0)
-            positions_for_assessment.append(
-                {
-                    "ticker": ticker,
-                    "exchange": exchange,
-                    "currency": "USD",
-                    "quantity": qty,
-                    "avg_cost": avg_cost,
-                    "market_value": market_value,
-                    "unrealized_pnl": unrealized_pnl,
-                }
-            )
-
-        if not positions_for_assessment:
-            logger.info("Phase 0: no non-zero IB positions — marking cleanup complete")
-            self._record_phase_transition(
-                from_phase=0, to_phase=1, reason="No positions to clean up"
-            )
-            return
-
-        # Subscribe market data for Phase 0 positions (sync REST seed)
-        for pos_dict in positions_for_assessment:
-            try:
-                await self._market_data.subscribe(pos_dict["ticker"], "US")
-            except Exception:
-                logger.exception("Phase 0 market data sub failed for %s", pos_dict["ticker"])
-
-        logger.info("Phase 0: assessing %d positions", len(positions_for_assessment))
-        assessments = await self._portfolio_assessor.assess_portfolio(
-            positions_for_assessment
-        )
-
-        # Persist assessments to database (both dry-run and live)
-        self._save_phase0_assessments(assessments)
-
-        # Generate Phase 0 report
-        await self._generate_phase0_report(
-            assessments, alpaca_positions, positions_for_assessment
-        )
-
-        if self._dry_run:
-            logger.info("[DRY RUN] Phase 0 assessment complete — skipping actual cleanup")
-            for a in assessments:
-                logger.info(
-                    "[DRY RUN]   %s: action=%s, score=%d, reason=%s",
-                    a.ticker, a.classification, a.score, a.reasoning,
-                )
-            logger.info("[DRY RUN] Would transition Phase 0 -> Phase 1")
-            return
-
-        # execute_cleanup sends the ntfy plan, waits 5 min, then executes
-        await self._portfolio_assessor.execute_cleanup(assessments, self._gateway)
-
-        self._record_phase_transition(
-            from_phase=0, to_phase=1, reason="Phase 0 cleanup complete"
-        )
-        logger.info("=== Phase 0 Complete ===")
 
     # ------------------------------------------------------------------
     # Phase transition check
@@ -1275,125 +1193,6 @@ class TradingBot:
             )
         except Exception:
             logger.exception("Failed to record phase transition %d->%d", from_phase, to_phase)
-
-    async def _generate_phase0_report(
-        self,
-        assessments: list[Any],
-        broker_positions: list[Any],
-        positions_for_assessment: list[dict[str, Any]],
-    ) -> None:
-        """Build portfolio snapshot, extract log highlights, and generate the Phase 0 report."""
-        run_date: str = datetime.now(tz=_EASTERN).strftime("%Y-%m-%d")
-
-        # Build portfolio snapshot from Alpaca positions
-        portfolio: list[dict[str, Any]] = []
-        for pos in broker_positions:
-            qty: int = int(float(pos.qty or 0))
-            if qty == 0:
-                continue
-            portfolio.append({
-                "ticker": str(pos.symbol),
-                "exchange": str(pos.exchange or "US"),
-                "currency": "USD",
-                "quantity": qty,
-                "avg_cost": float(pos.avg_entry_price or 0),
-                "market_price": float(pos.current_price or 0),
-                "market_value": float(pos.market_value or 0),
-                "unrealized_pnl": float(pos.unrealized_pl or 0),
-            })
-
-        # Convert assessments to dicts for the template
-        assessment_dicts: list[dict[str, Any]] = [
-            {
-                "ticker": a.ticker,
-                "exchange": a.exchange,
-                "current_value_gbp": a.current_value_gbp,
-                "unrealized_pnl_gbp": a.unrealized_pnl_gbp,
-                "score": a.score,
-                "classification": a.classification,
-                "scores_breakdown": a.scores_breakdown,
-                "reasoning": a.reasoning,
-                "recommended_action": a.recommended_action,
-                "trailing_stop_price": a.trailing_stop_price,
-            }
-            for a in assessments
-        ]
-
-        # Extract log highlights from today's log
-        log_highlights: list[dict[str, str]] = self._extract_log_highlights()
-
-        equity: float = await self._get_account_equity_gbp()
-
-        try:
-            path: str = self._report_generator.generate_phase0_report(
-                report_date=run_date,
-                assessments=assessment_dicts,
-                portfolio=portfolio,
-                account_equity_gbp=equity,
-                dry_run=self._dry_run,
-                log_highlights=log_highlights,
-            )
-            logger.info("Phase 0 report generated: %s", path)
-        except Exception:
-            logger.exception("Failed to generate Phase 0 report")
-
-    def _extract_log_highlights(self) -> list[dict[str, str]]:
-        """Extract ERROR and WARNING entries from today's log file."""
-        log_file: str = self._config.log_file
-        highlights: list[dict[str, str]] = []
-        today_str: str = datetime.now(tz=_EASTERN).strftime("%Y-%m-%d")
-        try:
-            with open(log_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    if not line.startswith(today_str):
-                        continue
-                    if "[ERROR]" in line:
-                        highlights.append({"level": "error", "text": line.strip()})
-                    elif "[WARNING]" in line:
-                        highlights.append({"level": "warning", "text": line.strip()})
-        except FileNotFoundError:
-            pass
-        # Deduplicate repeated messages, keep first 50
-        seen: set[str] = set()
-        unique: list[dict[str, str]] = []
-        for h in highlights:
-            # Use the message part (after logger name) as dedup key
-            msg_part: str = h["text"].split(": ", 2)[-1] if ": " in h["text"] else h["text"]
-            if msg_part not in seen:
-                seen.add(msg_part)
-                unique.append(h)
-            if len(unique) >= 50:
-                break
-        return unique
-
-    def _save_phase0_assessments(
-        self,
-        assessments: list[Any],
-    ) -> None:
-        """Persist Phase 0 assessment results to the database."""
-        run_date: str = datetime.now(tz=_EASTERN).strftime("%Y-%m-%d")
-        records: list[dict[str, Any]] = [
-            {
-                "ticker": a.ticker,
-                "exchange": a.exchange,
-                "current_value_gbp": a.current_value_gbp,
-                "unrealized_pnl_gbp": a.unrealized_pnl_gbp,
-                "score": a.score,
-                "classification": a.classification,
-                "scores_breakdown": a.scores_breakdown,
-                "reasoning": a.reasoning,
-                "recommended_action": a.recommended_action,
-                "trailing_stop_price": a.trailing_stop_price,
-            }
-            for a in assessments
-        ]
-        try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-            conn.row_factory = sqlite3.Row
-            repo.save_phase0_assessments(conn, records, run_date, dry_run=self._dry_run)
-            conn.close()
-        except Exception:
-            logger.exception("Failed to save Phase 0 assessments")
 
     # ------------------------------------------------------------------
     # Market window helpers
@@ -1639,7 +1438,9 @@ class TradingBot:
         except KeyError:
             return None
 
-    async def _get_5min_bars(self, ticker: str, exchange: str):  # type: ignore[return]
+    async def _get_5min_bars(
+        self, ticker: str, exchange: str,
+    ) -> Any | None:
         """Fetch 5-minute bars and return as a pandas DataFrame, or None.
 
         ``MarketDataManager.get_historical_bars`` returns ``list[dict]`` with
@@ -1658,7 +1459,9 @@ class TradingBot:
             df = df.set_index("date")
         return df
 
-    async def _get_daily_bars(self, ticker: str, exchange: str):  # type: ignore[return]
+    async def _get_daily_bars(
+        self, ticker: str, exchange: str,
+    ) -> Any | None:
         """Fetch daily bars and return as a pandas DataFrame, or None."""
         import pandas as pd
 

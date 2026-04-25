@@ -8,16 +8,17 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta
-from typing import Any, Awaitable, Callable
+from typing import Awaitable, Callable
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from trading_bot.constants import TZ_EASTERN
 from trading_bot.strategy.technical import TechnicalAnalyzer
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-ET: ZoneInfo = ZoneInfo("US/Eastern")
+ET: ZoneInfo = TZ_EASTERN
 
 
 class RegimeFilter:
