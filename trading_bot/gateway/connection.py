@@ -115,15 +115,6 @@ class GatewayConnection:
         logger.debug("Disconnected from Alpaca")
 
     # ------------------------------------------------------------------
-    # Heartbeat — no-op in the tick model.  Kept as a coroutine stub so
-    # any remaining callers (main.py) can still ``await`` it without
-    # raising.  Remove once main.py is rewritten as a stateless tick.
-    # ------------------------------------------------------------------
-
-    async def start_heartbeat(self) -> None:
-        logger.debug("start_heartbeat is a no-op in the tick model")
-
-    # ------------------------------------------------------------------
     # Account queries
     # ------------------------------------------------------------------
 
