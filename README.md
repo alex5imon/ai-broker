@@ -33,7 +33,6 @@ trading_bot/
   heartbeat.yml           30-min watchdog that fails if bot is stale
 
 config.yaml               single source of truth for all tunables
-config_backtest.yaml      backtest-only overrides
 scripts/                  dev tooling (smoke tests, evaluators)
 backtest_data/            offline datasets (see CLAUDE.md)
 ```
@@ -43,7 +42,7 @@ backtest_data/            offline datasets (see CLAUDE.md)
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env      # fill in ALPACA_PAPER_KEY_ID / ALPACA_PAPER_SECRET
+cp .env.example .env      # fill in Alpaca creds, FINNHUB_API_KEY, NTFY_TOPIC, NTFY_KILL_TOPIC
 
 # One tick (what GHA runs)
 python -m trading_bot.main --mode normal
@@ -111,15 +110,26 @@ and market-hour gating happens in code
 ([trading_bot/main.py](trading_bot/main.py) + Alpaca clock).
 
 SQLite state (`trading_bot/data/trading_bot.db`) is persisted across runs
-via `actions/cache@v4` and uploaded as an artifact on every run so logs,
+via `actions/cache` and uploaded as an artifact on every run so logs,
 state, and the DB are inspectable after the fact.
 
 ### Required repo secrets
 
-- `ALPACA_PAPER_KEY_ID`
-- `ALPACA_PAPER_SECRET`
-- `ALPACA_LIVE_KEY_ID`
-- `ALPACA_LIVE_SECRET`
+| Secret | Purpose |
+|---|---|
+| `ALPACA_PAPER_KEY_ID` / `ALPACA_PAPER_SECRET` | Paper trading credentials |
+| `ALPACA_LIVE_KEY_ID` / `ALPACA_LIVE_SECRET` | Live trading credentials (only used when `ALPACA_ENV=live`) |
+| `FINNHUB_API_KEY` | Market news + sentiment data |
+| `NTFY_TOPIC` | ntfy.sh topic for trade alerts. Optional — if unset, push notifications are disabled and the bot still trades. |
+| `NTFY_KILL_TOPIC` | ntfy.sh topic the bot subscribes to for the kill switch. Optional. |
+
+> **Important:** ntfy.sh free-tier topics have no auth — anyone with the
+> topic name can subscribe (read every alert) or publish (including to
+> the kill switch). Generate long random topic names locally before
+> setting them as repo secrets, e.g.:
+> ```bash
+> python -c "import secrets; print('bot-alerts-' + secrets.token_urlsafe(24))"
+> ```
 
 ### Repo variable
 
