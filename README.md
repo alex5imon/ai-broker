@@ -144,6 +144,60 @@ gh run download <run-id> --name bot-logs-<run-id> --dir ./logs
 gh run download <run-id> --name bot-db-<run-id> --dir ./trading_bot/data
 ```
 
+### Scheduling via GCP Cloud Scheduler
+
+GitHub Actions throttles `schedule` events under load — sub-15-minute
+crons routinely fire only every 60–90 minutes. For a strategy that
+trades on 5-minute bars that's unacceptable, so the bot is triggered
+from an external cron via `workflow_dispatch`, which fires on demand
+without throttling.
+
+The chosen scheduler is **Google Cloud Scheduler** (free tier covers up
+to 3 jobs/month, runs from Google's always-on infrastructure).
+
+**Setup recap:**
+
+1. **GitHub fine-grained PAT** — Settings → Developer settings → Fine-grained
+   tokens. Scope: this repo only, `Actions: Read and write`. 1-year
+   expiration. Set a calendar reminder to rotate.
+2. **GCP project** with billing enabled and the Cloud Scheduler API on.
+3. **Cloud Scheduler job** in any region:
+
+   | Field | Value |
+   |---|---|
+   | Frequency | `*/5 13-21 * * 1-5` |
+   | Timezone | UTC |
+   | Target | HTTP POST |
+   | URL | `https://api.github.com/repos/alex5imon/ai-broker/actions/workflows/bot.yml/dispatches` |
+   | Body | `{"ref":"main"}` |
+   | Headers | `Accept: application/vnd.github+json`, `X-GitHub-Api-Version: 2022-11-28`, `Authorization: Bearer <PAT>` |
+   | Max retry attempts | 0 |
+   | Attempt deadline | 30s |
+
+The native GHA `schedule:` block in `bot.yml` is intentionally left in
+place as a fallback — if the GCP job ever stalls, the GHA cron will
+still fire (slowly) and the heartbeat workdog will notice within 20 min.
+The bot's `concurrency: bot-run` group serializes any overlap between
+the two trigger paths and ticks are idempotent, so duplicate firings are
+harmless.
+
+**Rotation procedure** when the PAT nears expiry:
+
+1. Generate a new fine-grained PAT in GitHub.
+2. Update the `Authorization` header on the Cloud Scheduler job.
+3. Force-run the job once to confirm it works.
+4. Revoke the old PAT.
+
+**Debugging a missed tick:**
+
+- Cloud Scheduler job → Logs tab shows each attempt's HTTP response.
+  Common errors: `401 Bad credentials` (PAT expired/wrong),
+  `404 Not Found` (PAT lacks `Actions: write` on this repo).
+- If the Scheduler call succeeds but no GHA run appears, check
+  https://github.com/alex5imon/ai-broker/actions/workflows/bot.yml — a
+  `workflow_dispatch` event there means the trigger fired and the bot
+  itself is at fault.
+
 ## Tick model
 
 Each invocation runs one `tick()` and exits:
