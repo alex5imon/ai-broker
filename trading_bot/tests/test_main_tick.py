@@ -1,0 +1,338 @@
+"""Integration tests for TradingBot.tick() — the per-tick orchestrator.
+
+Each test constructs a real TradingBot with the project config, then patches
+the gateway, market data, and time-window helpers so we can drive the bot
+through a single deterministic tick without hitting Alpaca."""
+
+from __future__ import annotations
+
+from datetime import date, datetime
+from unittest.mock import AsyncMock, MagicMock, patch
+from zoneinfo import ZoneInfo
+
+import pytest
+
+from trading_bot.constants import Market, TZ_EASTERN
+from trading_bot.main import TradingBot, _parse_time
+
+ET = TZ_EASTERN
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def trading_bot(config, tmp_db_path, monkeypatch):
+    """Real TradingBot with all external IO replaced by mocks.
+
+    The instance has been instrumented so calling .tick() exercises the
+    full orchestrator without hitting the network or any global handlers.
+    """
+    monkeypatch.setenv("ALPACA_API_KEY", "test")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "test")
+    config._raw["db"] = {"path": tmp_db_path}
+
+    bot = TradingBot(config, mode="normal", dry_run=False)
+
+    # --- Replace external dependencies with awaitable mocks ---
+    bot._gateway = MagicMock()
+    bot._gateway.connect = AsyncMock(return_value=True)
+    bot._gateway.disconnect = AsyncMock(return_value=None)
+    bot._gateway.is_connected = True
+    bot._gateway.get_account_summary = AsyncMock(return_value={
+        "NetLiquidation": "1000.0", "SettledCash": "1000.0",
+        "BuyingPower": "1000.0",
+    })
+    bot._gateway.get_positions = AsyncMock(return_value=[])
+    bot._gateway.get_open_orders = AsyncMock(return_value=[])
+
+    bot._fx = MagicMock()
+    bot._fx.refresh = AsyncMock()
+    bot._fx.get_rate = MagicMock(return_value=1.25)
+    bot._fx.to_gbp = MagicMock(side_effect=lambda amt, ccy: amt / 1.25)
+    bot._fx.to_usd = MagicMock(side_effect=lambda amt, ccy: amt * 1.25)
+
+    bot._market_data = MagicMock()
+    bot._market_data.refresh_quotes = AsyncMock()
+    bot._market_data.get_latest_price = MagicMock(return_value=100.0)
+    bot._market_data.is_stale = MagicMock(return_value=False)
+    bot._market_data.trading_paused = False
+    bot._market_data.subscribe = AsyncMock()
+    bot._market_data.get_historical_bars = AsyncMock(return_value=[])
+
+    bot._sentiment = MagicMock()
+    bot._sentiment.get_sentiment = AsyncMock(return_value=0.2)
+    bot._sentiment.refresh_all = AsyncMock()  # bulk refresh from pre_market_scan
+
+    bot._earnings = MagicMock()
+    bot._earnings.is_in_blackout = MagicMock(return_value=False)
+    bot._earnings.refresh = AsyncMock()
+
+    bot._notifier = MagicMock()
+    bot._notifier.send = AsyncMock()
+    bot._notifier.send_sync = MagicMock()
+    bot._notifier.shutdown = AsyncMock()
+    bot._notifier.trade_entry = AsyncMock()
+    bot._notifier.position_closed = AsyncMock()
+    bot._notifier.bot_startup = AsyncMock()
+    bot._notifier.daily_summary = AsyncMock()
+    bot._notifier.phase_transition = AsyncMock()
+    bot._notifier.gateway_alert = AsyncMock()
+    bot._notifier.kill_switch = AsyncMock()
+    bot._notifier.drawdown_alert = AsyncMock()
+
+    bot._state_recovery = MagicMock()
+    recovery_result = MagicMock()
+    recovery_result.summary = MagicMock(return_value="ok")
+    bot._state_recovery.recover = AsyncMock(return_value=recovery_result)
+
+    bot._order_manager._check_order_statuses = AsyncMock()
+
+    if bot._strategy_manager is not None:
+        bot._strategy_manager.scan_for_entries = AsyncMock(return_value=0)
+        bot._strategy_manager.check_exits = AsyncMock(return_value=0)
+        bot._strategy_manager.get_comparison_report = MagicMock(return_value={})
+
+    return bot
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _override_hours(bot: TradingBot, *, start: str, end: str) -> None:
+    """Override only the operating-hour config keys; leave others intact."""
+    real_get = bot._config._get
+
+    def _patched(*args, **kwargs):
+        if len(args) >= 2 and args[0] == "schedule":
+            if args[1] == "bot_start_gmt":
+                return start
+            if args[1] == "bot_end_gmt":
+                return end
+        return real_get(*args, **kwargs)
+
+    bot._config._get = MagicMock(side_effect=_patched)
+
+
+def _open_hours(bot: TradingBot) -> None:
+    """Open the operating window so the tick proceeds past the time gate."""
+    _override_hours(bot, start="00:00", end="23:59")
+
+
+# ---------------------------------------------------------------------------
+# Trading-day gate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tick_exits_on_non_trading_day(trading_bot):
+    """When today is not a trading day the tick exits before any IO."""
+    # Force is_trading_day to return False
+    trading_bot._config.is_trading_day = MagicMock(return_value=False)
+    await trading_bot.tick()
+    # Gateway never connected
+    trading_bot._gateway.connect.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_tick_exits_outside_operating_hours(trading_bot):
+    """Tick exits when current UTC time is outside the operating window."""
+    trading_bot._config.is_trading_day = MagicMock(return_value=True)
+    # Force the window to a 1-min slot in the past
+    _override_hours(trading_bot, start="00:00", end="00:01")
+    await trading_bot.tick()
+    trading_bot._gateway.connect.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_tick_aborts_on_gateway_failure(trading_bot):
+    """When Alpaca connect fails, tick aborts before reconcile/orders."""
+    trading_bot._config.is_trading_day = MagicMock(return_value=True)
+    # Wide-open hours
+    _open_hours(trading_bot)
+    trading_bot._gateway.connect = AsyncMock(return_value=False)
+    await trading_bot.tick()
+    # FX refresh and state recovery should NOT have been called
+    trading_bot._fx.refresh.assert_not_called()
+    trading_bot._state_recovery.recover.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Happy-path tick
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tick_full_cycle_outside_market_window(trading_bot):
+    """Tick runs all infrastructure but skips entry/wind-down outside windows."""
+    trading_bot._config.is_trading_day = MagicMock(return_value=True)
+    # Open hours + force all market window helpers to False
+    _open_hours(trading_bot)
+    trading_bot._is_market_in_premarket = MagicMock(return_value=False)
+    trading_bot._is_market_in_execution = MagicMock(return_value=False)
+    trading_bot._is_market_in_winddown = MagicMock(return_value=False)
+
+    await trading_bot.tick()
+
+    trading_bot._gateway.connect.assert_called_once()
+    trading_bot._fx.refresh.assert_awaited()
+    trading_bot._state_recovery.recover.assert_awaited()
+    trading_bot._order_manager._check_order_statuses.assert_awaited()
+    trading_bot._market_data.refresh_quotes.assert_awaited()
+    # No entry scan (market closed)
+    if trading_bot._strategy_manager is not None:
+        trading_bot._strategy_manager.scan_for_entries.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_tick_runs_entry_scan_when_in_execution_window(trading_bot):
+    trading_bot._config.is_trading_day = MagicMock(return_value=True)
+    _open_hours(trading_bot)
+    trading_bot._is_market_in_premarket = MagicMock(return_value=False)
+    trading_bot._is_market_in_execution = MagicMock(return_value=True)
+    trading_bot._is_market_in_winddown = MagicMock(return_value=False)
+
+    await trading_bot.tick()
+
+    if trading_bot._strategy_manager is not None:
+        trading_bot._strategy_manager.scan_for_entries.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tick_skips_entry_in_close_only_mode(trading_bot):
+    trading_bot._mode = "close-only"
+    trading_bot._config.is_trading_day = MagicMock(return_value=True)
+    _open_hours(trading_bot)
+    trading_bot._is_market_in_premarket = MagicMock(return_value=False)
+    trading_bot._is_market_in_execution = MagicMock(return_value=True)
+    trading_bot._is_market_in_winddown = MagicMock(return_value=False)
+
+    await trading_bot.tick()
+
+    if trading_bot._strategy_manager is not None:
+        trading_bot._strategy_manager.scan_for_entries.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_tick_runs_wind_down_within_window(trading_bot):
+    trading_bot._config.is_trading_day = MagicMock(return_value=True)
+    _open_hours(trading_bot)
+    trading_bot._is_market_in_premarket = MagicMock(return_value=False)
+    trading_bot._is_market_in_execution = MagicMock(return_value=False)
+    trading_bot._is_market_in_winddown = MagicMock(return_value=True)
+    trading_bot.wind_down = AsyncMock()
+    await trading_bot.tick()
+    trading_bot.wind_down.assert_awaited_with(Market.US)
+
+
+@pytest.mark.asyncio
+async def test_tick_disconnects_in_finally_even_on_error(trading_bot):
+    trading_bot._config.is_trading_day = MagicMock(return_value=True)
+    _open_hours(trading_bot)
+    # Force fx.refresh to raise — the inner try/except should swallow it,
+    # but state_recovery should still run and finally should still disconnect.
+    trading_bot._fx.refresh = AsyncMock(side_effect=RuntimeError("boom"))
+    await trading_bot.tick()
+    trading_bot._gateway.disconnect.assert_awaited()
+    trading_bot._notifier.shutdown.assert_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Pre-market scan
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pre_market_scan_calls_bulk_refresh(trading_bot):
+    """pre_market_scan must hit the real bulk-refresh APIs (not removed
+    per-ticker stubs that previously failed silently)."""
+    await trading_bot.pre_market_scan(Market.US)
+    trading_bot._earnings.refresh.assert_awaited_once()
+    trading_bot._sentiment.refresh_all.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pre_market_scan_empty_watchlist_skips(trading_bot):
+    trading_bot._config.get_watchlist = MagicMock(return_value=[])
+    await trading_bot.pre_market_scan(Market.US)
+    trading_bot._earnings.refresh.assert_not_called()
+    trading_bot._sentiment.refresh_all.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pre_market_scan_swallows_refresh_errors(trading_bot):
+    trading_bot._earnings.refresh = AsyncMock(side_effect=RuntimeError("api down"))
+    trading_bot._sentiment.refresh_all = AsyncMock(side_effect=RuntimeError("api down"))
+    # Must not raise — refresh failures are non-fatal
+    await trading_bot.pre_market_scan(Market.US)
+
+
+# ---------------------------------------------------------------------------
+# Day-flag persistence
+# ---------------------------------------------------------------------------
+
+
+def test_load_save_day_flags_round_trip(trading_bot):
+    today = date(2026, 4, 27)
+    trading_bot._save_day_flags(today, {"pre_market_done": True, "x": 1})
+    loaded = trading_bot._load_day_flags(today)
+    assert loaded.get("pre_market_done") is True
+    assert loaded.get("x") == 1
+
+
+def test_load_day_flags_returns_empty_when_stale(trading_bot):
+    """Flags from an earlier date should not leak into today's flags."""
+    yesterday = date(2026, 4, 26)
+    today = date(2026, 4, 27)
+    trading_bot._save_day_flags(yesterday, {"pre_market_done": True})
+    loaded = trading_bot._load_day_flags(today)
+    assert loaded == {}
+
+
+# ---------------------------------------------------------------------------
+# Window helpers
+# ---------------------------------------------------------------------------
+
+
+def test_market_window_helpers_callable(trading_bot):
+    """Exercise the time-window helpers — values depend on wall-clock time
+    but the helpers themselves should not raise."""
+    for fn in (
+        trading_bot._is_market_in_premarket,
+        trading_bot._is_market_in_execution,
+        trading_bot._is_market_in_winddown,
+    ):
+        out = fn(Market.US)
+        assert isinstance(out, bool)
+
+
+def test_parse_time_helper():
+    t = _parse_time("09:30")
+    assert t.hour == 9
+    assert t.minute == 30
+
+
+# ---------------------------------------------------------------------------
+# Dry-run flag visibility
+# ---------------------------------------------------------------------------
+
+
+def test_dry_run_flag_propagates_to_strategy_manager(config, tmp_db_path, monkeypatch):
+    monkeypatch.setenv("ALPACA_API_KEY", "test")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "test")
+    config._raw["db"] = {"path": tmp_db_path}
+    bot = TradingBot(config, mode="normal", dry_run=True)
+    if bot._strategy_manager is not None:
+        assert bot._strategy_manager._dry_run is True
+
+
+def test_construct_with_close_only_mode(config, tmp_db_path, monkeypatch):
+    monkeypatch.setenv("ALPACA_API_KEY", "test")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "test")
+    config._raw["db"] = {"path": tmp_db_path}
+    bot = TradingBot(config, mode="close-only", dry_run=False)
+    assert bot._mode == "close-only"

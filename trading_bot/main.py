@@ -421,20 +421,18 @@ class TradingBot:
 
         exchange_str: str = "US"
 
-        # 1. Refresh earnings calendar
-        for ticker in watchlist:
-            try:
-                await self._earnings.refresh_ticker(ticker)
-            except Exception:
-                logger.warning("Earnings refresh failed for %s", ticker, exc_info=True)
+        # 1. Refresh earnings calendar (single Finnhub call covers all tickers)
+        try:
+            await self._earnings.refresh(watchlist)
+        except Exception:
+            logger.warning("Earnings refresh failed", exc_info=True)
 
-        # 2. Refresh sentiment
-        for ticker in watchlist:
-            try:
-                await self._sentiment.refresh_ticker(ticker)
-            except Exception:
-                # Benign: Finnhub often returns 403 on ETFs; sentiment is optional.
-                logger.debug("Sentiment refresh failed for %s", ticker, exc_info=True)
+        # 2. Refresh sentiment (per-ticker, rate-limited inside refresh_all)
+        try:
+            await self._sentiment.refresh_all(watchlist)
+        except Exception:
+            # Benign: Finnhub often returns 403 on ETFs; sentiment is optional.
+            logger.debug("Sentiment refresh failed", exc_info=True)
 
         # 3. Subscribe to market data (REST seed — no WebSocket wait needed)
         for ticker in watchlist:
