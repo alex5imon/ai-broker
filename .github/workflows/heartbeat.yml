@@ -26,13 +26,15 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Filter conclusion in jq rather than via `--status success`, which
+          # is unreliable in some gh-CLI versions when combined with --workflow
+          # (can return empty even when successful runs exist).
           last_ts=$(gh run list \
             --repo "${{ github.repository }}" \
             --workflow "$BOT_WORKFLOW" \
-            --status success \
-            --limit 1 \
-            --json updatedAt \
-            --jq '.[0].updatedAt // empty')
+            --limit 20 \
+            --json updatedAt,conclusion \
+            --jq '[.[] | select(.conclusion=="success")] | .[0].updatedAt // empty')
 
           if [ -z "$last_ts" ]; then
             echo "::error::No successful $BOT_WORKFLOW run found at all."
