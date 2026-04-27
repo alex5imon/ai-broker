@@ -55,6 +55,10 @@ jobs:
           ALPACA_LIVE_KEY_ID: ${{ secrets.ALPACA_LIVE_KEY_ID }}
           ALPACA_LIVE_SECRET: ${{ secrets.ALPACA_LIVE_SECRET }}
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          # ntfy.sh topic names — set as repo secrets. If absent, the
+          # notifier disables ntfy gracefully and the bot still trades.
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_KILL_TOPIC: ${{ secrets.NTFY_KILL_TOPIC }}
           BOT_LOG_DIR: logs
           BOT_STATE_DIR: state
         run: python -m trading_bot.main --mode normal

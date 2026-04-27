@@ -87,7 +87,7 @@ class TestStateRecovery:
         account: dict | None = None,
     ) -> MagicMock:
         gw = MagicMock()
-        gw.account_id = "U5433252"
+        gw.account_id = "TEST_ACCOUNT"
         gw.client = MagicMock()
         gw.get_positions = AsyncMock(return_value=positions or [])
         gw.get_open_orders = AsyncMock(return_value=orders or [])

@@ -426,7 +426,7 @@ Before entering position B while holding position A:
 
 ### Kill Switch
 
-- Bot subscribes to a dedicated ntfy topic (`trading-bot-kill-*`).
+- Bot subscribes to a dedicated ntfy topic (the value of `NTFY_KILL_TOPIC`).
 - On any message: cancel all pending orders, market-sell all open positions, send confirmation, enter permanent close-only mode (until the kill state is cleared in the DB).
 
 ### Drawdown Circuit Breaker
