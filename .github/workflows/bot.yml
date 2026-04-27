@@ -54,6 +54,7 @@ jobs:
           ALPACA_PAPER_SECRET: ${{ secrets.ALPACA_PAPER_SECRET }}
           ALPACA_LIVE_KEY_ID: ${{ secrets.ALPACA_LIVE_KEY_ID }}
           ALPACA_LIVE_SECRET: ${{ secrets.ALPACA_LIVE_SECRET }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           BOT_LOG_DIR: logs
           BOT_STATE_DIR: state
         run: python -m trading_bot.main --mode normal
