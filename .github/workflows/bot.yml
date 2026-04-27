@@ -19,9 +19,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -31,7 +31,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Restore state
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: state
           key: bot-state-${{ github.run_id }}
@@ -39,7 +39,7 @@ jobs:
             bot-state-
 
       - name: Restore SQLite DB
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: trading_bot/data/trading_bot.db*
           key: bot-db-${{ github.run_id }}
@@ -61,7 +61,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: bot-logs-${{ github.run_id }}
           path: logs/
@@ -69,7 +69,7 @@ jobs:
 
       - name: Upload state
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: bot-state-${{ github.run_id }}
           path: state/
@@ -77,7 +77,7 @@ jobs:
 
       - name: Upload SQLite DB
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: bot-db-${{ github.run_id }}
           path: trading_bot/data/trading_bot.db*
