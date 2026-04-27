@@ -123,36 +123,43 @@ acct = client.get_account()
 print(f'  Account: {acct.account_number} status={acct.status} equity=\${acct.equity} paper={is_paper}')
 " 2>>"$TODAY_LOG" | while read -r line; do log "$line"; done; then
     log "ERROR: Alpaca REST ping failed — see log for traceback."
-    python3 -c "
-import requests
+    if [ -n "${NTFY_KILL_TOPIC:-}" ]; then
+        NTFY_KILL_TOPIC="$NTFY_KILL_TOPIC" python3 -c "
+import os, requests
+topic = os.environ['NTFY_KILL_TOPIC']
 try:
-    requests.post('https://ntfy.sh/REDACTED_KILL_TOPIC',
+    requests.post(f'https://ntfy.sh/{topic}',
         data='Alpaca REST unreachable — bot did not start',
         headers={'Title': 'Bot Start FAILED', 'Priority': '5', 'Tags': 'warning'}, timeout=5)
 except Exception: pass
 " 2>/dev/null || true
+    fi
     exit 1
 fi
 
 log "TIP: run 'python scripts/smoke_paper.py' before live-path changes to catch integration bugs the backtest can't."
 
 # ---------------------------------------------------------------------------
-# 5. Send startup notification
+# 5. Send startup notification (skipped if NTFY_TOPIC is unset)
 # ---------------------------------------------------------------------------
-python3 -c "
-import requests
+if [ -n "${NTFY_TOPIC:-}" ]; then
+    NTFY_TOPIC="$NTFY_TOPIC" python3 -c "
+import os, requests
+topic = os.environ['NTFY_TOPIC']
 try:
     requests.post(
-        'https://ntfy.sh/REDACTED_TOPIC',
+        f'https://ntfy.sh/{topic}',
         data='Pre-flight passed. Bot starting.',
         headers={'Title': 'Bot Starting', 'Priority': '3', 'Tags': 'rocket'},
-        timeout=5
+        timeout=5,
     )
 except Exception:
     pass
 " 2>/dev/null || true
-
-log "Startup notification sent."
+    log "Startup notification sent."
+else
+    log "NTFY_TOPIC unset — skipping startup notification."
+fi
 
 # ---------------------------------------------------------------------------
 # 6. Launch the bot
@@ -170,18 +177,22 @@ EXIT_CODE=${PIPESTATUS[0]}
 log "---"
 log "Bot exited with code ${EXIT_CODE}"
 
-# Send shutdown notification
-python3 -c "
-import requests
+# Send shutdown notification (skipped if NTFY_TOPIC is unset)
+if [ -n "${NTFY_TOPIC:-}" ]; then
+    NTFY_TOPIC="$NTFY_TOPIC" EXIT_CODE="$EXIT_CODE" python3 -c "
+import os, requests
+topic = os.environ['NTFY_TOPIC']
+exit_code = os.environ['EXIT_CODE']
 try:
     requests.post(
-        'https://ntfy.sh/REDACTED_TOPIC',
-        data='Bot process exited (code ${EXIT_CODE})',
+        f'https://ntfy.sh/{topic}',
+        data=f'Bot process exited (code {exit_code})',
         headers={'Title': 'Bot Stopped', 'Priority': '3', 'Tags': 'checkered_flag'},
-        timeout=5
+        timeout=5,
     )
 except Exception:
     pass
 " 2>/dev/null || true
+fi
 
 exit $EXIT_CODE

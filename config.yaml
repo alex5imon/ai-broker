@@ -311,8 +311,12 @@ exit_spread_protection:
 # -----------------------------------------------------------------------------
 notifications:
   ntfy_server: "https://ntfy.sh"
-  ntfy_topic: "REDACTED_TOPIC"
-  ntfy_kill_topic: "REDACTED_KILL_TOPIC"
+  # Topic names are read from env vars NTFY_TOPIC and NTFY_KILL_TOPIC.
+  # ntfy.sh free-tier topics have no auth — anyone with the topic name can
+  # subscribe (and read every alert) or publish (including to the kill
+  # topic). Generate long random topic names locally and set them via .env
+  # for development or as repo secrets for GitHub Actions. If unset, the
+  # notifier disables ntfy (the bot still trades, just silently).
   priorities:
     trade_entry: 3
     position_closed: 3

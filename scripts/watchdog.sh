@@ -25,7 +25,9 @@ PROCESS_PATTERN="trading_bot.main"
 STALE_THRESHOLD_SEC=600        # 10 minutes of no log activity = frozen
 RESTART_COOLDOWN_SEC=600       # don't restart again within 10 minutes
 
-NTFY_TOPIC="REDACTED_TOPIC"
+# Read ntfy topic from env (set in .env or the LaunchAgent plist). Empty
+# = watchdog runs silently with no push notifications.
+NTFY_TOPIC="${NTFY_TOPIC:-}"
 
 mkdir -p "$LOG_DIR"
 
@@ -37,6 +39,9 @@ notify() {
     local title="$1"
     local body="$2"
     local priority="${3:-4}"
+    if [ -z "$NTFY_TOPIC" ]; then
+        return 0
+    fi
     curl -fsS --max-time 5 \
         -H "Title: ${title}" \
         -H "Priority: ${priority}" \

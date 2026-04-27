@@ -9,6 +9,7 @@ HTTP POST via ``requests`` and return immediately.
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import time
 from collections import deque
@@ -34,10 +35,22 @@ class Notifier:
     def __init__(self, config: dict[str, Any]) -> None:
         ntfy_cfg: dict[str, Any] = config.get("notifications", {})
         self._server: str = ntfy_cfg.get("ntfy_server", "https://ntfy.sh")
-        self._topic: str = ntfy_cfg.get("ntfy_topic", "REDACTED_TOPIC")
-        self._kill_topic: str = ntfy_cfg.get(
-            "ntfy_kill_topic", "REDACTED_KILL_TOPIC"
+
+        # Topic names: prefer env vars (production), fall back to config
+        # (test fixtures pass topics inline). ntfy.sh free-tier topics are
+        # globally readable to anyone who knows the name, so the production
+        # config.yaml deliberately omits them. Never bake a default literal
+        # into source — fail closed and disable ntfy if both env and config
+        # are empty.
+        self._topic: str = (
+            os.environ.get("NTFY_TOPIC", "").strip()
+            or str(ntfy_cfg.get("ntfy_topic", "")).strip()
         )
+        self._kill_topic: str = (
+            os.environ.get("NTFY_KILL_TOPIC", "").strip()
+            or str(ntfy_cfg.get("ntfy_kill_topic", "")).strip()
+        )
+
         self._max_retries: int = int(ntfy_cfg.get("max_retries", 3))
         self._retry_interval: float = float(
             ntfy_cfg.get("retry_interval_seconds", 60)
@@ -53,7 +66,14 @@ class Notifier:
 
         self._send_timestamps: deque[float] = deque()
         self._consecutive_failures: int = 0
-        self._ntfy_available: bool = True
+        # Disable ntfy entirely if topic env vars aren't set. Sends become
+        # no-ops (with optional macOS osascript fallback for local dev).
+        self._ntfy_available: bool = bool(self._topic)
+        if not self._ntfy_available:
+            logger.warning(
+                "NTFY_TOPIC env var not set — push notifications are disabled. "
+                "Set NTFY_TOPIC and NTFY_KILL_TOPIC to enable ntfy.sh alerts."
+            )
 
         self._session: requests.Session = requests.Session()
 
