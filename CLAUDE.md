@@ -38,9 +38,6 @@ python -m trading_bot.main --mode normal --dry-run
 # Run tests
 pytest trading_bot/tests/
 
-# Backtest — single-day Alpaca cache (legacy)
-python -m trading_bot.backtest --date 2026-04-15
-
 # Multi-strategy backtest — S&P 500 daily bars (505 tickers)
 python -m trading_bot.multi_strategy_backtest --from 2017-02-07 --to 2018-02-07 --daily
 
