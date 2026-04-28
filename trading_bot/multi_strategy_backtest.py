@@ -22,8 +22,11 @@ import logging
 import statistics
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, time
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from zoneinfo import ZoneInfo
+
+if TYPE_CHECKING:
+    from trading_bot.backtest.walkforward import WalkforwardResult
 
 import pandas as pd
 
@@ -1787,6 +1790,73 @@ def save_comparison_json(
     return output_path
 
 
+def save_walkforward_json(
+    result: "WalkforwardResult",
+    output_path: str | None = None,
+) -> str:
+    """Save a walkforward run (per-window stats, aggregate, bootstrap CIs)."""
+    import os
+
+    payload: dict[str, Any] = {
+        "from_date": result.from_date,
+        "to_date": result.to_date,
+        "config": {
+            "window_days": result.config.window_days,
+            "step_days": result.config.step_days,
+            "bootstrap_samples": result.config.bootstrap_samples,
+            "bootstrap_ci": result.config.bootstrap_ci,
+            "min_trades_per_window": result.config.min_trades_per_window,
+        },
+        "windows": [
+            {
+                "window_idx": w.window_idx,
+                "from_date": w.from_date.isoformat(),
+                "to_date": w.to_date.isoformat(),
+            }
+            for w in result.windows
+        ],
+        "aggregate": result.aggregate,
+        "per_window": {
+            sid: [
+                {
+                    "window_idx": s.window_idx,
+                    "from_date": s.from_date,
+                    "to_date": s.to_date,
+                    "trades": s.trades,
+                    "return_pct": round(s.return_pct, 4),
+                    "win_rate": round(s.win_rate, 4),
+                    "profit_factor": (
+                        round(s.profit_factor, 4) if s.profit_factor is not None else None
+                    ),
+                    "max_drawdown_pct": round(s.max_drawdown_pct, 4),
+                }
+                for s in stats
+            ]
+            for sid, stats in result.per_window.items()
+        },
+        "bootstrap": {
+            sid: {name: ci.as_dict() for name, ci in cis.items()}
+            for sid, cis in result.bootstrap.items()
+        },
+    }
+
+    if output_path is None:
+        out_dir = os.path.join(os.getcwd(), "backtest_results")
+        os.makedirs(out_dir, exist_ok=True)
+        now = datetime.now(ZoneInfo("Europe/London"))
+        ts = now.strftime("%Y%m%dT%H%M%S")
+        output_path = os.path.join(
+            out_dir,
+            f"walkforward_{result.from_date}_to_{result.to_date}_{ts}.json",
+        )
+
+    with open(output_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, default=str)
+
+    logger.info("Walkforward results saved to %s", output_path)
+    return output_path
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1835,6 +1905,26 @@ async def main() -> None:
         "--tickers", type=str, default="SPY,QQQ,XLF,XLK",
         help="Comma-separated tickers for --multi-intraday mode",
     )
+    parser.add_argument(
+        "--walkforward", action="store_true",
+        help="Run rolling-window OOS evaluation with bootstrap CIs",
+    )
+    parser.add_argument(
+        "--wf-window", type=int, default=90,
+        help="Walkforward window size in calendar days (default: 90)",
+    )
+    parser.add_argument(
+        "--wf-step", type=int, default=90,
+        help="Walkforward step size in calendar days (default: 90)",
+    )
+    parser.add_argument(
+        "--wf-bootstrap", type=int, default=1000,
+        help="Bootstrap resamples for walkforward CIs (default: 1000)",
+    )
+    parser.add_argument(
+        "--wf-ci", type=float, default=0.95,
+        help="Walkforward CI coverage in (0, 1) (default: 0.95)",
+    )
     args = parser.parse_args()
 
     logger.info(
@@ -1855,49 +1945,96 @@ async def main() -> None:
         tickers = list(raw.get("us", []))
         await download_all(config, tickers, d_from, d_to)
 
-    engine = MultiStrategyBacktester(config)
-
-    # Filter strategies if --strategies specified
+    # Validate the strategy filter early so we fail fast on a typo'd
+    # strategy id, rather than running an empty backtest per window.
     if args.strategies:
         selected = set(s.strip() for s in args.strategies.split(","))
-        before = len(engine._strategies)
-        engine._strategies = [s for s in engine._strategies if s.strategy_id in selected]
+        probe = MultiStrategyBacktester(config)
+        matched = [s.strategy_id for s in probe._strategies if s.strategy_id in selected]
         logger.info(
             "Strategy filter: %d -> %d strategies (%s)",
-            before, len(engine._strategies), [s.strategy_id for s in engine._strategies],
+            len(probe._strategies), len(matched), matched,
         )
-        if not engine._strategies:
+        if not matched:
             logger.error("No matching strategies found for: %s", selected)
             return
 
-    if args.multi_intraday:
-        ticker_list = [t.strip() for t in args.tickers.split(",") if t.strip()]
-        logger.info("Running multi-ticker intraday backtest on %s", ticker_list)
-        result = await engine.run_multi_ticker_intraday(
-            d_from, d_to,
-            tickers=ticker_list,
-            cash_per_strategy_usd=args.cash,
-            regime_filter=not args.no_regime_filter,
+    ticker_list = [t.strip() for t in args.tickers.split(",") if t.strip()]
+
+    async def _run_window(d1: date, d2: date) -> MultiStrategyResult:
+        # Each window needs a fresh engine so per-strategy state
+        # (cash, peak equity, cooldowns) doesn't leak across windows.
+        window_engine = MultiStrategyBacktester(config)
+        if args.strategies:
+            selected = set(s.strip() for s in args.strategies.split(","))
+            window_engine._strategies = [
+                s for s in window_engine._strategies if s.strategy_id in selected
+            ]
+        if args.multi_intraday:
+            return await window_engine.run_multi_ticker_intraday(
+                d1, d2,
+                tickers=ticker_list,
+                cash_per_strategy_usd=args.cash,
+                regime_filter=not args.no_regime_filter,
+            )
+        if args.spy:
+            return await window_engine.run_spy_intraday(
+                d1, d2,
+                cash_per_strategy_usd=args.cash,
+                regime_filter=not args.no_regime_filter,
+            )
+        if args.daily:
+            return await window_engine.run_daily(
+                d1, d2,
+                cash_per_strategy_usd=args.cash,
+                min_avg_volume=args.min_volume,
+                min_price=args.min_price,
+                max_price=args.max_price,
+                regime_filter=not args.no_regime_filter,
+            )
+        return await window_engine.run(d1, d2, cash_per_strategy_usd=args.cash)
+
+    if args.walkforward:
+        from trading_bot.backtest.walkforward import (
+            WalkforwardConfig,
+            run_walkforward,
         )
+
+        wf_cfg = WalkforwardConfig(
+            window_days=args.wf_window,
+            step_days=args.wf_step,
+            bootstrap_samples=args.wf_bootstrap,
+            bootstrap_ci=args.wf_ci,
+        )
+        logger.info(
+            "Running walkforward: window=%dd step=%dd bootstrap=%d ci=%.2f",
+            wf_cfg.window_days, wf_cfg.step_days,
+            wf_cfg.bootstrap_samples, wf_cfg.bootstrap_ci,
+        )
+        wf_result = await run_walkforward(d_from, d_to, _run_window, config=wf_cfg)
+        report = wf_result.summary()
+        for line in report.splitlines():
+            logger.info(line)
+        print(report)
+
+        json_path = save_walkforward_json(wf_result)
+        logger.info("Walkforward JSON saved to %s", json_path)
+        logger.info("Log file: %s", log_path)
+        print(f"\nWalkforward results saved to: {json_path}")
+        print(f"Log file: {log_path}")
+        return
+
+    if args.multi_intraday:
+        logger.info("Running multi-ticker intraday backtest on %s", ticker_list)
+        result = await _run_window(d_from, d_to)
     elif args.spy:
         logger.info("Running SPY intraday backtest (5-min bars)")
-        result = await engine.run_spy_intraday(
-            d_from, d_to,
-            cash_per_strategy_usd=args.cash,
-            regime_filter=not args.no_regime_filter,
-        )
+        result = await _run_window(d_from, d_to)
     elif args.daily:
         logger.info("Running daily-bar backtest on S&P 500 universe")
-        result = await engine.run_daily(
-            d_from, d_to,
-            cash_per_strategy_usd=args.cash,
-            min_avg_volume=args.min_volume,
-            min_price=args.min_price,
-            max_price=args.max_price,
-            regime_filter=not args.no_regime_filter,
-        )
+        result = await _run_window(d_from, d_to)
     else:
-        result = await engine.run(d_from, d_to, cash_per_strategy_usd=args.cash)
+        result = await _run_window(d_from, d_to)
 
     report = format_comparison_report(result)
     for line in report.splitlines():
@@ -1908,7 +2045,7 @@ async def main() -> None:
     logger.info("JSON results saved to %s", json_path)
     logger.info("Log file: %s", log_path)
     print(f"\nResults saved to: {json_path}")
-    print(f"Log file: {log_path}")
+    print(f"\nLog file: {log_path}")
 
 
 if __name__ == "__main__":
