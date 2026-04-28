@@ -32,6 +32,14 @@ class TrendFollowingStrategy(StrategyBase):
         self._trailing_stop_pct: float = float(config.get("trailing_stop_pct", 0.025))
         self._initial_stop_pct: float = float(config.get("initial_stop_pct", 0.03))
         self._max_positions: int = int(config.get("max_positions", 1))
+        # Opt-in ATR-anchored stop + trailing distance. When enabled, the
+        # initial stop becomes ``atr_stop_mult × ATR`` and the trailing
+        # distance becomes ``atr_trail_mult × ATR / entry`` so risk scales
+        # with regime volatility.
+        self._use_atr_stops: bool = bool(config.get("use_atr_stops", False))
+        self._atr_period: int = int(config.get("atr_period", 14))
+        self._atr_stop_mult: float = float(config.get("atr_stop_mult", 1.5))
+        self._atr_trail_mult: float = float(config.get("atr_trail_mult", 2.0))
 
     def evaluate_entry(
         self,
@@ -89,7 +97,21 @@ class TrendFollowingStrategy(StrategyBase):
         if avg_vol <= 0 or current_vol < self._volume_multiplier * avg_vol:
             return None
 
-        stop_price: float = round(current_price * (1.0 - self._initial_stop_pct), 2)
+        trail_pct: float = self._trailing_stop_pct
+        if self._use_atr_stops:
+            atr: float | None = self._compute_atr(df_daily, self._atr_period)
+            if atr is not None and atr > 0 and current_price > 0:
+                stop_price: float = round(
+                    current_price - self._atr_stop_mult * atr, 2,
+                )
+                trail_pct = max(
+                    self._atr_trail_mult * atr / current_price,
+                    self._trailing_stop_pct,
+                )
+            else:
+                stop_price = round(current_price * (1.0 - self._initial_stop_pct), 2)
+        else:
+            stop_price = round(current_price * (1.0 - self._initial_stop_pct), 2)
         shares: int = self._compute_shares(current_price, stop_price, available_cash)
         if shares < 1:
             return None
@@ -107,7 +129,7 @@ class TrendFollowingStrategy(StrategyBase):
             entry_price=current_price,
             stop_price=stop_price,
             target_price=None,
-            trail_pct=self._trailing_stop_pct,
+            trail_pct=trail_pct,
             hold_type=HoldType.SWING,
             strategy_id=self.strategy_id,
             signals={
@@ -137,9 +159,16 @@ class TrendFollowingStrategy(StrategyBase):
         if stop_price > 0 and current_price <= stop_price:
             return ExitSignal(should_exit=True, reason="stop_loss", is_emergency=True, use_market_order=True)
 
-        # Trailing stop: once price has moved up, trail from highest
+        # Trailing stop: once price has moved up, trail from highest. Prefer
+        # the per-position trailing_distance when set (lets ATR-anchored
+        # entries trail at their entry-time volatility), else fall back to
+        # the strategy default.
         if highest_price > entry_price:
-            trail_stop: float = highest_price * (1.0 - self._trailing_stop_pct)
+            stored_trail: float = float(coalesce(position, "trailing_distance", 0))
+            trail_distance: float = (
+                stored_trail if stored_trail > 0 else self._trailing_stop_pct
+            )
+            trail_stop: float = highest_price * (1.0 - trail_distance)
             if current_price <= trail_stop:
                 return ExitSignal(should_exit=True, reason="trailing_stop")
 

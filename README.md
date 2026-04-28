@@ -85,6 +85,19 @@ overnight gap filter.
 
 See [SPEC.md](SPEC.md) Sections 6 and 7 for the full entry / exit logic.
 
+### Risk gates layered on top
+
+These are book-wide protections that apply across all sleeves. Each is
+config-driven and can be disabled in [config.yaml](config.yaml).
+
+| Gate | Where | Config | What it does |
+|---|---|---|---|
+| **Per-symbol allocation cap** | `strategy_manager._enforce_symbol_cap` | `watchlist_caps.per_symbol[ticker]` | Caps total exposure to any single ticker (across all sleeves) at a fraction of the multi-strategy book. Shrinks oversized entries instead of skipping when possible. |
+| **Entry limit slop clamp** | `strategy_manager._clamp_limit_price` | `entry.limit_slop_pct` (default `0.002` = 0.2%) | Bounds entry limit prices to within 0.2% of NBBO ask (buys) or bid (sells). Prevents thin-spread chasing when the strategy reference price has drifted past the inside market. |
+| **Consecutive-loss cooldown** | `execution.loss_cooldown` | `risk.consecutive_loss_cooldown.{enabled,threshold_losses,cooldown_minutes}` | After N losing trades in a row, pauses ONLY the offending sleeve for M minutes. A profitable trade resets immediately. State persists in `risk_circuit_state` so it survives across stateless ticks. |
+| **Macro-event gate (FOMC)** | `data.event_calendar` | `event_gate.{enabled,fomc_action,fomc_size_multiplier,fomc_dates_<year>}` | Reduces or skips new entries on Fed announcement days. `fomc_action: "skip"` blocks all new entries; `"reduce"` scales share counts by `fomc_size_multiplier`. Existing positions keep being managed normally. Update `fomc_dates_<year>` annually from federalreserve.gov. |
+| **ATR-anchored stops** | each strategy's `evaluate_entry` | `<strategy>.{use_atr_stops,atr_period,atr_stop_mult,atr_trail_mult}` | Sizes stop and trail distance from realized volatility (ATR) instead of fixed percentages. Mean-reversion uses 2.0×ATR stop / 5.0×ATR target; breakout and trend-following use 1.5×ATR stop / 2.0×ATR trail. Falls back to fixed pct when ATR can't be computed. |
+
 ## Backtesting
 
 ```bash

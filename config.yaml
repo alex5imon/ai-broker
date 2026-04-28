@@ -135,6 +135,51 @@ watchlist:
     - "META"    # Meta Platforms
 
 # -----------------------------------------------------------------------------
+# Per-Symbol Allocation Caps
+# -----------------------------------------------------------------------------
+# Cap on how much of the multi-strategy book a single ticker may consume
+# (across ALL strategies, summed at entry-price). Prevents one runaway
+# position from dominating a 2-position phase-1 book even when each
+# individual strategy says "size up". Expressed as a fraction in (0, 1].
+# Set default_max_allocation_pct to 1.0 to disable globally.
+watchlist_caps:
+  default_max_allocation_pct: 0.50    # 50% — no ticker > half the book
+  per_symbol:
+    SPY: 0.60                         # primary signal source — slightly looser
+    QQQ: 0.50
+    XLK: 0.35
+    XLF: 0.35
+    XLV: 0.35
+    XLE: 0.30
+    XLY: 0.30
+    XLP: 0.30
+    XLI: 0.30
+    XLB: 0.25
+    XLU: 0.25
+    XLRE: 0.25
+    XLC: 0.30
+
+# -----------------------------------------------------------------------------
+# Macro-Event Gating (FOMC days)
+# -----------------------------------------------------------------------------
+# Reduces or skips new entries on Fed announcement days. The bot keeps
+# managing existing positions normally — only NEW entries are gated.
+# Update fomc_dates_<year> annually from federalreserve.gov.
+event_gate:
+  enabled: true
+  fomc_action: "reduce"               # "skip" (no entries) or "reduce" (scale risk)
+  fomc_size_multiplier: 0.50          # used only when fomc_action == "reduce"
+  fomc_dates_2026:
+    - "2026-01-28"
+    - "2026-03-18"
+    - "2026-05-06"
+    - "2026-06-17"
+    - "2026-07-29"
+    - "2026-09-16"
+    - "2026-11-04"
+    - "2026-12-16"
+
+# -----------------------------------------------------------------------------
 # Watchlist Quality Criteria
 # -----------------------------------------------------------------------------
 watchlist_criteria:
@@ -207,6 +252,14 @@ risk:
     pause_days: 1
     recovery_position_size_pct: 0.50  # 50% size for first 3 trades after breaker
     recovery_trades: 3
+  # Per-strategy cooldown after N consecutive losing trades. A profitable
+  # exit resets the streak immediately. Pauses ONLY the offending strategy
+  # (other sleeves keep trading). Tuning notes: 3 / 240 ≈ "sit out half
+  # a session after a 3-loss skid". Set enabled=false to disable.
+  consecutive_loss_cooldown:
+    enabled: true
+    threshold_losses: 3
+    cooldown_minutes: 240
   correlation_threshold: 0.85
   order_rejections:
     max_count: 3
@@ -256,6 +309,10 @@ entry:
   spread_wait_seconds: 120        # Wait up to 2 min for spread to narrow
   spread_recheck_seconds: 15      # Recheck spread every 15 sec
   entry_timeout_seconds: 300      # Cancel unfilled entry after 5 min
+  # Maximum slop above ask (buys) or below bid (sells) for entry limit
+  # orders. Prevents thin-spread / pre-market chasing where a strategy's
+  # current_price reference may already sit at ask. 0.002 = 0.2%.
+  limit_slop_pct: 0.002
   partial_fill_min_pct: 0.50      # Accept partial fill >= 50%
   cooldown_minutes: 30            # Cooldown after exiting a ticker
   earnings_blackout_hours: 48     # Hours before/after earnings to skip
@@ -493,12 +550,11 @@ multi_strategy:
     # they produce comparable backtest evidence.
     mean_reversion:
       enabled: true
-      # 1500 -> 750 after 2026-04-28 walkforward:
-      # 14-window OOS PF 1.235 with 95% CI [0.92, 1.71] — lower bound
-      # below 1.0, not statistically significant. Reallocated half its
-      # capital to breakout (the only significant edge) and a slice to
-      # trend_following.
-      allocation_usd: 750.0
+      # 750 -> 1375 after 2026-04-28 trend_following disable.
+      # Absorbing half of the freed $1250 (other half to breakout). Latest
+      # 57-window walkforward: OOS PF 1.498 CI [0.652, 4.006] — point up
+      # from 1.235 with the new ATR + gate stack, OOS return +7.52%.
+      allocation_usd: 1375.0
       max_positions: 3          # hold up to 3 concurrent diversified ETF positions
       rsi_period: 14
       rsi_oversold: 28
@@ -552,12 +608,16 @@ multi_strategy:
       bb_lookback_bars: 3
 
     trend_following:
-      enabled: true
-      # 1000 -> 1250 after 2026-04-28 walkforward:
-      # OOS PF 1.637 with 95% CI [1.00, 2.58] — borderline significant
-      # (lower bound just touches 1.0). Modest bump from mean_reversion
-      # rebalance.
-      allocation_usd: 1250.0
+      # DISABLED 2026-04-28 (second walkforward review).
+      # Two consecutive walkforward runs put the OOS PF lower-CI below 1.0:
+      #   pre-gate (memorized): PF 1.637 CI [1.00, 2.58] — borderline
+      #   post-gate (current):  PF 1.034 CI [0.476, 2.555] — not significant
+      # OOS return collapsed from +5.6% to +0.33% over 13yr. Allocation
+      # redistributed to mean_reversion (+$625) and breakout (+$625), the
+      # two sleeves still showing positive OOS evidence. Left in config
+      # for future re-enable if the strategy logic is overhauled.
+      enabled: false
+      allocation_usd: 0.0
       max_positions: 1
       sma_period: 50
       ema_fast: 9
@@ -565,21 +625,32 @@ multi_strategy:
       volume_multiplier: 1.5
       trailing_stop_pct: 0.025
       initial_stop_pct: 0.03
+      # ATR-anchored stop + trailing distance. Volatility-adaptive exits:
+      # tight in calm tape, wider in violent tape. Falls back to the fixed
+      # percentages above if ATR can't be computed.
+      use_atr_stops: true
+      atr_period: 14
+      atr_stop_mult: 1.5
+      atr_trail_mult: 2.0
 
     breakout:
       enabled: true
-      # 1500 -> 2000 after 2026-04-28 walkforward:
-      # 14-window OOS PF 2.385 with 95% CI [1.30, 4.70] — the only
-      # strategy with lower CI bound > 1.0, i.e. statistically
-      # significant profitability. Trade count is small (44 over 13yr)
-      # so there's room to grow this allocation as live evidence
-      # accumulates. Capital absorbed from mean_reversion rebalance.
-      allocation_usd: 2000.0
+      # 2000 -> 2625 after 2026-04-28 trend_following disable.
+      # Absorbing the other half of the freed $1250. Latest 57-window
+      # walkforward: OOS PF 1.637 CI [0.735, 4.657], OOS return +10.05%
+      # (best per-strategy OOS return). Simple 13yr backtest also gives
+      # PF 2.72 — strongest sleeve in the stack.
+      allocation_usd: 2625.0
       max_positions: 1
       breakout_period: 20
       exit_period: 10
       volume_multiplier: 1.5
       stop_loss_pct: 0.03
+      # ATR-anchored stop. Donchian exits handle the upside; the stop just
+      # needs to scale with regime vol to avoid getting tagged in noise.
+      use_atr_stops: true
+      atr_period: 14
+      atr_stop_mult: 1.5
 
     # Sentiment Combo DISABLED 2026-04-24 (objective reframe).
     # Two tuning iterations exhausted the parameter search:
