@@ -20,8 +20,17 @@ STRATEGY_REGISTRY: dict[str, type[StrategyBase]] = {
 }
 
 
-def create_strategies(strategy_configs: dict[str, dict[str, Any]]) -> list[StrategyBase]:
-    """Instantiate all enabled strategies from config."""
+def create_strategies(
+    strategy_configs: dict[str, dict[str, Any]],
+    db_path: str | None = None,
+    vol_target_config: dict[str, Any] | None = None,
+) -> list[StrategyBase]:
+    """Instantiate all enabled strategies from config.
+
+    ``db_path`` and ``vol_target_config`` are optional so the backtester
+    (which uses an in-memory closed-trades buffer) can keep its current
+    constructor invocation. Live callers should pass both.
+    """
     strategies: list[StrategyBase] = []
     for sid, cfg in strategy_configs.items():
         if not cfg.get("enabled", True):
@@ -29,5 +38,11 @@ def create_strategies(strategy_configs: dict[str, dict[str, Any]]) -> list[Strat
         cls: type[StrategyBase] | None = STRATEGY_REGISTRY.get(sid)
         if cls is None:
             continue
-        strategies.append(cls(config=cfg))
+        strategies.append(
+            cls(
+                config=cfg,
+                db_path=db_path,
+                vol_target_config=vol_target_config,
+            )
+        )
     return strategies

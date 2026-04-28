@@ -19,11 +19,12 @@ logger: logging.Logger = logging.getLogger(__name__)
 class MeanReversionStrategy(StrategyBase):
     """Buy when RSI(14) recovers from oversold; exit on RSI normalization or target."""
 
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(self, config: dict[str, Any], **kwargs: Any) -> None:
         super().__init__(
             strategy_id="mean_reversion",
             display_name="Mean Reversion",
             config=config,
+            **kwargs,
         )
         self._rsi_period: int = int(config.get("rsi_period", 14))
         self._rsi_oversold: float = float(config.get("rsi_oversold", 28))
@@ -243,6 +244,7 @@ class MeanReversionStrategy(StrategyBase):
             target_price = target_price_computed
 
         if self._use_risk_sizing:
+            vt_mult: float = self.vol_multiplier()
             shares = self.size_by_risk(
                 entry_price=current_price,
                 stop_price=stop_price,
@@ -250,6 +252,7 @@ class MeanReversionStrategy(StrategyBase):
                 risk_per_trade_pct=self._risk_per_trade_pct,
                 max_position_pct=self._max_position_pct,
                 fractional=self._fractional_shares,
+                vol_multiplier=vt_mult,
             )
         else:
             shares = self._compute_shares(current_price, stop_price, available_cash)

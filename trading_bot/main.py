@@ -143,7 +143,14 @@ class TradingBot:
         self._strategy_manager: StrategyManager | None = None
         if config.multi_strategy_enabled:
             strategy_configs: dict[str, Any] = config.get_strategy_configs()
-            strategies = create_strategies(strategy_configs)
+            vol_target_cfg: dict[str, Any] = (
+                config._raw.get("risk", {}) or {}
+            ).get("vol_target", {}) or {}
+            strategies = create_strategies(
+                strategy_configs,
+                db_path=db_path,
+                vol_target_config=vol_target_cfg,
+            )
             portfolio_mgr = PortfolioManager(
                 strategy_configs=strategy_configs,
                 total_cash=config.multi_strategy_total_allocation,

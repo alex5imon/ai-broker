@@ -150,3 +150,87 @@ class TestLoadRecentTradeReturns:
         conn.close()
 
         assert load_recent_trade_returns(str(db), "mr", lookback=10) == []
+
+
+class TestStrategyBaseVolMultiplier:
+    """Live-path integration: vol_multiplier() on StrategyBase reads the
+    real trades table populated through the live schema."""
+
+    def _seed_trades(
+        self, conn: sqlite3.Connection, strategy_id: str, returns: list[float]
+    ) -> None:
+        from datetime import datetime, timedelta
+        base = datetime(2026, 1, 1, 10, 0, 0)
+        for i, r in enumerate(returns):
+            entry = 100.0
+            qty = 1
+            exit_price = entry * (1.0 + r)
+            ts = (base + timedelta(hours=i)).isoformat()
+            conn.execute(
+                """INSERT INTO trades (ticker, exchange, currency, side,
+                   entry_time, entry_price, quantity, exit_time, exit_price,
+                   hold_type, phase, strategy_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ("SPY", "NASDAQ", "USD", "BUY",
+                 ts, entry, qty, ts, exit_price,
+                 "intraday", 1, strategy_id),
+            )
+        conn.commit()
+
+    def test_returns_one_when_db_path_missing(self) -> None:
+        from trading_bot.strategy.strategies.mean_reversion import MeanReversionStrategy
+        s = MeanReversionStrategy(config={"use_risk_sizing": True})
+        assert s.vol_multiplier() == 1.0
+
+    def test_returns_one_when_target_zero(self, tmp_db_path: str) -> None:
+        from trading_bot.strategy.strategies.mean_reversion import MeanReversionStrategy
+        s = MeanReversionStrategy(
+            config={"use_risk_sizing": True},
+            db_path=tmp_db_path,
+            vol_target_config={"annual_vol_pct": 0.0},
+        )
+        assert s.vol_multiplier() == 1.0
+
+    def test_scales_down_on_high_vol(self, tmp_db_path: str) -> None:
+        from trading_bot.strategy.strategies.mean_reversion import MeanReversionStrategy
+        # Big swings → realized per-trade vol way above target.
+        conn = sqlite3.connect(tmp_db_path)
+        self._seed_trades(conn, "mean_reversion", [0.05, -0.05] * 10)
+        conn.close()
+
+        s = MeanReversionStrategy(
+            config={"use_risk_sizing": True},
+            db_path=tmp_db_path,
+            vol_target_config={
+                "annual_vol_pct": 0.20,
+                "lookback_trades": 30,
+                "min_multiplier": 0.5,
+                "max_multiplier": 1.5,
+            },
+        )
+        assert s.vol_multiplier() == 0.5
+
+    def test_isolated_per_strategy(self, tmp_db_path: str) -> None:
+        from trading_bot.strategy.strategies.mean_reversion import MeanReversionStrategy
+        from trading_bot.strategy.strategies.breakout import BreakoutStrategy
+        # mean_reversion: high vol; breakout: tiny vol.
+        conn = sqlite3.connect(tmp_db_path)
+        self._seed_trades(conn, "mean_reversion", [0.05, -0.05] * 10)
+        self._seed_trades(conn, "breakout", [0.0001, -0.0001] * 10)
+        conn.close()
+
+        cfg = {
+            "annual_vol_pct": 0.20,
+            "lookback_trades": 30,
+            "min_multiplier": 0.5,
+            "max_multiplier": 1.5,
+        }
+        mr = MeanReversionStrategy(
+            config={"use_risk_sizing": True},
+            db_path=tmp_db_path, vol_target_config=cfg,
+        )
+        bo = BreakoutStrategy(
+            config={"use_risk_sizing": True},
+            db_path=tmp_db_path, vol_target_config=cfg,
+        )
+        assert mr.vol_multiplier() == 0.5
+        assert bo.vol_multiplier() == 1.5

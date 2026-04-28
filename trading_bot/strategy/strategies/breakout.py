@@ -18,11 +18,12 @@ logger: logging.Logger = logging.getLogger(__name__)
 class BreakoutStrategy(StrategyBase):
     """Enter on 20-day high breakout with volume; exit at 10-day low or stop."""
 
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(self, config: dict[str, Any], **kwargs: Any) -> None:
         super().__init__(
             strategy_id="breakout",
             display_name="Breakout",
             config=config,
+            **kwargs,
         )
         self._breakout_period: int = int(config.get("breakout_period", 20))
         self._exit_period: int = int(config.get("exit_period", 10))
