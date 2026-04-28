@@ -387,6 +387,52 @@ class Config:
     def health_enabled(self) -> bool:
         return bool(self._get("health", "enabled", default=True))
 
+    # -----------------------------------------------------------------------
+    # Per-symbol allocation cap
+    # -----------------------------------------------------------------------
+
+    def get_symbol_max_allocation_pct(self, ticker: str) -> float:
+        """Per-ticker cap on share of total book (fraction in (0, 1]).
+
+        Looks up ``watchlist_caps.per_symbol[ticker]``; falls back to
+        ``watchlist_caps.default_max_allocation_pct``; finally falls back
+        to ``1.0`` (no cap) if neither is set.
+        """
+        per_symbol: dict[str, Any] | None = self._get("watchlist_caps", "per_symbol")
+        if isinstance(per_symbol, dict) and ticker in per_symbol:
+            return float(per_symbol[ticker])
+        default_pct: Any = self._get("watchlist_caps", "default_max_allocation_pct")
+        if default_pct is not None:
+            return float(default_pct)
+        return 1.0
+
+    # -----------------------------------------------------------------------
+    # Order placement (entry slop)
+    # -----------------------------------------------------------------------
+
+    @property
+    def entry_limit_slop_pct(self) -> float:
+        """Maximum distance an entry limit price may sit beyond ask (or below bid).
+
+        Returns 0 when not configured (i.e., no clamping applied).
+        """
+        return float(self._get("entry", "limit_slop_pct", default=0.0))
+
+    # -----------------------------------------------------------------------
+    # Consecutive-loss cooldown
+    # -----------------------------------------------------------------------
+
+    def get_loss_cooldown_config(self) -> dict[str, Any]:
+        """Return the consecutive-loss cooldown config (with defaults)."""
+        section: dict[str, Any] = self._get(
+            "risk", "consecutive_loss_cooldown", default={}
+        ) or {}
+        return {
+            "enabled": bool(section.get("enabled", False)),
+            "threshold_losses": int(section.get("threshold_losses", 3)),
+            "cooldown_minutes": int(section.get("cooldown_minutes", 240)),
+        }
+
     @property
     def health_host(self) -> str:
         return str(self._get("health", "host", default="0.0.0.0"))

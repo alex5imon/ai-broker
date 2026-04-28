@@ -30,6 +30,13 @@ class BreakoutStrategy(StrategyBase):
         self._volume_multiplier: float = float(config.get("volume_multiplier", 1.5))
         self._stop_loss_pct: float = float(config.get("stop_loss_pct", 0.03))
         self._max_positions: int = int(config.get("max_positions", 1))
+        # Opt-in ATR-anchored stop. When enabled, replaces the fixed
+        # stop_loss_pct with stop_atr_mult × ATR (typically 1.5×ATR for
+        # asymmetric R/R breakouts). Defaults match the article-aligned
+        # 1.5× stop.
+        self._use_atr_stops: bool = bool(config.get("use_atr_stops", False))
+        self._atr_period: int = int(config.get("atr_period", 14))
+        self._atr_stop_mult: float = float(config.get("atr_stop_mult", 1.5))
 
     def evaluate_entry(
         self,
@@ -63,7 +70,16 @@ class BreakoutStrategy(StrategyBase):
         if vol_avg <= 0 or current_vol < self._volume_multiplier * vol_avg:
             return None
 
-        stop_price: float = round(current_price * (1.0 - self._stop_loss_pct), 2)
+        if self._use_atr_stops:
+            atr: float | None = self._compute_atr(df_daily, self._atr_period)
+            if atr is not None and atr > 0:
+                stop_price: float = round(
+                    current_price - self._atr_stop_mult * atr, 2,
+                )
+            else:
+                stop_price = round(current_price * (1.0 - self._stop_loss_pct), 2)
+        else:
+            stop_price = round(current_price * (1.0 - self._stop_loss_pct), 2)
         shares: int = self._compute_shares(current_price, stop_price, available_cash)
         if shares < 1:
             return None
