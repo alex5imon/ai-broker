@@ -493,12 +493,17 @@ multi_strategy:
     # they produce comparable backtest evidence.
     mean_reversion:
       enabled: true
-      # 1500 -> 750 after 2026-04-28 walkforward:
-      # 14-window OOS PF 1.235 with 95% CI [0.92, 1.71] — lower bound
-      # below 1.0, not statistically significant. Reallocated half its
-      # capital to breakout (the only significant edge) and a slice to
-      # trend_following.
-      allocation_usd: 750.0
+      # 750 -> 2500 after 2026-04-28 evening walkforward:
+      # On 13-ETF SPDR sector universe (2020-07-27 to 2026-04-16,
+      # 6 yearly windows, no regime filter):
+      #   482 trades, WR 52.7%, PF 1.201, OOS Return +47.2%
+      #   PF 95% CI [1.006, 1.428] — lower bound > 1.0, statistically
+      #   significant. Sharpe lower bound also positive (0.003).
+      # This is the only strategy with a stable edge across both the
+      # 2008-2021 SPY-only and 2020-2026 13-ETF regimes. Scale up
+      # accordingly. Capital comes from the disabled breakout and
+      # trend_following sleeves (PF 0.29 and 0.57 in current regime).
+      allocation_usd: 2500.0
       max_positions: 3          # hold up to 3 concurrent diversified ETF positions
       rsi_period: 14
       rsi_oversold: 28
@@ -552,12 +557,15 @@ multi_strategy:
       bb_lookback_bars: 3
 
     trend_following:
-      enabled: true
-      # 1000 -> 1250 after 2026-04-28 walkforward:
-      # OOS PF 1.637 with 95% CI [1.00, 2.58] — borderline significant
-      # (lower bound just touches 1.0). Modest bump from mean_reversion
-      # rebalance.
-      allocation_usd: 1250.0
+      # DISABLED 2026-04-28 evening walkforward.
+      # On 13-ETF universe 2020-07-27 to 2026-04-16:
+      #   89 trades, WR 29.2%, PF 0.565, OOS Return -15.3%
+      # PR #9's bullish read (PF 1.637 CI [1.00, 2.58]) was on
+      # SPY-only 2008-2021. Recent regime is hostile — strong moves
+      # break out and keep going past the trail-stop, or fake out
+      # immediately. Disable until retuned for current era.
+      enabled: false
+      allocation_usd: 0.0
       max_positions: 1
       sma_period: 50
       ema_fast: 9
@@ -567,14 +575,17 @@ multi_strategy:
       initial_stop_pct: 0.03
 
     breakout:
-      enabled: true
-      # 1500 -> 2000 after 2026-04-28 walkforward:
-      # 14-window OOS PF 2.385 with 95% CI [1.30, 4.70] — the only
-      # strategy with lower CI bound > 1.0, i.e. statistically
-      # significant profitability. Trade count is small (44 over 13yr)
-      # so there's room to grow this allocation as live evidence
-      # accumulates. Capital absorbed from mean_reversion rebalance.
-      allocation_usd: 2000.0
+      # DISABLED 2026-04-28 evening walkforward.
+      # On 13-ETF universe 2020-07-27 to 2026-04-16:
+      #   26 trades, WR 11.5%, PF 0.292, OOS Return -17.0%
+      # The PF 2.385 finding from PR #9 was on SPY-only 2008-2021.
+      # In the current regime, breakouts on the 4-13 ETF universe
+      # fake out hard — the 11.5% win rate is well below the breakout
+      # archetype's natural ~40-50%. Disable until retuned for the
+      # current era (or until adding a regime filter that confines
+      # entries to genuine momentum thrusts).
+      enabled: false
+      allocation_usd: 0.0
       max_positions: 1
       breakout_period: 20
       exit_period: 10
@@ -605,8 +616,17 @@ multi_strategy:
     # premium. 3% disaster stop caps gap-down tail risk.
     overnight_drift:
       enabled: true
-      allocation_usd: 1000.0
-      max_positions: 1
+      # 1000 -> 2500, max_positions 1 -> 3 after 2026-04-28 evening
+      # walkforward on 13-ETF universe:
+      #   max_pos=1: 1435 trades, PF 1.035, CI [0.892, 1.196],
+      #              OOS Return +5.5%
+      #   max_pos=3: 4295 trades, PF 1.052, CI [0.964, 1.155],
+      #              OOS Return +19.1%
+      # max_positions=1 saturates at one trade/day regardless of
+      # universe size — we were leaving sector-diversification value
+      # on the table. PF holds, CI tightens, OOS return triples.
+      allocation_usd: 2500.0
+      max_positions: 3
       # Entry fires on the 15:45 5-min bar (covers 15:45-15:49:59 ET).
       # Must fire BEFORE wind-down (15:50) because the backtester skips
       # new entries once wind-down starts. This gives ~15 min before close.
