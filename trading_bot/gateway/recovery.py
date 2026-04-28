@@ -10,8 +10,8 @@ from __future__ import annotations
 import logging
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import date, datetime
-from typing import Any
+from datetime import date, datetime, time, timedelta
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from alpaca.trading.models import Position as AlpacaPosition
@@ -24,6 +24,10 @@ from trading_bot.notifications.notifier import Notifier
 logger: logging.Logger = logging.getLogger(__name__)
 
 ET: ZoneInfo = TZ_EASTERN
+
+# Default thresholds — overridable via config.
+_DEFAULT_STALE_ENTRY_MINUTES: int = 5
+_DEFAULT_EOD_FLATTEN_TIME: str = "15:55"
 
 
 @dataclass
@@ -39,6 +43,8 @@ class RecoveryResult:
     quantities_updated: list[str] = field(default_factory=list)
     stops_placed: list[str] = field(default_factory=list)
     settlements_updated: int = 0
+    stale_orders_cancelled: list[str] = field(default_factory=list)
+    eod_flatten_orders: list[str] = field(default_factory=list)
 
     account_equity: float = 0.0
     settled_cash: float = 0.0
@@ -50,6 +56,8 @@ class RecoveryResult:
             self.positions_created
             or self.positions_closed_mismatch
             or self.quantities_updated
+            or self.stale_orders_cancelled
+            or self.eod_flatten_orders
         )
 
     def summary(self) -> str:
@@ -68,6 +76,15 @@ class RecoveryResult:
             lines.append(f"Updated quantities: {', '.join(self.quantities_updated)}")
         if self.stops_placed:
             lines.append(f"Placed missing stop orders: {', '.join(self.stops_placed)}")
+        if self.stale_orders_cancelled:
+            lines.append(
+                f"Cancelled stale entry orders: {', '.join(self.stale_orders_cancelled)}"
+            )
+        if self.eod_flatten_orders:
+            lines.append(
+                f"EOD flatten — closing intraday positions: "
+                f"{', '.join(self.eod_flatten_orders)}"
+            )
         if self.settlements_updated:
             lines.append(f"Settlements marked settled: {self.settlements_updated}")
         if not self.has_discrepancies:
@@ -84,11 +101,15 @@ class StateRecovery:
         db_path: str,
         notifier: Notifier,
         config: dict[str, Any] | None = None,
+        now_fn: "Callable[[], datetime] | None" = None,  # noqa: F821
     ) -> None:
         self._gw: GatewayConnection = gateway
         self._db_path: str = db_path
         self._notifier: Notifier = notifier
         self._config: dict[str, Any] = config or {}
+        # Injectable clock — defaults to wall clock in ET. Tests pass a
+        # fixed clock to exercise the EOD-flatten branches deterministically.
+        self._now_fn = now_fn or (lambda: datetime.now(tz=ET))
 
     async def recover(self) -> RecoveryResult:
         """Run the full state-recovery sequence."""
@@ -118,10 +139,18 @@ class StateRecovery:
         # 6. Verify stop orders
         await self._verify_stop_orders(alpaca_positions, alpaca_orders, result)
 
-        # 7. Update settlements
+        # 7. Cancel stale entry orders. Fresh order list because step 6 may
+        #    have placed new stops, but those are GTC and not stale.
+        await self._cancel_stale_entry_orders(alpaca_orders, result)
+
+        # 8. EOD intraday flatten. Closes intraday-tagged DB positions if the
+        #    cron tick lands after the configured cutoff (default 15:55 ET).
+        await self._eod_intraday_flatten(alpaca_positions, result)
+
+        # 9. Update settlements
         result.settlements_updated = self._update_settlements()
 
-        # 8. Log and alert
+        # 10. Log and alert
         logger.info("State recovery complete:\n%s", result.summary())
         if result.has_discrepancies:
             await self._notifier.gateway_alert(
@@ -255,6 +284,131 @@ class StateRecovery:
         except Exception:
             logger.exception("Failed to place emergency stop for %s", ticker)
 
+    async def _cancel_stale_entry_orders(
+        self,
+        alpaca_orders: list[AlpacaOrder],
+        result: RecoveryResult,
+    ) -> None:
+        """Cancel pending entry orders older than the stale threshold.
+
+        Borrowed from alpacahq/example-scalping: a stateless tick missed by
+        cron can leave a buy/sell ``new`` order hanging at a price that no
+        longer reflects the signal. We cancel any non-stop, non-trailing
+        entry order older than ``stale_entry_order_minutes``.
+        """
+        exit_cfg: dict[str, Any] = self._config.get("exit_intraday", {})
+        threshold_min: int = int(
+            exit_cfg.get("stale_entry_order_minutes", _DEFAULT_STALE_ENTRY_MINUTES)
+        )
+        if threshold_min <= 0:
+            return
+
+        now: datetime = self._now_fn()
+        cutoff: datetime = now - timedelta(minutes=threshold_min)
+
+        for order in alpaca_orders:
+            order_type: str = order.type.value if order.type else ""
+            # Don't cancel risk-management orders. Those are GTC by design.
+            if order_type in ("stop", "trailing_stop", "stop_limit"):
+                continue
+
+            submitted_at: datetime | None = _to_et(
+                getattr(order, "submitted_at", None)
+                or getattr(order, "created_at", None)
+            )
+            if submitted_at is None or submitted_at >= cutoff:
+                continue
+
+            ticker: str = str(order.symbol)
+            order_id: str = str(getattr(order, "id", "") or "")
+            try:
+                self._gw.client.cancel_order_by_id(order_id)
+                age_min: float = (now - submitted_at).total_seconds() / 60.0
+                logger.warning(
+                    "Cancelled stale %s order for %s (id=%s, age=%.1f min)",
+                    order_type, ticker, order_id, age_min,
+                )
+                result.stale_orders_cancelled.append(ticker)
+            except Exception:
+                logger.exception(
+                    "Failed to cancel stale order id=%s ticker=%s",
+                    order_id, ticker,
+                )
+
+    async def _eod_intraday_flatten(
+        self,
+        alpaca_positions: list[AlpacaPosition],
+        result: RecoveryResult,
+    ) -> None:
+        """Close DB-tagged intraday positions if past the EOD cutoff.
+
+        Swing positions are intentionally untouched. Only intraday-tagged
+        positions in the local DB are flattened — that keeps the policy
+        decision (which holds are intraday) inside our config rather than
+        relying on broker metadata.
+        """
+        exit_cfg: dict[str, Any] = self._config.get("exit_intraday", {})
+        cutoff_str: str = str(
+            exit_cfg.get("eod_flatten_time_et", _DEFAULT_EOD_FLATTEN_TIME)
+        )
+        if not cutoff_str:
+            return
+
+        try:
+            cutoff_t: time = time.fromisoformat(cutoff_str)
+        except ValueError:
+            logger.warning("Invalid eod_flatten_time_et=%r — skipping", cutoff_str)
+            return
+
+        now_et: datetime = self._now_fn()
+        if now_et.time() < cutoff_t:
+            return
+
+        intraday_tickers: set[str] = self._intraday_tickers_in_db()
+        if not intraday_tickers:
+            return
+
+        from alpaca.trading.requests import MarketOrderRequest
+        from alpaca.trading.enums import OrderSide, TimeInForce
+
+        for pos in alpaca_positions:
+            ticker: str = str(pos.symbol)
+            if ticker not in intraday_tickers:
+                continue
+            qty: int = int(float(pos.qty or 0))
+            if qty == 0:
+                continue
+
+            side: OrderSide = OrderSide.SELL if qty > 0 else OrderSide.BUY
+            try:
+                request = MarketOrderRequest(
+                    symbol=ticker,
+                    qty=abs(qty),
+                    side=side,
+                    time_in_force=TimeInForce.DAY,
+                )
+                self._gw.client.submit_order(order_data=request)
+                logger.warning(
+                    "EOD flatten: %s %d %s (cutoff=%s)",
+                    side.value, abs(qty), ticker, cutoff_str,
+                )
+                result.eod_flatten_orders.append(ticker)
+            except Exception:
+                logger.exception("EOD flatten failed for %s", ticker)
+
+    def _intraday_tickers_in_db(self) -> set[str]:
+        conn: sqlite3.Connection = sqlite3.connect(self._db_path)
+        try:
+            cursor = conn.execute(
+                "SELECT ticker FROM positions "
+                "WHERE status != 'CLOSED' AND hold_type = 'intraday'"
+            )
+            return {row[0] for row in cursor.fetchall()}
+        except sqlite3.OperationalError:
+            return set()
+        finally:
+            conn.close()
+
     def _update_settlements(self) -> int:
         today_str: str = date.today().isoformat()
         conn: sqlite3.Connection = sqlite3.connect(self._db_path)
@@ -358,3 +512,21 @@ def _safe_float(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _to_et(value: Any) -> datetime | None:
+    """Coerce an Alpaca timestamp (datetime or ISO string) to ET, or None."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt: datetime = value
+    elif isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+    return dt.astimezone(ET)
