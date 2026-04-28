@@ -18,11 +18,12 @@ logger: logging.Logger = logging.getLogger(__name__)
 class TrendFollowingStrategy(StrategyBase):
     """Enter on EMA crossover with trend confirmation; exit via trailing stop."""
 
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(self, config: dict[str, Any], **kwargs: Any) -> None:
         super().__init__(
             strategy_id="trend_following",
             display_name="Trend Following",
             config=config,
+            **kwargs,
         )
         self._sma_period: int = int(config.get("sma_period", 50))
         self._ema_fast: int = int(config.get("ema_fast", 9))

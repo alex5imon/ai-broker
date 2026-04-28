@@ -51,10 +51,21 @@ class StrategyBase(ABC):
     strategy_id: str
     display_name: str
 
-    def __init__(self, strategy_id: str, display_name: str, config: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        strategy_id: str,
+        display_name: str,
+        config: dict[str, Any],
+        db_path: str | None = None,
+        vol_target_config: dict[str, Any] | None = None,
+    ) -> None:
         self.strategy_id = strategy_id
         self.display_name = display_name
         self._config = config
+        # Live vol-target context. Backtester passes None and uses its own
+        # in-memory closed-trades buffer instead.
+        self._db_path: str | None = db_path
+        self._vol_target_config: dict[str, Any] = vol_target_config or {}
 
     @abstractmethod
     def evaluate_entry(
@@ -170,6 +181,7 @@ class StrategyBase(ABC):
         risk_per_trade_pct: float = 0.02,
         max_position_pct: float = 0.40,
         fractional: bool = False,
+        vol_multiplier: float = 1.0,
     ) -> float:
         """Share count so max loss ≈ risk_per_trade_pct of available_cash.
 
@@ -177,6 +189,8 @@ class StrategyBase(ABC):
         4 decimal places (Alpaca supports fractional shares down to 1/1000000).
         With ``fractional=False`` returns an integer share count.
         Bounded above by a max position value (max_position_pct of cash).
+        ``vol_multiplier`` scales the risk budget (not the cash cap), so
+        high-vol strategies shrink without breaking max-position-pct.
         Returns 0 when sizing is impossible.
         """
         if entry_price <= 0 or available_cash <= 0:
@@ -185,7 +199,9 @@ class StrategyBase(ABC):
         if risk_per_share <= 0:
             return 0.0
 
-        risk_dollars: float = available_cash * risk_per_trade_pct
+        risk_dollars: float = (
+            available_cash * risk_per_trade_pct * max(vol_multiplier, 0.0)
+        )
         shares_by_risk: float = risk_dollars / risk_per_share
         shares_by_cash: float = (available_cash * max_position_pct) / entry_price
 
@@ -193,3 +209,48 @@ class StrategyBase(ABC):
         if fractional:
             return round(shares, 4)
         return float(int(shares))
+
+    def vol_multiplier(self) -> float:
+        """Live vol-target multiplier from this strategy's recent DB trades.
+
+        Returns ``1.0`` (no adjustment) when:
+          - db_path was not supplied (e.g. backtester),
+          - the vol_target config is missing or annual_vol_pct ≤ 0,
+          - or the trades table doesn't yet have ``min_sample`` rows for
+            this strategy.
+
+        Caller-side: pass the result as ``vol_multiplier=`` to
+        :meth:`size_by_risk`. The result is cheap (one indexed query +
+        a stdev), but still cache per tick if you call from a hot loop.
+        """
+        if not self._db_path:
+            return 1.0
+        target_annual: float = float(
+            self._vol_target_config.get("annual_vol_pct", 0.0)
+        )
+        if target_annual <= 0:
+            return 1.0
+
+        from trading_bot.execution.vol_target import (
+            load_recent_trade_returns,
+            vol_target_multiplier,
+        )
+
+        lookback: int = int(self._vol_target_config.get("lookback_trades", 30))
+        recent: list[float] = load_recent_trade_returns(
+            self._db_path, self.strategy_id, lookback=lookback,
+        )
+        result = vol_target_multiplier(
+            recent,
+            target_annual_vol=target_annual,
+            expected_trades_per_year=int(
+                self._vol_target_config.get("trades_per_year", 252)
+            ),
+            min_multiplier=float(
+                self._vol_target_config.get("min_multiplier", 0.5)
+            ),
+            max_multiplier=float(
+                self._vol_target_config.get("max_multiplier", 1.5)
+            ),
+        )
+        return result.multiplier

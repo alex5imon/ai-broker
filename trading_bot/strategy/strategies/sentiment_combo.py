@@ -17,11 +17,12 @@ logger: logging.Logger = logging.getLogger(__name__)
 class SentimentComboStrategy(StrategyBase):
     """Enter when Finnhub sentiment is positive AND at least one technical signal fires."""
 
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(self, config: dict[str, Any], **kwargs: Any) -> None:
         super().__init__(
             strategy_id="sentiment_combo",
             display_name="Sentiment Combo",
             config=config,
+            **kwargs,
         )
         self._sentiment_threshold: float = float(config.get("sentiment_threshold", 0.15))
         self._min_technical_signals: int = int(config.get("min_technical_signals", 1))

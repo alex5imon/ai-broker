@@ -32,11 +32,12 @@ logger: logging.Logger = logging.getLogger(__name__)
 class OvernightDriftStrategy(StrategyBase):
     """Buy at close, sell at next open — capture the overnight risk premium."""
 
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(self, config: dict[str, Any], **kwargs: Any) -> None:
         super().__init__(
             strategy_id="overnight_drift",
             display_name="Overnight Drift",
             config=config,
+            **kwargs,
         )
         self._max_positions: int = int(config.get("max_positions", 1))
         # Entry window — last bar of the session. Default 15:45-15:55 ET
