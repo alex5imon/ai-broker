@@ -40,6 +40,7 @@ from trading_bot.data.market_data import MarketDataManager
 from trading_bot.data.sentiment import SentimentAnalyzer
 from trading_bot.db import repository as repo
 from trading_bot.db.migrations import run_migrations
+from trading_bot.execution.loss_cooldown import LossCooldownConfig, LossCooldownTracker
 from trading_bot.execution.order_manager import EntryDecision as OMEntryDecision
 from trading_bot.execution.order_manager import OrderManager
 from trading_bot.execution.risk_manager import RiskManager
@@ -166,6 +167,15 @@ class TradingBot:
                     enabled=True,
                     cache_ttl_minutes=int(regime_cfg.get("cache_ttl_minutes", 30)),
                 )
+            loss_cd_cfg: dict[str, Any] = config.get_loss_cooldown_config()
+            loss_cooldown: LossCooldownTracker = LossCooldownTracker(
+                db_path=db_path,
+                config=LossCooldownConfig(
+                    enabled=bool(loss_cd_cfg.get("enabled", False)),
+                    threshold_losses=int(loss_cd_cfg.get("threshold_losses", 3)),
+                    cooldown_minutes=int(loss_cd_cfg.get("cooldown_minutes", 240)),
+                ),
+            )
             self._strategy_manager = StrategyManager(
                 strategies=strategies,
                 portfolio_manager=portfolio_mgr,
@@ -178,6 +188,7 @@ class TradingBot:
                 db_path=db_path,
                 dry_run=dry_run,
                 regime_filter=regime_filter,
+                loss_cooldown=loss_cooldown,
             )
             logger.info(
                 "Multi-strategy enabled: %d strategies, $%.0f total",

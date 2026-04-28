@@ -135,6 +135,51 @@ watchlist:
     - "META"    # Meta Platforms
 
 # -----------------------------------------------------------------------------
+# Per-Symbol Allocation Caps
+# -----------------------------------------------------------------------------
+# Cap on how much of the multi-strategy book a single ticker may consume
+# (across ALL strategies, summed at entry-price). Prevents one runaway
+# position from dominating a 2-position phase-1 book even when each
+# individual strategy says "size up". Expressed as a fraction in (0, 1].
+# Set default_max_allocation_pct to 1.0 to disable globally.
+watchlist_caps:
+  default_max_allocation_pct: 0.50    # 50% — no ticker > half the book
+  per_symbol:
+    SPY: 0.60                         # primary signal source — slightly looser
+    QQQ: 0.50
+    XLK: 0.35
+    XLF: 0.35
+    XLV: 0.35
+    XLE: 0.30
+    XLY: 0.30
+    XLP: 0.30
+    XLI: 0.30
+    XLB: 0.25
+    XLU: 0.25
+    XLRE: 0.25
+    XLC: 0.30
+
+# -----------------------------------------------------------------------------
+# Macro-Event Gating (FOMC days)
+# -----------------------------------------------------------------------------
+# Reduces or skips new entries on Fed announcement days. The bot keeps
+# managing existing positions normally — only NEW entries are gated.
+# Update fomc_dates_<year> annually from federalreserve.gov.
+event_gate:
+  enabled: true
+  fomc_action: "reduce"               # "skip" (no entries) or "reduce" (scale risk)
+  fomc_size_multiplier: 0.50          # used only when fomc_action == "reduce"
+  fomc_dates_2026:
+    - "2026-01-28"
+    - "2026-03-18"
+    - "2026-05-06"
+    - "2026-06-17"
+    - "2026-07-29"
+    - "2026-09-16"
+    - "2026-11-04"
+    - "2026-12-16"
+
+# -----------------------------------------------------------------------------
 # Watchlist Quality Criteria
 # -----------------------------------------------------------------------------
 watchlist_criteria:
@@ -207,6 +252,14 @@ risk:
     pause_days: 1
     recovery_position_size_pct: 0.50  # 50% size for first 3 trades after breaker
     recovery_trades: 3
+  # Per-strategy cooldown after N consecutive losing trades. A profitable
+  # exit resets the streak immediately. Pauses ONLY the offending strategy
+  # (other sleeves keep trading). Tuning notes: 3 / 240 ≈ "sit out half
+  # a session after a 3-loss skid". Set enabled=false to disable.
+  consecutive_loss_cooldown:
+    enabled: true
+    threshold_losses: 3
+    cooldown_minutes: 240
   correlation_threshold: 0.85
   order_rejections:
     max_count: 3
@@ -256,6 +309,10 @@ entry:
   spread_wait_seconds: 120        # Wait up to 2 min for spread to narrow
   spread_recheck_seconds: 15      # Recheck spread every 15 sec
   entry_timeout_seconds: 300      # Cancel unfilled entry after 5 min
+  # Maximum slop above ask (buys) or below bid (sells) for entry limit
+  # orders. Prevents thin-spread / pre-market chasing where a strategy's
+  # current_price reference may already sit at ask. 0.002 = 0.2%.
+  limit_slop_pct: 0.002
   partial_fill_min_pct: 0.50      # Accept partial fill >= 50%
   cooldown_minutes: 30            # Cooldown after exiting a ticker
   earnings_blackout_hours: 48     # Hours before/after earnings to skip
@@ -493,16 +550,16 @@ multi_strategy:
     # they produce comparable backtest evidence.
     mean_reversion:
       enabled: true
-      # 750 -> 2500 after 2026-04-28 evening walkforward:
-      # On 13-ETF SPDR sector universe (2020-07-27 to 2026-04-16,
-      # 6 yearly windows, no regime filter):
+      # 1375 -> 2500 after 2026-04-28 evening walkforward (post PR #11).
+      # Re-running the harness on the 13-ETF SPDR sector universe
+      # (2020-07-27 to 2026-04-16, 6 yearly windows, no regime filter)
+      # showed:
       #   482 trades, WR 52.7%, PF 1.201, OOS Return +47.2%
       #   PF 95% CI [1.006, 1.428] — lower bound > 1.0, statistically
       #   significant. Sharpe lower bound also positive (0.003).
-      # This is the only strategy with a stable edge across both the
-      # 2008-2021 SPY-only and 2020-2026 13-ETF regimes. Scale up
-      # accordingly. Capital comes from the disabled breakout and
-      # trend_following sleeves (PF 0.29 and 0.57 in current regime).
+      # Mean reversion is the only strategy with a stable edge across
+      # both the 2008-2021 SPY-only and 2020-2026 13-ETF regimes.
+      # Capital absorbs the now-disabled breakout sleeve (see below).
       allocation_usd: 2500.0
       max_positions: 3          # hold up to 3 concurrent diversified ETF positions
       rsi_period: 14
@@ -557,13 +614,15 @@ multi_strategy:
       bb_lookback_bars: 3
 
     trend_following:
-      # DISABLED 2026-04-28 evening walkforward.
-      # On 13-ETF universe 2020-07-27 to 2026-04-16:
+      # DISABLED 2026-04-28 (kept disabled after evening walkforward).
+      # First disabled in PR #11 after SPY 13yr walkforward CI dropped:
+      #   pre-gate: PF 1.637 CI [1.00, 2.58] — borderline
+      #   post-gate: PF 1.034 CI [0.476, 2.555] — not significant
+      # Confirmed in 13-ETF 2020-2026 walkforward:
       #   89 trades, WR 29.2%, PF 0.565, OOS Return -15.3%
-      # PR #9's bullish read (PF 1.637 CI [1.00, 2.58]) was on
-      # SPY-only 2008-2021. Recent regime is hostile — strong moves
-      # break out and keep going past the trail-stop, or fake out
-      # immediately. Disable until retuned for current era.
+      # Recent regime is hostile — strong moves break out and keep going
+      # past the trail-stop, or fake out immediately. Disable until
+      # retuned for the current era.
       enabled: false
       allocation_usd: 0.0
       max_positions: 1
@@ -573,17 +632,25 @@ multi_strategy:
       volume_multiplier: 1.5
       trailing_stop_pct: 0.025
       initial_stop_pct: 0.03
+      # ATR-anchored stop + trailing distance. Volatility-adaptive exits:
+      # tight in calm tape, wider in violent tape. Falls back to the fixed
+      # percentages above if ATR can't be computed.
+      use_atr_stops: true
+      atr_period: 14
+      atr_stop_mult: 1.5
+      atr_trail_mult: 2.0
 
     breakout:
-      # DISABLED 2026-04-28 evening walkforward.
-      # On 13-ETF universe 2020-07-27 to 2026-04-16:
+      # DISABLED 2026-04-28 evening walkforward (was $2625 enabled in PR #11).
+      # The PR #11 read used a SPY-only 13yr walkforward. Re-running on
+      # 13-ETF 2020-2026 (the regime the live bot actually trades) showed:
       #   26 trades, WR 11.5%, PF 0.292, OOS Return -17.0%
-      # The PF 2.385 finding from PR #9 was on SPY-only 2008-2021.
-      # In the current regime, breakouts on the 4-13 ETF universe
-      # fake out hard — the 11.5% win rate is well below the breakout
-      # archetype's natural ~40-50%. Disable until retuned for the
-      # current era (or until adding a regime filter that confines
-      # entries to genuine momentum thrusts).
+      # Win rate 11.5% is well below the breakout archetype's natural
+      # ~40-50% — breakouts on this universe in this regime fake out
+      # hard. Disable until retuned for the current era (e.g. tighter
+      # Donchian period, volume confirmation, time-of-day filter).
+      # The freed $2625 goes to mean_reversion (+$1125) and overnight_drift
+      # (+$1500 with max_pos bumped 1->3 — see below).
       enabled: false
       allocation_usd: 0.0
       max_positions: 1
@@ -591,6 +658,11 @@ multi_strategy:
       exit_period: 10
       volume_multiplier: 1.5
       stop_loss_pct: 0.03
+      # ATR-anchored stop. Donchian exits handle the upside; the stop just
+      # needs to scale with regime vol to avoid getting tagged in noise.
+      use_atr_stops: true
+      atr_period: 14
+      atr_stop_mult: 1.5
 
     # Sentiment Combo DISABLED 2026-04-24 (objective reframe).
     # Two tuning iterations exhausted the parameter search:
