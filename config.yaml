@@ -156,6 +156,24 @@ watchlist_criteria:
 # -----------------------------------------------------------------------------
 risk:
   daily_loss_limit_pct: 0.01      # -1% of account equity
+  # Vol-targeted sizing (per pysystemtrade). When `annual_vol_pct` > 0,
+  # each strategy's risk-per-trade is scaled by the ratio of target
+  # per-trade vol to its trailing realized per-trade vol. Strategies with
+  # high realized vol shrink, low-vol strategies stretch toward the target.
+  # Set annual_vol_pct=0 to disable (no behaviour change).
+  vol_target:
+    annual_vol_pct: 0.0           # e.g. 0.20 = 20% annualized vol target
+    lookback_trades: 30
+    trades_per_year: 252
+    min_multiplier: 0.5
+    max_multiplier: 1.5
+  # Optional realized-vol AND-gate on top of the SMA50 regime filter.
+  # When > 0, the backtester treats a day as bullish only if SPY > SMA50
+  # AND realized vol is below the threshold (annualized). Catches the
+  # 2008 / 2018-Q4 crashes the SMA gate alone misses.
+  regime:
+    high_vol_threshold_pct: 0.0   # e.g. 0.35 = block when 20d realized > 35%
+    vol_lookback_days: 20
   max_daily_trades:
     phase1: 10
     phase2: 25
