@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import statistics
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, time
@@ -37,6 +38,7 @@ from trading_bot.constants import (
     TZ_EASTERN,
 )
 from trading_bot.data_cache import load_cached
+from trading_bot.execution.vol_target import vol_target_multiplier
 from trading_bot.strategy.base import ExitSignal, StrategyBase
 from trading_bot.strategy.strategies import create_strategies
 
@@ -164,6 +166,67 @@ class MultiStrategyBacktester:
             "Loaded %d strategies: %s",
             len(self._strategies),
             [s.strategy_id for s in self._strategies],
+        )
+        # Vol-target settings live under risk.vol_target in config; if
+        # absent, the multiplier collapses to 1.0 (legacy behaviour).
+        risk_cfg: dict[str, Any] = self._config._raw.get("risk", {}) or {}
+        vt_cfg: dict[str, Any] = risk_cfg.get("vol_target", {}) or {}
+        self._vol_target_annual: float = float(
+            vt_cfg.get("annual_vol_pct", 0.0)  # 0 disables
+        )
+        self._vol_target_min_mult: float = float(vt_cfg.get("min_multiplier", 0.5))
+        self._vol_target_max_mult: float = float(vt_cfg.get("max_multiplier", 1.5))
+        self._vol_target_lookback: int = int(vt_cfg.get("lookback_trades", 30))
+        self._vol_target_trades_per_year: int = int(
+            vt_cfg.get("trades_per_year", 252)
+        )
+        if self._vol_target_annual > 0:
+            logger.info(
+                "Vol target enabled: annual=%.1f%%, lookback=%d trades, "
+                "mult bounds [%.2f, %.2f]",
+                self._vol_target_annual * 100,
+                self._vol_target_lookback,
+                self._vol_target_min_mult,
+                self._vol_target_max_mult,
+            )
+        # Regime: optional realized-vol gate on top of the existing
+        # SMA50-trend gate. When set, regime_bullish requires *both*
+        # close > SMA50 *and* realized vol below the threshold. This
+        # catches the 2008/2018-Q4-style crashes that the SMA gate
+        # alone misses.
+        regime_cfg: dict[str, Any] = risk_cfg.get("regime", {}) or {}
+        self._regime_high_vol_threshold: float = float(
+            regime_cfg.get("high_vol_threshold_pct", 0.0)
+        )  # 0 disables
+        self._regime_vol_lookback: int = int(
+            regime_cfg.get("vol_lookback_days", 20)
+        )
+        if self._regime_high_vol_threshold > 0:
+            logger.info(
+                "Regime high-vol gate enabled: threshold=%.1f%% (annualized), "
+                "lookback=%d days",
+                self._regime_high_vol_threshold * 100,
+                self._regime_vol_lookback,
+            )
+
+    def _compute_vol_multiplier(self, st: "_StrategyState") -> Any:
+        """Per-strategy vol-target multiplier from recent closed trades.
+
+        Returns a ``VolTargetResult`` whose ``multiplier`` is 1.0 when the
+        feature is disabled or insufficient samples exist.
+        """
+        recent: list[float] = []
+        for trade in st.closed_trades[-self._vol_target_lookback:]:
+            cost: float = trade.entry_price * float(trade.shares)
+            if cost <= 0:
+                continue
+            recent.append(trade.net_pnl_usd / cost)
+        return vol_target_multiplier(
+            recent,
+            target_annual_vol=self._vol_target_annual,
+            expected_trades_per_year=self._vol_target_trades_per_year,
+            min_multiplier=self._vol_target_min_mult,
+            max_multiplier=self._vol_target_max_mult,
         )
 
     def _get_tickers(self) -> list[str]:
@@ -298,14 +361,19 @@ class MultiStrategyBacktester:
         risk_per_trade_pct: float = 0.02,
         max_position_pct: float = 0.40,
         fractional: bool = True,
+        vol_multiplier: float = 1.0,
     ) -> float:
         """Size a position so the max loss equals a fixed % of capital.
 
         With ``fractional=True`` returns fractional share count (Alpaca supports
         fractional shares down to 1/1000000). With ``fractional=False`` returns
         an integer count.
+
+        ``vol_multiplier`` scales the risk budget (not the cash cap), so a
+        strategy whose realized vol is high gets fewer shares but never
+        breaks the max-position-pct ceiling.
         """
-        risk_dollars = available_cash * risk_per_trade_pct
+        risk_dollars = available_cash * risk_per_trade_pct * max(vol_multiplier, 0.0)
         risk_per_share = abs(entry_price - stop_price)
         if risk_per_share <= 0 or entry_price <= 0:
             return 0.0
@@ -804,15 +872,34 @@ class MultiStrategyBacktester:
                     all_dates.add(d)
         trading_days: list[date] = sorted(all_dates)
 
-        # Market regime filter: synthetic equal-weight index vs 50-day SMA
+        # Market regime filter: synthetic equal-weight index vs 50-day SMA,
+        # optionally AND-gated on realized vol.
         market_index: pd.DataFrame = pd.DataFrame()
         if regime_filter:
             market_index = self._build_market_index(universe, sma_period=50)
+            if (
+                not market_index.empty
+                and self._regime_high_vol_threshold > 0
+            ):
+                ret = market_index["close"].pct_change()
+                realized = (
+                    ret.rolling(self._regime_vol_lookback,
+                                min_periods=self._regime_vol_lookback).std()
+                    * math.sqrt(252)
+                )
+                market_index["realized_vol"] = realized
+                vol_gate = realized < self._regime_high_vol_threshold
+                market_index["regime_bullish"] = (
+                    market_index["regime_bullish"] & vol_gate.fillna(True)
+                )
             bullish_days = int(market_index["regime_bullish"].sum()) if not market_index.empty else 0
             total_idx_days = len(market_index.dropna(subset=["sma"]))
             logger.info(
-                "Market regime filter: %d/%d days bullish (index > 50-day SMA)",
+                "Market regime filter: %d/%d days bullish (index > 50-day SMA, "
+                "vol_threshold=%s)",
                 bullish_days, total_idx_days,
+                f"{self._regime_high_vol_threshold * 100:.1f}%"
+                if self._regime_high_vol_threshold > 0 else "off",
             )
 
         logger.info(
@@ -943,11 +1030,13 @@ class MultiStrategyBacktester:
                         equity = st.cash_usd + sum(
                             t.entry_price * t.shares for t in st.open_positions
                         )
+                        vt = self._compute_vol_multiplier(st)
                         shares = self._size_by_risk(
                             fill_price, atr_stop, equity,
                             risk_per_trade_pct=0.02,
                             max_position_pct=0.40,
                             fractional=False,
+                            vol_multiplier=vt.multiplier,
                         )
                         if shares < 1:
                             continue
@@ -1105,9 +1194,23 @@ class MultiStrategyBacktester:
             "volume": "sum",
         }).dropna(subset=["close"])
 
-        # Market regime: SPY close > 50-day SMA
+        # Market regime: SPY close > 50-day SMA, optionally AND-gated on
+        # realized vol (annualized stdev of daily returns) being below a
+        # configured threshold.
         df_daily["sma50"] = df_daily["close"].rolling(50, min_periods=50).mean()
-        df_daily["regime_bullish"] = df_daily["close"] > df_daily["sma50"]
+        sma_gate: pd.Series = df_daily["close"] > df_daily["sma50"]
+        if self._regime_high_vol_threshold > 0:
+            daily_ret: pd.Series = df_daily["close"].pct_change()
+            realized_ann_vol: pd.Series = (
+                daily_ret.rolling(self._regime_vol_lookback,
+                                  min_periods=self._regime_vol_lookback).std()
+                * math.sqrt(252)
+            )
+            df_daily["realized_vol"] = realized_ann_vol
+            vol_gate: pd.Series = realized_ann_vol < self._regime_high_vol_threshold
+            df_daily["regime_bullish"] = sma_gate & vol_gate.fillna(True)
+        else:
+            df_daily["regime_bullish"] = sma_gate
 
         logger.info(
             "SPY intraday backtest: %d strategies x %d 5-min bars x %d days (regime=%s)",
@@ -1259,11 +1362,13 @@ class MultiStrategyBacktester:
                     equity = st.cash_usd + sum(
                         t.entry_price * t.shares for t in st.open_positions
                     )
+                    vt = self._compute_vol_multiplier(st)
                     shares = self._size_by_risk(
                         fill_price, atr_stop, equity,
                         risk_per_trade_pct=0.03,
                         max_position_pct=0.90,
                         fractional=True,
+                        vol_multiplier=vt.multiplier,
                     )
                     if shares <= 0.001:
                         continue
@@ -1399,13 +1504,28 @@ class MultiStrategyBacktester:
             )
             df = per_ticker_daily[regime_ticker].copy()
             df["sma50"] = df["close"].rolling(sma_p, min_periods=sma_p).mean()
-            df["regime_bullish"] = df["close"] > df["sma50"]
+            sma_gate = df["close"] > df["sma50"]
+            if self._regime_high_vol_threshold > 0:
+                ret = df["close"].pct_change()
+                realized = (
+                    ret.rolling(self._regime_vol_lookback,
+                                min_periods=self._regime_vol_lookback).std()
+                    * math.sqrt(252)
+                )
+                df["realized_vol"] = realized
+                vol_gate = realized < self._regime_high_vol_threshold
+                df["regime_bullish"] = sma_gate & vol_gate.fillna(True)
+            else:
+                df["regime_bullish"] = sma_gate
             market_regime = df
             bullish_days = int(df["regime_bullish"].fillna(False).sum())
             total_rated = int(df["sma50"].notna().sum())
             logger.info(
-                "Regime filter calibrated on %s: %d/%d days bullish (close > %d-day SMA)",
+                "Regime filter calibrated on %s: %d/%d days bullish (close > %d-day SMA, "
+                "vol_threshold=%s)",
                 regime_ticker, bullish_days, total_rated, sma_p,
+                f"{self._regime_high_vol_threshold * 100:.1f}%"
+                if self._regime_high_vol_threshold > 0 else "off",
             )
 
         states: dict[str, _StrategyState] = {}
@@ -1555,11 +1675,13 @@ class MultiStrategyBacktester:
                     equity = st.cash_usd + sum(
                         t.entry_price * t.shares for t in st.open_positions
                     )
+                    vt = self._compute_vol_multiplier(st)
                     shares = self._size_by_risk(
                         fill_price, atr_stop, equity,
                         risk_per_trade_pct=0.02,
                         max_position_pct=0.40,
                         fractional=True,
+                        vol_multiplier=vt.multiplier,
                     )
                     if shares <= 0.001:
                         continue

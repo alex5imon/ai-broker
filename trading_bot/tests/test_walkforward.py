@@ -249,6 +249,50 @@ class TestRunWalkforward:
         assert len(result.windows) == 1
 
     @pytest.mark.asyncio
+    async def test_portfolio_aggregate_when_multi_strategy(self) -> None:
+        """Multi-strategy run produces a synthetic _portfolio entry."""
+        d_from = date(2026, 1, 1)
+        d_to = date(2026, 6, 30)
+
+        def _make_multi(d1: date, d2: date) -> MultiStrategyResult:
+            r = _multi_result(d1, d2, return_pct=2.0,
+                              trades_pnl=[8, -3, 6, -2, 5])
+            r2 = _multi_result(d1, d2, return_pct=4.0,
+                               trades_pnl=[12, -4, 10, -3, 8])
+            r2.strategies[0].strategy_id = "breakout"
+            r2.strategies[0].display_name = "Breakout"
+            for t in r2.strategies[0].trades:
+                t.strategy_id = "breakout"
+            r.strategies.append(r2.strategies[0])
+            return r
+
+        async def runner(d1: date, d2: date) -> MultiStrategyResult:
+            return _make_multi(d1, d2)
+
+        cfg = WalkforwardConfig(window_days=90, step_days=90, bootstrap_samples=200)
+        result = await run_walkforward(d_from, d_to, runner, config=cfg)
+
+        assert "_portfolio" in result.aggregate
+        # 2 windows × 2 strategies × 5 trades = 20 pooled trades.
+        assert result.aggregate["_portfolio"]["trades"] == 20
+        # Portfolio has its own bootstrap CIs.
+        assert "_portfolio" in result.bootstrap
+        assert "profit_factor" in result.bootstrap["_portfolio"]
+
+    @pytest.mark.asyncio
+    async def test_no_portfolio_for_single_strategy(self) -> None:
+        d_from = date(2026, 1, 1)
+        d_to = date(2026, 6, 30)
+
+        async def runner(d1: date, d2: date) -> MultiStrategyResult:
+            return _multi_result(d1, d2, return_pct=2.0,
+                                 trades_pnl=[8, -3, 6, -2, 5])
+
+        cfg = WalkforwardConfig(window_days=90, step_days=90, bootstrap_samples=200)
+        result = await run_walkforward(d_from, d_to, runner, config=cfg)
+        assert "_portfolio" not in result.aggregate
+
+    @pytest.mark.asyncio
     async def test_invalid_window_days_raises(self) -> None:
         async def runner(d1: date, d2: date) -> MultiStrategyResult:
             return _multi_result(d1, d2, return_pct=0.0, trades_pnl=[])

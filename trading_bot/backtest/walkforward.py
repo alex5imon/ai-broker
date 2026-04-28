@@ -331,13 +331,25 @@ def metric_sharpe_approx(returns: Sequence[float]) -> float:
 # ---------------------------------------------------------------------------
 
 
+PORTFOLIO_KEY: str = "_portfolio"
+
+
 def _aggregate(out: WalkforwardResult, cfg: WalkforwardConfig) -> None:
     # Index per-strategy trades and per-window stats.
     by_strategy: dict[str, list[StrategyTrade]] = {}
     by_strategy_returns: dict[str, list[float]] = {}
     display_name: dict[str, str] = {}
 
+    # Per-window portfolio aggregation (used for compounded return on the
+    # synthetic equal-weighted sleeve).
+    portfolio_window_returns: dict[int, list[float]] = {}
+
     for window in out.windows:
+        # Per-window: build an equal-weighted "portfolio" return as the
+        # mean of each strategy's return_pct in that window. Empty windows
+        # contribute 0 so the geometric compound stays consistent.
+        per_strat_window_returns: list[float] = []
+
         for sr in window.result.strategies:
             sid: str = sr.strategy_id
             display_name.setdefault(sid, sr.display_name)
@@ -358,6 +370,54 @@ def _aggregate(out: WalkforwardResult, cfg: WalkforwardConfig) -> None:
                 max_drawdown_pct=sr.max_drawdown_pct,
             )
             out.per_window.setdefault(sid, []).append(stats)
+            per_strat_window_returns.append(sr.return_pct)
+
+        portfolio_window_returns[window.window_idx] = per_strat_window_returns
+
+    # Build the synthetic portfolio "strategy" — pooled per-trade returns
+    # across all real strategies. CIs on this distribution answer the
+    # "does the *combined* sleeve clear PF > 1 at 95%?" question.
+    if len(by_strategy_returns) >= 2:
+        pooled_returns: list[float] = []
+        pooled_trades: list[StrategyTrade] = []
+        for sid, rets in by_strategy_returns.items():
+            pooled_returns.extend(rets)
+            pooled_trades.extend(by_strategy[sid])
+
+        by_strategy[PORTFOLIO_KEY] = pooled_trades
+        by_strategy_returns[PORTFOLIO_KEY] = pooled_returns
+        display_name[PORTFOLIO_KEY] = "Portfolio (equal-weight pooled)"
+
+        # Per-window portfolio stats: mean of per-strategy window returns.
+        for window in out.windows:
+            per_strat = portfolio_window_returns.get(window.window_idx, [])
+            mean_ret: float = (
+                statistics.fmean(per_strat) if per_strat else 0.0
+            )
+            window_window_trades: int = sum(
+                sr.total_trades for sr in window.result.strategies
+            )
+            out.per_window.setdefault(PORTFOLIO_KEY, []).append(
+                StrategyWindowStats(
+                    window_idx=window.window_idx,
+                    from_date=window.from_date.isoformat(),
+                    to_date=window.to_date.isoformat(),
+                    trades=window_window_trades,
+                    return_pct=mean_ret,
+                    win_rate=metric_win_rate(
+                        [r for sr in window.result.strategies
+                         for r in _trade_returns(sr)]
+                    ) * 100.0,
+                    profit_factor=metric_profit_factor(
+                        [r for sr in window.result.strategies
+                         for r in _trade_returns(sr)]
+                    ) or None,
+                    max_drawdown_pct=max(
+                        (sr.max_drawdown_pct for sr in window.result.strategies),
+                        default=0.0,
+                    ),
+                )
+            )
 
     # Aggregate metrics across all OOS trades.
     for sid, trades in by_strategy.items():

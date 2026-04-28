@@ -156,6 +156,24 @@ watchlist_criteria:
 # -----------------------------------------------------------------------------
 risk:
   daily_loss_limit_pct: 0.01      # -1% of account equity
+  # Vol-targeted sizing (per pysystemtrade). When `annual_vol_pct` > 0,
+  # each strategy's risk-per-trade is scaled by the ratio of target
+  # per-trade vol to its trailing realized per-trade vol. Strategies with
+  # high realized vol shrink, low-vol strategies stretch toward the target.
+  # Set annual_vol_pct=0 to disable (no behaviour change).
+  vol_target:
+    annual_vol_pct: 0.0           # e.g. 0.20 = 20% annualized vol target
+    lookback_trades: 30
+    trades_per_year: 252
+    min_multiplier: 0.5
+    max_multiplier: 1.5
+  # Optional realized-vol AND-gate on top of the SMA50 regime filter.
+  # When > 0, the backtester treats a day as bullish only if SPY > SMA50
+  # AND realized vol is below the threshold (annualized). Catches the
+  # 2008 / 2018-Q4 crashes the SMA gate alone misses.
+  regime:
+    high_vol_threshold_pct: 0.0   # e.g. 0.35 = block when 20d realized > 35%
+    vol_lookback_days: 20
   max_daily_trades:
     phase1: 10
     phase2: 25
@@ -268,6 +286,9 @@ exit_intraday:
   trailing_distance_pct: 0.01     # Trail at -1% from high
   time_stop_hours: 4              # Re-evaluate after 4 hours
   time_stop_flat_threshold: 0.005 # +/- 0.5% considered "flat"
+  # Recovery / safety nets (consumed by gateway/recovery.py on every tick).
+  stale_entry_order_minutes: 5    # Cancel non-stop entry orders older than N min
+  eod_flatten_time_et: "15:55"    # ET cutoff: flatten intraday-tagged positions
 
 # -----------------------------------------------------------------------------
 # Exit Parameters - Swing
@@ -472,10 +493,12 @@ multi_strategy:
     # they produce comparable backtest evidence.
     mean_reversion:
       enabled: true
-      # Bumped 1000 -> 1500 after 2026-04-24 objective reframe:
-      # absorbed half of the disabled sentiment_combo allocation.
-      # Top PF strategy (1.63) with the added BB confirmation.
-      allocation_usd: 1500.0
+      # 1500 -> 750 after 2026-04-28 walkforward:
+      # 14-window OOS PF 1.235 with 95% CI [0.92, 1.71] — lower bound
+      # below 1.0, not statistically significant. Reallocated half its
+      # capital to breakout (the only significant edge) and a slice to
+      # trend_following.
+      allocation_usd: 750.0
       max_positions: 3          # hold up to 3 concurrent diversified ETF positions
       rsi_period: 14
       rsi_oversold: 28
@@ -530,7 +553,11 @@ multi_strategy:
 
     trend_following:
       enabled: true
-      allocation_usd: 1000.0
+      # 1000 -> 1250 after 2026-04-28 walkforward:
+      # OOS PF 1.637 with 95% CI [1.00, 2.58] — borderline significant
+      # (lower bound just touches 1.0). Modest bump from mean_reversion
+      # rebalance.
+      allocation_usd: 1250.0
       max_positions: 1
       sma_period: 50
       ema_fast: 9
@@ -541,10 +568,13 @@ multi_strategy:
 
     breakout:
       enabled: true
-      # Bumped 1000 -> 1500 after 2026-04-24 objective reframe:
-      # absorbed half of the disabled sentiment_combo allocation.
-      # Highest PF strategy (2.94) in the 13-year SPY backtest.
-      allocation_usd: 1500.0
+      # 1500 -> 2000 after 2026-04-28 walkforward:
+      # 14-window OOS PF 2.385 with 95% CI [1.30, 4.70] — the only
+      # strategy with lower CI bound > 1.0, i.e. statistically
+      # significant profitability. Trade count is small (44 over 13yr)
+      # so there's room to grow this allocation as live evidence
+      # accumulates. Capital absorbed from mean_reversion rebalance.
+      allocation_usd: 2000.0
       max_positions: 1
       breakout_period: 20
       exit_period: 10
