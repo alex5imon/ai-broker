@@ -550,11 +550,17 @@ multi_strategy:
     # they produce comparable backtest evidence.
     mean_reversion:
       enabled: true
-      # 750 -> 1375 after 2026-04-28 trend_following disable.
-      # Absorbing half of the freed $1250 (other half to breakout). Latest
-      # 57-window walkforward: OOS PF 1.498 CI [0.652, 4.006] — point up
-      # from 1.235 with the new ATR + gate stack, OOS return +7.52%.
-      allocation_usd: 1375.0
+      # 1375 -> 2500 after 2026-04-28 evening walkforward (post PR #11).
+      # Re-running the harness on the 13-ETF SPDR sector universe
+      # (2020-07-27 to 2026-04-16, 6 yearly windows, no regime filter)
+      # showed:
+      #   482 trades, WR 52.7%, PF 1.201, OOS Return +47.2%
+      #   PF 95% CI [1.006, 1.428] — lower bound > 1.0, statistically
+      #   significant. Sharpe lower bound also positive (0.003).
+      # Mean reversion is the only strategy with a stable edge across
+      # both the 2008-2021 SPY-only and 2020-2026 13-ETF regimes.
+      # Capital absorbs the now-disabled breakout sleeve (see below).
+      allocation_usd: 2500.0
       max_positions: 3          # hold up to 3 concurrent diversified ETF positions
       rsi_period: 14
       rsi_oversold: 28
@@ -608,14 +614,15 @@ multi_strategy:
       bb_lookback_bars: 3
 
     trend_following:
-      # DISABLED 2026-04-28 (second walkforward review).
-      # Two consecutive walkforward runs put the OOS PF lower-CI below 1.0:
-      #   pre-gate (memorized): PF 1.637 CI [1.00, 2.58] — borderline
-      #   post-gate (current):  PF 1.034 CI [0.476, 2.555] — not significant
-      # OOS return collapsed from +5.6% to +0.33% over 13yr. Allocation
-      # redistributed to mean_reversion (+$625) and breakout (+$625), the
-      # two sleeves still showing positive OOS evidence. Left in config
-      # for future re-enable if the strategy logic is overhauled.
+      # DISABLED 2026-04-28 (kept disabled after evening walkforward).
+      # First disabled in PR #11 after SPY 13yr walkforward CI dropped:
+      #   pre-gate: PF 1.637 CI [1.00, 2.58] — borderline
+      #   post-gate: PF 1.034 CI [0.476, 2.555] — not significant
+      # Confirmed in 13-ETF 2020-2026 walkforward:
+      #   89 trades, WR 29.2%, PF 0.565, OOS Return -15.3%
+      # Recent regime is hostile — strong moves break out and keep going
+      # past the trail-stop, or fake out immediately. Disable until
+      # retuned for the current era.
       enabled: false
       allocation_usd: 0.0
       max_positions: 1
@@ -634,13 +641,18 @@ multi_strategy:
       atr_trail_mult: 2.0
 
     breakout:
-      enabled: true
-      # 2000 -> 2625 after 2026-04-28 trend_following disable.
-      # Absorbing the other half of the freed $1250. Latest 57-window
-      # walkforward: OOS PF 1.637 CI [0.735, 4.657], OOS return +10.05%
-      # (best per-strategy OOS return). Simple 13yr backtest also gives
-      # PF 2.72 — strongest sleeve in the stack.
-      allocation_usd: 2625.0
+      # DISABLED 2026-04-28 evening walkforward (was $2625 enabled in PR #11).
+      # The PR #11 read used a SPY-only 13yr walkforward. Re-running on
+      # 13-ETF 2020-2026 (the regime the live bot actually trades) showed:
+      #   26 trades, WR 11.5%, PF 0.292, OOS Return -17.0%
+      # Win rate 11.5% is well below the breakout archetype's natural
+      # ~40-50% — breakouts on this universe in this regime fake out
+      # hard. Disable until retuned for the current era (e.g. tighter
+      # Donchian period, volume confirmation, time-of-day filter).
+      # The freed $2625 goes to mean_reversion (+$1125) and overnight_drift
+      # (+$1500 with max_pos bumped 1->3 — see below).
+      enabled: false
+      allocation_usd: 0.0
       max_positions: 1
       breakout_period: 20
       exit_period: 10
@@ -676,8 +688,17 @@ multi_strategy:
     # premium. 3% disaster stop caps gap-down tail risk.
     overnight_drift:
       enabled: true
-      allocation_usd: 1000.0
-      max_positions: 1
+      # 1000 -> 2500, max_positions 1 -> 3 after 2026-04-28 evening
+      # walkforward on 13-ETF universe:
+      #   max_pos=1: 1435 trades, PF 1.035, CI [0.892, 1.196],
+      #              OOS Return +5.5%
+      #   max_pos=3: 4295 trades, PF 1.052, CI [0.964, 1.155],
+      #              OOS Return +19.1%
+      # max_positions=1 saturates at one trade/day regardless of
+      # universe size — we were leaving sector-diversification value
+      # on the table. PF holds, CI tightens, OOS return triples.
+      allocation_usd: 2500.0
+      max_positions: 3
       # Entry fires on the 15:45 5-min bar (covers 15:45-15:49:59 ET).
       # Must fire BEFORE wind-down (15:50) because the backtester skips
       # new entries once wind-down starts. This gives ~15 min before close.
