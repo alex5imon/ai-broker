@@ -339,8 +339,21 @@ def classify_position(
     state: AlpacaState,
     strategy_enabled: Mapping[str, bool],
 ) -> PositionFinding:
-    """Classify a single ``positions`` row against live Alpaca state."""
+    """Classify a single ``positions`` row against live Alpaca state.
+
+    Terminal states (CLOSED, ENTRY_FAILED) take the closed-side branch.
+    ENTRY_FAILED is the post-V8 label for what we used to detect heuristically
+    as PHANTOM_CLOSE — when we see it we can short-circuit to that classification
+    without re-querying Alpaca.
+    """
     status: str = str(pos.get("status") or "").upper()
+    if status == "ENTRY_FAILED":
+        return PositionFinding(
+            db_row=pos,
+            classification=PositionClass.PHANTOM_CLOSE,
+            evidence="status='ENTRY_FAILED' — V8 migration already flagged this row",
+            proposed_action=_POSITION_ACTION[PositionClass.PHANTOM_CLOSE],
+        )
     if status != "CLOSED":
         return _classify_open_position(pos, state, strategy_enabled)
     return _classify_closed_position(pos, state)

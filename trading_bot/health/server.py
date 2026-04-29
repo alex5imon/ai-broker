@@ -127,7 +127,8 @@ class HealthServer:
             try:
                 # Open positions count
                 row = conn.execute(
-                    "SELECT COUNT(*) AS cnt FROM positions WHERE status != 'CLOSED'"
+                    "SELECT COUNT(*) AS cnt FROM positions "
+                    "WHERE status NOT IN ('CLOSED', 'ENTRY_FAILED')"
                 ).fetchone()
                 open_positions_count = int(row["cnt"]) if row else 0
 

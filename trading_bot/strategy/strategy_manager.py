@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from trading_bot.constants import GICS_SECTOR, PositionStatus, TZ_EASTERN
+from trading_bot.constants import GICS_SECTOR, TZ_EASTERN
 from trading_bot.data.event_calendar import fomc_size_multiplier
 from trading_bot.db import repository as repo
 from trading_bot.execution.loss_cooldown import LossCooldownTracker
@@ -375,7 +375,8 @@ class StrategyManager:
             conn.row_factory = sqlite3.Row
             try:
                 rows = conn.execute(
-                    "SELECT * FROM positions WHERE status != 'CLOSED'"
+                    "SELECT * FROM positions "
+                    "WHERE status NOT IN ('CLOSED', 'ENTRY_FAILED')"
                 ).fetchall()
             finally:
                 conn.close()
@@ -624,8 +625,9 @@ class StrategyManager:
             try:
                 rows = conn.execute(
                     "SELECT quantity, entry_price FROM positions "
-                    "WHERE ticker = ? AND status != ?",
-                    (ticker, PositionStatus.CLOSED.value),
+                    "WHERE ticker = ? "
+                    "AND status NOT IN ('CLOSED', 'ENTRY_FAILED')",
+                    (ticker,),
                 ).fetchall()
             finally:
                 conn.close()

@@ -1,4 +1,8 @@
-"""Tests for tick_state / risk_circuit_state persistence (Schema V7)."""
+"""Tests for tick_state / risk_circuit_state persistence (added in Schema V7).
+
+The version assertions reference :data:`trading_bot.constants.SCHEMA_VERSION`
+so future migration bumps don't silently regress these tests.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from trading_bot.constants import SCHEMA_VERSION
 from trading_bot.db.migrations import run_migrations
 from trading_bot.db.repository import (
     load_risk_state,
@@ -39,7 +44,7 @@ def test_migration_creates_new_tables(tmp_path: Path) -> None:
         assert "risk_circuit_state" in names
 
         version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
-        assert version == 7
+        assert version == SCHEMA_VERSION
     finally:
         conn.close()
 
@@ -53,7 +58,7 @@ def test_migration_is_idempotent(tmp_path: Path) -> None:
     conn = sqlite3.connect(str(db_path))
     try:
         version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
-        assert version == 7
+        assert version == SCHEMA_VERSION
     finally:
         conn.close()
 

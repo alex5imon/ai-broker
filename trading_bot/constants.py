@@ -48,13 +48,33 @@ class OrderSide(str, Enum):
 
 
 class PositionStatus(str, Enum):
-    """Lifecycle states for an open position."""
+    """Lifecycle states for a position.
+
+    Terminal states (the row never transitions out):
+        - CLOSED — entry filled, then exited (normal lifecycle).
+        - ENTRY_FAILED — entry never filled (cancel, reject, timeout). The
+          row exists because we optimistically inserted into ``positions``
+          before the bracket order confirmed; we cannot delete it without
+          breaking foreign keys + audit history. Callers querying for
+          "in-flight" positions must exclude both terminal states.
+
+    All other states are in-flight.
+    """
     ENTRY_PENDING = "ENTRY_PENDING"
     POSITION_OPEN = "POSITION_OPEN"
     STOP_AND_TARGET_ACTIVE = "STOP_AND_TARGET_ACTIVE"
     TRAILING_ACTIVE = "TRAILING_ACTIVE"
     CLOSING = "CLOSING"
     CLOSED = "CLOSED"
+    ENTRY_FAILED = "ENTRY_FAILED"
+
+
+# Set of terminal PositionStatus values. Use this in any query that asks
+# "is this position still in flight?" — it must exclude every terminal
+# state, not just CLOSED.
+TERMINAL_POSITION_STATUSES: frozenset[str] = frozenset(
+    {PositionStatus.CLOSED.value, PositionStatus.ENTRY_FAILED.value}
+)
 
 
 class HoldType(str, Enum):
@@ -176,4 +196,4 @@ def ticker_market(ticker: str) -> Market:
 # Schema version — must match the DB migration target
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION: int = 7
+SCHEMA_VERSION: int = 8

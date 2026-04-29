@@ -765,7 +765,11 @@ class TradingBot:
             status: str = position.get("status", "")
 
             # Skip positions that are already being closed
-            if status in (PositionStatus.CLOSING.value, PositionStatus.CLOSED.value):
+            if status in (
+                PositionStatus.CLOSING.value,
+                PositionStatus.CLOSED.value,
+                PositionStatus.ENTRY_FAILED.value,
+            ):
                 continue
 
             # Require a current price
@@ -965,7 +969,11 @@ class TradingBot:
                 logger.info("%s: swing — exempt from wind-down", ticker)
                 continue
 
-            if status in (PositionStatus.CLOSING.value, PositionStatus.CLOSED.value):
+            if status in (
+                PositionStatus.CLOSING.value,
+                PositionStatus.CLOSED.value,
+                PositionStatus.ENTRY_FAILED.value,
+            ):
                 continue
 
             # Only close positions belonging to this market

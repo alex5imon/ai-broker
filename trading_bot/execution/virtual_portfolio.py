@@ -116,7 +116,9 @@ class VirtualPortfolio:
         conn.row_factory = sqlite3.Row
         try:
             rows = conn.execute(
-                "SELECT * FROM positions WHERE strategy_id = ? AND status != 'CLOSED'",
+                "SELECT * FROM positions "
+                "WHERE strategy_id = ? "
+                "AND status NOT IN ('CLOSED', 'ENTRY_FAILED')",
                 (self.strategy_id,),
             ).fetchall()
             return [dict(r) for r in rows]
