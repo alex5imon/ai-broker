@@ -1,12 +1,10 @@
-"""Self-improvement research agent.
+"""Self-improvement and reconciliation tooling.
 
-Runs at end of trading day. Produces a markdown report containing:
-  1. Postmortem of recent trades (per-strategy stats over rolling window)
-  2. Hypotheses for config tweaks (deterministic, rule-based, bounded steps)
-  3. Backtest A/B results validating each hypothesis on historical data
-
-The report is committed via a draft PR. Humans review and apply the patch
-manually. The agent never edits ``config.yaml`` directly.
+The agent (postmortem + hypotheses + backtest gate + report) runs at end
+of trading day and produces a draft-PR markdown report. The reconcile
+module is a standalone read-only research tool that compares local
+SQLite state against the live Alpaca account and produces a markdown
+inventory of discrepancies. Neither edits the live DB or submits orders.
 """
 
 from trading_bot.self_improve.postmortem import StrategyStats, compute_window_stats
