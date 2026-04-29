@@ -465,6 +465,91 @@ class TestCancelFlatten:
 
 
 # ---------------------------------------------------------------------------
+# Strategy-driven exits (place_exit)
+# ---------------------------------------------------------------------------
+
+
+class TestPlaceExit:
+    @pytest.mark.asyncio
+    async def test_place_exit_cancels_bracket_legs_and_submits_market_sell(
+        self, config, tmp_db_path: str, mock_notifier,
+    ):
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        # Track an in-flight position with both bracket legs known.
+        active = _ActiveOrder(
+            trade_id=1,
+            ticker="SPY",
+            exchange="US",
+            alpaca_entry_order_id="entry-1",
+            alpaca_stop_order_id="stop-1",
+            alpaca_target_order_id="target-1",
+            status=PositionStatus.STOP_AND_TARGET_ACTIVE,
+            entry_shares=10.0,
+            filled_shares=10.0,
+            entry_price=100.0,
+            stop_price=98.0,
+            target_price=104.0,
+            hold_type="intraday",
+            strategy_id="mean_reversion",
+        )
+        om._active_orders[1] = active
+
+        cancel_calls: list[str] = []
+        om._gw.client.cancel_order_by_id = MagicMock(
+            side_effect=lambda oid: cancel_calls.append(oid),
+        )
+        submit_orders: list[Any] = []
+
+        def _submit(*args, **kwargs):
+            submit_orders.append(kwargs.get("order_data"))
+            o = MagicMock()
+            o.id = "exit-1"
+            return o
+
+        om._gw.client.submit_order = MagicMock(side_effect=_submit)
+
+        order_id = await om.place_exit(
+            ticker="SPY", qty=10, reason="rsi_normalized",
+        )
+        assert order_id == "exit-1"
+        # Both bracket legs cancelled before the new market order
+        assert "stop-1" in cancel_calls
+        assert "target-1" in cancel_calls
+        # Market sell submitted
+        assert len(submit_orders) == 1
+        # New order id mapped to the original trade id
+        assert om._alpaca_to_trade.get("exit-1") == 1
+
+    @pytest.mark.asyncio
+    async def test_place_exit_returns_none_on_broker_failure(
+        self, config, tmp_db_path: str, mock_notifier,
+    ):
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        om._gw.client.submit_order = MagicMock(side_effect=RuntimeError("rejected"))
+        # No active order tracked → falls through to symbol-wide cancel.
+        om._gw.client.get_orders = MagicMock(return_value=[])
+
+        order_id = await om.place_exit(
+            ticker="SPY", qty=5, reason="trailing_stop", is_emergency=True,
+        )
+        assert order_id is None
+        # Emergency exits should fire a notification on failure
+        mock_notifier.send.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_place_exit_rejects_non_positive_qty(
+        self, config, tmp_db_path: str, mock_notifier,
+    ):
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        om._gw.client.submit_order = MagicMock()
+        order_id = await om.place_exit(
+            ticker="SPY", qty=0, reason="anything",
+        )
+        assert order_id is None
+        om._gw.client.submit_order.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Place-entry failure path
 # ---------------------------------------------------------------------------
 

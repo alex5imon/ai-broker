@@ -516,12 +516,18 @@ class TradingBot:
             watchlist: list[str] = (
                 self._active_watchlist.get(market) or self._config.get_watchlist(market)
             )
-            account_equity_gbp: float = await self._get_account_equity_gbp()
+            # NOTE: ``_get_account_equity_gbp`` returns USD on Alpaca
+            # (NetLiquidation is reported in account currency = USD).
+            # The function name is a legacy IBKR-era misnomer pending a
+            # broader rename that also touches the daily_summaries DB
+            # column. Pass through as USD here for the new
+            # StrategyManager API.
+            account_equity_usd: float = await self._get_account_equity_gbp()
             await self._strategy_manager.scan_for_entries(
                 watchlist=watchlist,
                 get_5min_bars=self._get_5min_bars,
                 get_daily_bars=self._get_daily_bars,
-                account_equity_gbp=account_equity_gbp,
+                account_equity_usd=account_equity_usd,
             )
             return
 

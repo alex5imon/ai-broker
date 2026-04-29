@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -64,9 +65,16 @@ class StrategyManager:
         watchlist: list[str],
         get_5min_bars: Any,
         get_daily_bars: Any,
-        account_equity_gbp: float,
+        account_equity_usd: float,
     ) -> int:
-        """Run all strategies against the watchlist. Returns number of entries placed."""
+        """Run all strategies against the watchlist. Returns number of entries placed.
+
+        ``account_equity_usd`` is the broker NetLiquidation in USD (Alpaca
+        accounts settle in USD). The legacy "GBP" naming used elsewhere
+        in main.py is a relic — this manager uses the correct currency
+        label so future FX work won't accidentally apply a conversion to
+        an already-USD figure.
+        """
         entries_placed: int = 0
 
         if self._market_data.trading_paused:
@@ -233,6 +241,12 @@ class StrategyManager:
             positions: list[dict[str, Any]] = portfolio.get_open_positions()
             for position in positions:
                 ticker: str = position["ticker"]
+                # Stale-data gate — same protection scan_for_entries uses.
+                # A stale price that fires a false exit signal would
+                # otherwise cascade into a phantom market sell, broken
+                # virtual-portfolio cash, and a fake loss-cooldown record.
+                if self._market_data.is_stale(ticker):
+                    continue
                 current_price: float | None = self._market_data.get_latest_price(ticker)
                 if current_price is None or current_price <= 0:
                     continue
@@ -280,13 +294,35 @@ class StrategyManager:
                     continue
 
                 entry_price: float = float(position.get("entry_price", 0))
-                shares: int = int(position.get("quantity", 0))
+                shares: float = float(position.get("quantity", 0))
+                if shares <= 0:
+                    continue
+
+                # CRITICAL: send the broker order *before* recording the
+                # virtual exit. If the broker call fails we leave the
+                # virtual portfolio untouched, so the next tick still
+                # sees the position open and can re-attempt the exit
+                # (rather than silently diverging from broker state).
+                exit_order_id: str | None = await self._order_manager.place_exit(
+                    ticker=ticker,
+                    qty=shares,
+                    reason=exit_signal.reason or "strategy_exit",
+                    is_emergency=exit_signal.is_emergency,
+                )
+                if exit_order_id is None:
+                    logger.error(
+                        "[%s] Exit order rejected for %s — leaving virtual "
+                        "portfolio untouched so we re-attempt next tick",
+                        strategy.strategy_id, ticker,
+                    )
+                    continue
+
                 portfolio.record_exit(shares, current_price, entry_price)
                 exits += 1
 
                 # Loss-cooldown bookkeeping — must follow record_exit so the
                 # virtual portfolio's tally is consistent with the tracker's.
-                if self._loss_cooldown is not None and shares > 0:
+                if self._loss_cooldown is not None:
                     pnl: float = shares * (current_price - entry_price)
                     self._loss_cooldown.record_outcome(strategy.strategy_id, pnl)
 
@@ -326,9 +362,23 @@ class StrategyManager:
     # ------------------------------------------------------------------
 
     def _fomc_size_multiplier(self) -> float:
-        """Lookup today's FOMC multiplier from raw config (defaults to 1.0)."""
-        getter = getattr(self._config, "_raw", None)
-        raw: dict[str, Any] = getter if isinstance(getter, dict) else {}
+        """Lookup today's FOMC multiplier from config (defaults to 1.0).
+
+        Uses ``Config.raw_section()`` when available so we don't depend
+        on the private ``_raw`` attribute. Falls back to ``_raw`` only
+        for tests/mocks that pre-date the helper.
+        """
+        raw: dict[str, Any] = {}
+        section_fn = getattr(self._config, "raw_section", None)
+        if callable(section_fn):
+            try:
+                raw = section_fn()
+            except Exception:
+                raw = {}
+        if not raw:
+            legacy = getattr(self._config, "_raw", None)
+            if isinstance(legacy, dict):
+                raw = legacy
         try:
             today = datetime.now(tz=ET).date()
             return float(fomc_size_multiplier(today, raw))
@@ -340,21 +390,28 @@ class StrategyManager:
     def _scale_decision_shares(
         decision: StrategyDecision, multiplier: float,
     ) -> StrategyDecision | None:
-        """Scale a decision's share count by *multiplier*; drop if it falls below 1."""
+        """Return a new decision with shares scaled by *multiplier*, or None.
+
+        Preserves integer-vs-fractional intent based on the original
+        ``shares`` type. Returns a brand-new ``StrategyDecision`` so the
+        caller's object is never mutated — composition with other helpers
+        (FOMC × symbol cap) stays predictable regardless of call order.
+        """
         if multiplier <= 0:
             return None
         scaled: float = float(decision.shares) * multiplier
-        # Preserve integer share counts when the strategy used integer sizing.
-        if isinstance(decision.shares, int) and not isinstance(decision.shares, bool):
-            scaled = float(int(scaled))
-            if scaled < 1.0:
+        is_int_sized: bool = (
+            isinstance(decision.shares, int) and not isinstance(decision.shares, bool)
+        )
+        if is_int_sized:
+            scaled_int: int = int(scaled)
+            if scaled_int < 1:
                 return None
-        else:
-            scaled = round(scaled, 4)
-            if scaled < 0.001:
-                return None
-        decision.shares = scaled  # type: ignore[assignment]
-        return decision
+            return replace(decision, shares=scaled_int)
+        scaled = round(scaled, 4)
+        if scaled < 0.001:
+            return None
+        return replace(decision, shares=scaled)
 
     def _enforce_symbol_cap(
         self, decision: StrategyDecision,
@@ -365,7 +422,9 @@ class StrategyManager:
         value. Existing exposure to ``decision.ticker`` across all
         sub-portfolios + the proposed entry must stay under the cap;
         otherwise the candidate is shrunk (or rejected if the resulting
-        size would be below the strategy's min trade unit).
+        size would be below the strategy's min trade unit). Returns a
+        new ``StrategyDecision`` rather than mutating the caller's
+        object so transformations compose cleanly.
         """
         try:
             cap_pct: float = float(
@@ -394,24 +453,27 @@ class StrategyManager:
             return None
 
         max_shares_by_cap: float = remaining / float(decision.entry_price)
-        if isinstance(decision.shares, int) and not isinstance(decision.shares, bool):
-            max_shares_by_cap = float(int(max_shares_by_cap))
-            if max_shares_by_cap < 1.0:
+        is_int_sized: bool = (
+            isinstance(decision.shares, int) and not isinstance(decision.shares, bool)
+        )
+        if is_int_sized:
+            shares_int: int = int(max_shares_by_cap)
+            if shares_int < 1:
                 return None
-            decision.shares = int(max_shares_by_cap)  # type: ignore[assignment]
+            new_decision: StrategyDecision = replace(decision, shares=shares_int)
         else:
-            max_shares_by_cap = round(max_shares_by_cap, 4)
-            if max_shares_by_cap < 0.001:
+            shares_frac: float = round(max_shares_by_cap, 4)
+            if shares_frac < 0.001:
                 return None
-            decision.shares = max_shares_by_cap  # type: ignore[assignment]
+            new_decision = replace(decision, shares=shares_frac)
 
         logger.info(
             "[%s] %s shrunk by symbol cap %.0f%% (existing $%.2f, cap $%.2f, "
             "new shares=%s)",
-            decision.strategy_id, decision.ticker, cap_pct * 100,
-            existing_exposure, cap_value, decision.shares,
+            new_decision.strategy_id, new_decision.ticker, cap_pct * 100,
+            existing_exposure, cap_value, new_decision.shares,
         )
-        return decision
+        return new_decision
 
     def _compute_total_book_value(self) -> float:
         """Sum cash + open-position book value across all virtual portfolios."""

@@ -12,6 +12,7 @@ survive a stateless cron run.  ``_active_orders`` is hydrated from the
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 from dataclasses import dataclass
@@ -514,7 +515,9 @@ class OrderManager:
                 type=OrderType.MARKET,
                 time_in_force=TimeInForce.IOC,
             )
-            order: AlpacaOrder = client.submit_order(order_data=request)
+            order: AlpacaOrder = await asyncio.to_thread(
+                client.submit_order, order_data=request,
+            )
             logger.warning(
                 "Emergency flatten: SELL %d %s @ MARKET (alpaca_id=%s)",
                 qty, ticker, str(order.id),
@@ -529,6 +532,85 @@ class OrderManager:
                 priority=5,
                 tags=["skull_and_crossbones"],
             )
+
+    async def place_exit(
+        self,
+        ticker: str,
+        qty: float,
+        reason: str,
+        *,
+        is_emergency: bool = False,
+    ) -> str | None:
+        """Submit a strategy-driven exit (market sell).
+
+        Cancels any outstanding bracket legs for the matching position so
+        the broker doesn't reject the new order with insufficient-qty.
+        Returns the Alpaca order id on submission, or None on failure.
+        """
+        if qty <= 0:
+            logger.warning(
+                "place_exit called with non-positive qty for %s: %s", ticker, qty,
+            )
+            return None
+
+        # Find the matching active order (DB-hydrated) so we can release
+        # the bracket legs that reserve the shares.
+        matching_trade_id: int | None = None
+        matching_active: _ActiveOrder | None = None
+        for tid, active in self._active_orders.items():
+            if active.ticker == ticker and active.status not in (
+                PositionStatus.CLOSED,
+            ):
+                matching_trade_id = tid
+                matching_active = active
+                break
+
+        if matching_active is not None:
+            for oid in (
+                matching_active.alpaca_stop_order_id,
+                matching_active.alpaca_target_order_id,
+                matching_active.alpaca_trail_order_id,
+            ):
+                if oid is not None:
+                    await self.cancel_order(oid)
+        else:
+            # Defensive: cancel anything pending on the symbol so the
+            # market sell isn't blocked by reserved qty.
+            await self.cancel_all_for_ticker(ticker)
+
+        client: TradingClient = self._gw.client
+        try:
+            request = MarketOrderRequest(
+                symbol=ticker,
+                qty=qty,
+                side=OrderSide.SELL,
+                type=OrderType.MARKET,
+                time_in_force=TimeInForce.DAY,
+            )
+            order: AlpacaOrder = await asyncio.to_thread(
+                client.submit_order, order_data=request,
+            )
+            order_id: str = str(order.id)
+            logger.info(
+                "Strategy exit submitted: SELL %s %s @ MARKET (reason=%s, alpaca_id=%s)",
+                qty, ticker, reason, order_id,
+            )
+            if matching_trade_id is not None:
+                self._alpaca_to_trade[order_id] = matching_trade_id
+            return order_id
+        except Exception:
+            logger.exception(
+                "CRITICAL: Failed to place strategy exit for %s (qty=%s, reason=%s)",
+                ticker, qty, reason,
+            )
+            if is_emergency:
+                await self._notifier.send(
+                    "Strategy Exit Failed",
+                    f"Failed to exit {qty} {ticker} (reason={reason}). Manual review required.",
+                    priority=4,
+                    tags=["warning"],
+                )
+            return None
 
     async def flatten_all(self) -> None:
         """Flatten all positions with market orders (kill switch)."""

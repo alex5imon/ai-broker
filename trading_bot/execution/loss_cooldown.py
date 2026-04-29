@@ -16,6 +16,7 @@ import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Callable
 from zoneinfo import ZoneInfo
 
 from trading_bot.constants import TZ_EASTERN
@@ -42,9 +43,20 @@ class LossCooldownConfig:
 class LossCooldownTracker:
     """Tracks consecutive losses per strategy and enforces a cooldown."""
 
-    def __init__(self, db_path: str, config: LossCooldownConfig) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        config: LossCooldownConfig,
+        now_fn: Callable[[], datetime] | None = None,
+    ) -> None:
         self._db_path: str = db_path
         self._config: LossCooldownConfig = config
+        # Injectable clock — defaults to wall clock in ET. Tests pass a
+        # fixed clock so cooldown-window expiry can be exercised without
+        # relying on real elapsed time.
+        self._now_fn: Callable[[], datetime] = (
+            now_fn or (lambda: datetime.now(tz=ET))
+        )
 
     @property
     def enabled(self) -> bool:
@@ -54,8 +66,11 @@ class LossCooldownTracker:
         """Record a closed-trade outcome for *strategy_id*.
 
         ``pnl > 0`` resets the counter and clears any active cooldown.
-        ``pnl <= 0`` increments the counter; if it reaches the configured
-        threshold, a cooldown window is set.
+        ``pnl < 0`` increments the counter; if it reaches the configured
+        threshold, a cooldown window is set. ``pnl == 0`` (a scratch
+        trade) is treated as neutral — neither resetting nor advancing
+        the streak — to avoid false cooldowns from break-even runs on
+        commission-free SPY intraday.
         """
         if not self._config.enabled:
             return
@@ -85,6 +100,10 @@ class LossCooldownTracker:
                         )
                     return
 
+                if pnl == 0:
+                    # Scratch trade — neither resets nor advances the streak.
+                    return
+
                 consecutive += 1
                 if consecutive < self._config.threshold_losses:
                     repo.save_risk_state(
@@ -98,7 +117,7 @@ class LossCooldownTracker:
                     )
                     return
 
-                cooldown_until: datetime = datetime.now(tz=ET) + timedelta(
+                cooldown_until: datetime = self._now_fn() + timedelta(
                     minutes=self._config.cooldown_minutes,
                 )
                 repo.save_risk_state(
@@ -156,7 +175,7 @@ class LossCooldownTracker:
         if cooldown_until.tzinfo is None:
             cooldown_until = cooldown_until.replace(tzinfo=ET)
 
-        now: datetime = datetime.now(tz=ET)
+        now: datetime = self._now_fn()
         if now >= cooldown_until:
             self._auto_clear(strategy_id)
             return False, None

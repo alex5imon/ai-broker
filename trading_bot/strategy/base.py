@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import pandas as pd
@@ -16,7 +16,13 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 @dataclass
 class StrategyDecision:
-    """Entry decision produced by a strategy."""
+    """Entry decision produced by a strategy.
+
+    Treat instances as immutable in transformation pipelines: helpers that
+    need to adjust a decision (FOMC scaling, symbol-cap shrink) return a
+    new instance via ``dataclasses.replace`` rather than mutating shared
+    state.
+    """
 
     ticker: str
     exchange: str
@@ -28,7 +34,7 @@ class StrategyDecision:
     trail_pct: float | None  # None if using fixed target
     hold_type: HoldType
     strategy_id: str
-    signals: dict[str, Any]
+    signals: dict[str, Any] = field(default_factory=dict)
     sentiment_score: float | None = None
     # Price at which an active trailing stop should replace the take-profit.
     # None means "activate trailing immediately on fill" (legacy behaviour).

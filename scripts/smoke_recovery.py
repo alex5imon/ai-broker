@@ -19,7 +19,6 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 from trading_bot.config import Config
-from trading_bot.constants import TZ_EASTERN
 from trading_bot.gateway.connection import GatewayConnection
 from trading_bot.gateway.recovery import StateRecovery
 from trading_bot.notifications.notifier import Notifier

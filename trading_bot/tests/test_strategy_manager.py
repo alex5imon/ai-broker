@@ -139,6 +139,7 @@ def base_sentiment():
 def base_order_manager():
     om = MagicMock()
     om.place_entry = AsyncMock(return_value=42)
+    om.place_exit = AsyncMock(return_value="alpaca-exit-1")
     return om
 
 
@@ -219,7 +220,7 @@ class TestScanForEntries:
             watchlist=["SPY"],
             get_5min_bars=fake_5min,
             get_daily_bars=fake_daily,
-            account_equity_gbp=1000.0,
+            account_equity_usd=1000.0,
         )
         assert n == 0
         base_order_manager.place_entry.assert_not_called()
@@ -258,7 +259,7 @@ class TestScanForEntries:
             watchlist=["SPY"],
             get_5min_bars=fake_5min,
             get_daily_bars=fake_daily,
-            account_equity_gbp=1000.0,
+            account_equity_usd=1000.0,
         )
         assert n == 0
         base_order_manager.place_entry.assert_not_called()
@@ -298,7 +299,7 @@ class TestScanForEntries:
             watchlist=["SPY"],
             get_5min_bars=fake_5min,
             get_daily_bars=fake_daily,
-            account_equity_gbp=1000.0,
+            account_equity_usd=1000.0,
         )
         assert n == 1
         base_order_manager.place_entry.assert_called_once()
@@ -335,7 +336,7 @@ class TestScanForEntries:
             watchlist=["SPY", "QQQ"],
             get_5min_bars=fake_5min,
             get_daily_bars=fake_daily,
-            account_equity_gbp=1000.0,
+            account_equity_usd=1000.0,
         )
         assert n == 0
         assert strategy.evaluate_entry_calls == []
@@ -372,7 +373,7 @@ class TestScanForEntries:
             watchlist=["SPY", "QQQ"],
             get_5min_bars=fake_5min,
             get_daily_bars=fake_daily,
-            account_equity_gbp=1000.0,
+            account_equity_usd=1000.0,
         )
         # Only QQQ evaluated (SPY skipped as stale)
         assert [t for t, _ in strategy.evaluate_entry_calls] == ["QQQ"]
@@ -409,7 +410,7 @@ class TestScanForEntries:
             watchlist=["SPY", "QQQ"],
             get_5min_bars=fake_5min,
             get_daily_bars=fake_daily,
-            account_equity_gbp=1000.0,
+            account_equity_usd=1000.0,
         )
         assert [t for t, _ in strategy.evaluate_entry_calls] == ["QQQ"]
 
@@ -448,7 +449,7 @@ class TestScanForEntries:
             watchlist=["SPY"],
             get_5min_bars=fake_5min,
             get_daily_bars=fake_daily,
-            account_equity_gbp=1000.0,
+            account_equity_usd=1000.0,
         )
         assert n == 0
 
@@ -485,7 +486,7 @@ class TestScanForEntries:
             watchlist=["SPY"],
             get_5min_bars=fake_5min,
             get_daily_bars=fake_daily,
-            account_equity_gbp=1000.0,
+            account_equity_usd=1000.0,
         )
         assert n == 0
         base_order_manager.place_entry.assert_not_called()
@@ -522,7 +523,7 @@ class TestScanForEntries:
             watchlist=["SPY"],
             get_5min_bars=fake_5min,
             get_daily_bars=fake_daily,
-            account_equity_gbp=1000.0,
+            account_equity_usd=1000.0,
         )
         assert n == 0
         base_order_manager.place_entry.assert_not_called()
@@ -559,7 +560,7 @@ class TestScanForEntries:
             watchlist=["SPY"],
             get_5min_bars=fake_5min,
             get_daily_bars=fake_daily,
-            account_equity_gbp=1000.0,
+            account_equity_usd=1000.0,
         )
         assert n == 1
         base_order_manager.place_entry.assert_called_once()
@@ -599,7 +600,7 @@ class TestScanForEntries:
             watchlist=["SPY"],
             get_5min_bars=fake_5min,
             get_daily_bars=fake_daily,
-            account_equity_gbp=1000.0,
+            account_equity_usd=1000.0,
         )
         # The good strategy still places its entry despite bad raising.
         assert n == 1
@@ -639,7 +640,7 @@ class TestScanForEntries:
             watchlist=["SPY"],
             get_5min_bars=fetch_5min,
             get_daily_bars=fake_daily,
-            account_equity_gbp=1000.0,
+            account_equity_usd=1000.0,
         )
         # Fallback worked, entry placed
         assert n == 1
@@ -679,7 +680,7 @@ class TestScanForEntries:
             watchlist=["SPY"],
             get_5min_bars=boom,
             get_daily_bars=fake_daily,
-            account_equity_gbp=1000.0,
+            account_equity_usd=1000.0,
         )
         assert n == 0
         assert strategy.evaluate_entry_calls == []
@@ -716,7 +717,7 @@ class TestScanForEntries:
             watchlist=["SPY"],
             get_5min_bars=fake_5min,
             get_daily_bars=fake_daily,
-            account_equity_gbp=1000.0,
+            account_equity_usd=1000.0,
         )
         assert n == 1
 

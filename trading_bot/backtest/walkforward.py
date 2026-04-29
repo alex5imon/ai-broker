@@ -30,7 +30,7 @@ import random
 import statistics
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Awaitable, Callable, Sequence
+from typing import Any, Awaitable, Callable, Sequence
 
 from trading_bot.multi_strategy_backtest import (
     MultiStrategyResult,
@@ -82,7 +82,15 @@ class BootstrapCI:
     upper: float
     samples: int
 
-    def as_dict(self) -> dict[str, float | int | str]:
+    def as_dict(self) -> dict[str, Any]:
+        """Serialise as a plain dict for logging or JSON dumps.
+
+        Return type is ``dict[str, Any]`` rather than the previous
+        narrower union — mypy's strict mode rejected mixing ``str`` and
+        ``float`` in a single dict literal even though the annotation
+        was honest about it. ``Any`` here is read-only diagnostic
+        output, not a type-safety boundary.
+        """
         return {
             "metric": self.metric,
             "point_estimate": round(self.point_estimate, 4),
