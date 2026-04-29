@@ -37,6 +37,7 @@ from trading_bot.constants import (
     ExitReason,
     PositionStatus,
 )
+from trading_bot.db import repository as repo
 
 if TYPE_CHECKING:
     from trading_bot.config import Config
@@ -242,6 +243,14 @@ class OrderManager:
                         )
                         self._update_position_status(trade_id, PositionStatus.CLOSED)
                         active.status = PositionStatus.CLOSED
+                        self._log_rejection(
+                            ticker=active.ticker,
+                            exchange=active.exchange,
+                            order_type="ENTRY",
+                            intended_price=active.entry_price,
+                            intended_qty=active.entry_shares,
+                            reason=f"alpaca_{order.status.value}",
+                        )
                         del self._active_orders[trade_id]
 
                     elif order.status.value == "partially_filled":
@@ -370,9 +379,17 @@ class OrderManager:
 
             return trade_id
 
-        except Exception:
+        except Exception as exc:
             logger.exception("Failed to place entry order for %s", decision.ticker)
             self._update_position_status(trade_id, PositionStatus.CLOSED)
+            self._log_rejection(
+                ticker=decision.ticker,
+                exchange=decision.exchange,
+                order_type="ENTRY",
+                intended_price=decision.limit_price,
+                intended_qty=decision.shares,
+                reason=f"alpaca_submit_error: {type(exc).__name__}: {exc}"[:200],
+            )
             return None
 
     async def _maybe_timeout_entry(
@@ -427,6 +444,15 @@ class OrderManager:
 
             self._update_position_status(trade_id, PositionStatus.CLOSED)
             active.status = PositionStatus.CLOSED
+            self._log_rejection(
+                ticker=active.ticker,
+                exchange=active.exchange,
+                order_type="ENTRY",
+                intended_price=active.entry_price,
+                intended_qty=active.entry_shares,
+                reason=f"entry_timeout: filled {active.filled_shares:.4f}/"
+                       f"{active.entry_shares:.4f} after {age.total_seconds():.0f}s",
+            )
             del self._active_orders[trade_id]
 
     # ------------------------------------------------------------------
@@ -907,6 +933,45 @@ class OrderManager:
             logger.exception(
                 "Failed to update positions.%s for trade_id=%d",
                 field_name, trade_id,
+            )
+
+    def _log_rejection(
+        self,
+        *,
+        ticker: str,
+        exchange: str,
+        order_type: str,
+        intended_price: float | None,
+        intended_qty: float | None,
+        reason: str,
+    ) -> None:
+        """Persist an order rejection so post-mortems aren't blind.
+
+        Pre-2026-04-30 the rejection path stamped positions CLOSED but
+        wrote nothing to ``order_rejections`` — leaving us with 24 silent
+        failures and no forensic trail. This helper closes that gap.
+        """
+        try:
+            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
+            try:
+                repo.save_order_rejection(
+                    conn,
+                    {
+                        "ticker": ticker,
+                        "exchange": exchange or "US",
+                        "order_type": order_type,
+                        "intended_price": intended_price,
+                        "intended_qty": intended_qty,
+                        "reason": reason,
+                        "timestamp": datetime.now(tz=ET).isoformat(),
+                        "resolved": 0,
+                    },
+                )
+            finally:
+                conn.close()
+        except Exception:
+            logger.exception(
+                "Failed to persist rejection for %s (%s)", ticker, reason
             )
 
     # ------------------------------------------------------------------

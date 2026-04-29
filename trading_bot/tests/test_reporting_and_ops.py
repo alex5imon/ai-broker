@@ -464,3 +464,108 @@ def test_setup_logging_replaces_handlers(tmp_path, monkeypatch):
     root = logging.getLogger()
     # Should have exactly 2 handlers (console + file)
     assert len(root.handlers) == 2
+
+
+# ===========================================================================
+# save_daily_summary — schema match (2026-04-29 incident)
+# ===========================================================================
+#
+# The INSERT referenced ``lse_trades`` and ``commission_ratio`` but the
+# schema didn't, so every save raised OperationalError, was swallowed,
+# and the wind-down handler latched ``daily_summary_saved=true`` anyway.
+# Result: empty table, blind to PnL.
+
+
+def test_save_daily_summary_writes_row(tmp_db_path):
+    from trading_bot.db import repository as repo
+
+    summary = {
+        "date": "2026-04-30",
+        "total_trades": 3,
+        "wins": 2,
+        "losses": 1,
+        "gross_pnl_gbp": 12.5,
+        "commissions_gbp": 0.0,
+        "net_pnl_gbp": 12.5,
+        "account_equity_gbp": 100012.5,
+        "max_drawdown_pct": 0.005,
+        "win_rate": 0.667,
+        "avg_win_gbp": 7.0,
+        "avg_loss_gbp": -1.5,
+        "profit_factor": 9.33,
+        "phase": 1,
+        "us_trades": 3,
+        "notes": None,
+    }
+
+    conn = sqlite3.connect(tmp_db_path)
+    try:
+        repo.save_daily_summary(conn, summary)
+        row = conn.execute(
+            "SELECT date, total_trades, net_pnl_gbp, phase, account_equity_gbp "
+            "FROM daily_summaries WHERE date = ?",
+            ("2026-04-30",),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert row is not None, "save_daily_summary did not persist row"
+    assert row[0] == "2026-04-30"
+    assert row[1] == 3
+    assert abs(row[2] - 12.5) < 1e-6
+    assert row[3] == 1
+    assert abs(row[4] - 100012.5) < 1e-6
+
+
+def test_save_daily_summary_replaces_existing_row(tmp_db_path):
+    from trading_bot.db import repository as repo
+
+    base = {
+        "date": "2026-04-30",
+        "total_trades": 1,
+        "wins": 1,
+        "losses": 0,
+        "gross_pnl_gbp": 5.0,
+        "commissions_gbp": 0.0,
+        "net_pnl_gbp": 5.0,
+        "account_equity_gbp": 100005.0,
+        "phase": 1,
+        "us_trades": 1,
+    }
+    conn = sqlite3.connect(tmp_db_path)
+    try:
+        repo.save_daily_summary(conn, base)
+        # End-of-day re-save with updated metrics.
+        updated = {**base, "total_trades": 5, "net_pnl_gbp": 25.0}
+        repo.save_daily_summary(conn, updated)
+        row = conn.execute(
+            "SELECT total_trades, net_pnl_gbp FROM daily_summaries WHERE date = ?",
+            ("2026-04-30",),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert row == (5, 25.0)
+
+
+def test_save_daily_summary_ignores_dropped_lse_fields(tmp_db_path):
+    """Stray ``lse_trades``/``commission_ratio`` values must not crash."""
+    from trading_bot.db import repository as repo
+
+    summary = {
+        "date": "2026-04-30",
+        "account_equity_gbp": 100000.0,
+        "phase": 1,
+        # Legacy keys that no longer exist in schema:
+        "lse_trades": 0,
+        "commission_ratio": 0.0,
+    }
+    conn = sqlite3.connect(tmp_db_path)
+    try:
+        repo.save_daily_summary(conn, summary)
+        count = conn.execute(
+            "SELECT COUNT(*) FROM daily_summaries"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert count == 1

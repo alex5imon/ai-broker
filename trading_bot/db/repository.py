@@ -154,6 +154,38 @@ def get_open_positions(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return _rows_to_dicts(rows)
 
 
+def has_attempted_today(
+    conn: sqlite3.Connection,
+    *,
+    ticker: str,
+    strategy_id: str,
+    et_today_iso: str,
+) -> bool:
+    """Did *strategy_id* try to enter *ticker* on the ET calendar day *et_today_iso*?
+
+    Counts ANY row (open OR closed/rejected) — the 2026-04-29 incident
+    rejected entries were stamped CLOSED and the in-memory portfolio
+    dedup never saw them, so the next tick re-fired identical orders.
+    Persisting the "attempt" check at the DB level closes that gap.
+
+    *et_today_iso* must be a ``YYYY-MM-DD`` string in the ET calendar so
+    the SQL comparison matches our stored ``entry_time`` prefix.
+    """
+    _ensure_row_factory(conn)
+    row = conn.execute(
+        """
+        SELECT 1
+          FROM positions
+         WHERE ticker = ?
+           AND strategy_id = ?
+           AND substr(entry_time, 1, 10) = ?
+         LIMIT 1
+        """,
+        (ticker, strategy_id, et_today_iso),
+    ).fetchone()
+    return row is not None
+
+
 def save_position(conn: sqlite3.Connection, position: dict[str, Any]) -> int:
     """Insert a new position record and return its ``id``."""
     _ensure_row_factory(conn)
@@ -444,7 +476,15 @@ def clear_expired_cooldowns(conn: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 def save_daily_summary(conn: sqlite3.Connection, summary: dict[str, Any]) -> None:
-    """Insert or replace a daily summary row (keyed by ``date``)."""
+    """Insert or replace a daily summary row (keyed by ``date``).
+
+    Note: ``lse_trades`` and ``commission_ratio`` were removed in the
+    IBKR-cleanup pass (commit c40fe4d) but the INSERT still referenced
+    them, raising ``OperationalError: no such column`` on every save.
+    The wind-down handler swallowed the error and stamped
+    ``daily_summary_saved=true`` anyway, leaving the table empty
+    indefinitely. Columns dropped here to match the schema.
+    """
     conn.execute(
         """
         INSERT OR REPLACE INTO daily_summaries (
@@ -452,13 +492,13 @@ def save_daily_summary(conn: sqlite3.Connection, summary: dict[str, Any]) -> Non
             gross_pnl_gbp, commissions_gbp, net_pnl_gbp,
             account_equity_gbp, max_drawdown_pct, win_rate,
             avg_win_gbp, avg_loss_gbp, profit_factor,
-            phase, lse_trades, us_trades, commission_ratio, notes
+            phase, us_trades, notes
         ) VALUES (
             :date, :total_trades, :wins, :losses,
             :gross_pnl_gbp, :commissions_gbp, :net_pnl_gbp,
             :account_equity_gbp, :max_drawdown_pct, :win_rate,
             :avg_win_gbp, :avg_loss_gbp, :profit_factor,
-            :phase, :lse_trades, :us_trades, :commission_ratio, :notes
+            :phase, :us_trades, :notes
         )
         """,
         {
@@ -476,9 +516,7 @@ def save_daily_summary(conn: sqlite3.Connection, summary: dict[str, Any]) -> Non
             "avg_loss_gbp": summary.get("avg_loss_gbp"),
             "profit_factor": summary.get("profit_factor"),
             "phase": summary["phase"],
-            "lse_trades": summary.get("lse_trades", 0),
             "us_trades": summary.get("us_trades", 0),
-            "commission_ratio": summary.get("commission_ratio"),
             "notes": summary.get("notes"),
         },
     )

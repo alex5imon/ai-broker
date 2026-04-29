@@ -19,10 +19,11 @@ from __future__ import annotations
 import logging
 from datetime import date, datetime, time
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from trading_bot.constants import HoldType
+from trading_bot.constants import TZ_EASTERN, HoldType
 from trading_bot.strategy.base import ExitSignal, StrategyBase, StrategyDecision
 from trading_bot.utils import coalesce
 
@@ -81,7 +82,13 @@ class OvernightDriftStrategy(StrategyBase):
 
         stop_price: float = round(current_price * (1.0 - self._stop_loss_pct), 2)
 
-        max_spend: float = available_cash * self._position_pct
+        # Slot-aware sizing — divide by ``max_positions`` so a $1,000
+        # sleeve with 12 candidates doesn't blow $950 on the first
+        # ticker and reject the next 11. ``position_pct`` retains its
+        # role as the fraction of available cash to deploy *across*
+        # all slots; per-slot share is ``position_pct / max_positions``.
+        slots: int = max(1, self._max_positions)
+        max_spend: float = (available_cash * self._position_pct) / slots
         if max_spend <= 0:
             return None
         shares: float = max_spend / current_price
@@ -182,30 +189,43 @@ def _parse_time(value: str) -> time:
     return time(hour, minute)
 
 
-def _last_bar_time(df_5min: pd.DataFrame) -> time | None:
-    """Return the time-of-day of the last bar's index, if available."""
-    if df_5min is None or len(df_5min) == 0:
+def _to_et_datetime(ts: Any) -> datetime | None:
+    """Coerce a bar index value to a US/Eastern ``datetime``.
+
+    Alpaca emits tz-aware UTC; the backtester emits ET-localized
+    timestamps; some test fixtures emit naive datetimes. Convert tz-aware
+    values to ET; treat naive as already-ET (backtest convention).
+    """
+    if ts is None:
         return None
-    ts = df_5min.index[-1]
     if hasattr(ts, "to_pydatetime"):
         dt = ts.to_pydatetime()
     else:
         dt = ts
-    if hasattr(dt, "time"):
-        return dt.time()
-    return None
+    if not isinstance(dt, datetime):
+        return None
+    if dt.tzinfo is not None:
+        try:
+            return dt.astimezone(TZ_EASTERN)
+        except Exception:
+            return dt
+    return dt
+
+
+def _last_bar_time(df_5min: pd.DataFrame) -> time | None:
+    """Return the wall-clock (ET) time-of-day of the last bar."""
+    if df_5min is None or len(df_5min) == 0:
+        return None
+    dt = _to_et_datetime(df_5min.index[-1])
+    return dt.time() if dt is not None else None
 
 
 def _latest_bar_date(df_5min: pd.DataFrame | None) -> date | None:
-    """Return the date of the last bar's index, if available."""
+    """Return the wall-clock (ET) date of the last bar."""
     if df_5min is None or len(df_5min) == 0:
         return None
-    ts = df_5min.index[-1]
-    if hasattr(ts, "to_pydatetime"):
-        ts = ts.to_pydatetime()
-    if hasattr(ts, "date"):
-        return ts.date()
-    return None
+    dt = _to_et_datetime(df_5min.index[-1])
+    return dt.date() if dt is not None else None
 
 
 def _position_entry_date(position: dict[str, Any]) -> date | None:

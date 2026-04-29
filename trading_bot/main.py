@@ -288,6 +288,17 @@ class TradingBot:
             except Exception:
                 logger.exception("State recovery failed (non-fatal)")
 
+            # --- 5b. Anchor phase to live equity ---
+            # ``__init__`` logs the cached default phase (MICRO) because
+            # equity isn't known yet at construction time. After Alpaca
+            # connects, refresh from real NetLiquidation so the per-tick
+            # phase-aware accessors (max_positions, risk_per_trade_pct,
+            # stop tighter, etc.) match the actual account size.
+            try:
+                await self._refresh_phase_from_equity()
+            except Exception:
+                logger.warning("Phase refresh failed (non-fatal)", exc_info=True)
+
             # --- 6. Poll order statuses ---
             try:
                 await self._order_manager._check_order_statuses()
@@ -717,6 +728,17 @@ class TradingBot:
 
         # Delegate strategy-tagged positions to multi-strategy manager
         if self._strategy_manager is not None:
+            # Drain orphan positions whose strategy was disabled (config
+            # rebalance, schema rename, untagged legacy rows). Without
+            # this, ``check_exits`` only iterates active strategies and
+            # those positions sit forever — see 2026-04-29 SPY/XLRE.
+            try:
+                drained: int = await self._strategy_manager.drain_disabled_sleeves()
+                if drained > 0:
+                    logger.info("Drained %d orphan sleeve position(s)", drained)
+            except Exception:
+                logger.warning("Orphan sleeve drain failed", exc_info=True)
+
             await self._strategy_manager.check_exits(
                 get_5min_bars=self._get_5min_bars,
                 get_daily_bars=self._get_daily_bars,
@@ -1351,11 +1373,15 @@ class TradingBot:
         if now_et.time() < save_after:
             return
 
-        await self._save_daily_summary(today)
-        flags["daily_summary_saved"] = True
-        self._save_day_flags(today, flags)
+        saved: bool = await self._save_daily_summary(today)
+        # Only set the flag on a successful DB write — otherwise we'd
+        # latch a "saved" lie for the rest of the day and never retry,
+        # which is how the 2026-04-29 daily_summaries row went missing.
+        if saved:
+            flags["daily_summary_saved"] = True
+            self._save_day_flags(today, flags)
 
-    async def _save_daily_summary(self, today: date) -> None:
+    async def _save_daily_summary(self, today: date) -> bool:
         """Compute and persist daily metrics, then send a summary notification."""
         today_str: str = today.isoformat()
         equity: float = await self._get_account_equity_gbp()
@@ -1387,11 +1413,13 @@ class TradingBot:
             "notes": None,
         }
 
+        saved: bool = False
         try:
             conn: sqlite3.Connection = sqlite3.connect(self._db_path)
             conn.row_factory = sqlite3.Row
             repo.save_daily_summary(conn, summary)
             conn.close()
+            saved = True
             logger.info("Daily summary saved for %s (trades=%d, net_pnl=£%.2f)",
                         today_str, summary["total_trades"], summary["net_pnl_gbp"])
         except Exception:
@@ -1413,6 +1441,8 @@ class TradingBot:
         except Exception:
             logger.exception("Failed to auto-generate daily report for %s", today_str)
 
+        return saved
+
     # ------------------------------------------------------------------
     # Utility helpers
     # ------------------------------------------------------------------
@@ -1427,6 +1457,32 @@ class TradingBot:
         except Exception:
             logger.warning("get_account_equity_gbp failed", exc_info=True)
         return 0.0
+
+    async def _refresh_phase_from_equity(self) -> None:
+        """Re-resolve the operating phase using the broker's live equity.
+
+        ``Config.get_phase`` caches its first answer; the first call
+        happens in ``__init__`` before Alpaca is connected, so the cache
+        always pinned MICRO. We reset the cache and re-resolve with
+        live equity so per-tick phase-aware accessors match reality.
+        """
+        equity_usd: float = await self._get_account_equity_gbp()
+        if equity_usd <= 0:
+            return
+
+        prior: Phase | None = getattr(self._config, "_phase", None)
+        self._config._phase = None
+        new_phase: Phase = self._config.get_phase(equity_gbp=equity_usd)
+        if prior is not None and prior != new_phase:
+            logger.info(
+                "Phase refresh: %s -> %s (equity=$%.2f)",
+                prior.name, new_phase.name, equity_usd,
+            )
+        elif prior is None:
+            logger.info(
+                "Phase resolved: %s (equity=$%.2f)",
+                new_phase.name, equity_usd,
+            )
 
     def _count_open_positions(self) -> int:
         """Count non-closed positions in SQLite."""
@@ -1479,7 +1535,7 @@ class TradingBot:
         df = pd.DataFrame(bars)
         if "date" in df.columns:
             df = df.set_index("date")
-        return df
+        return _normalize_bar_index_to_et(df)
 
     async def _get_daily_bars(
         self, ticker: str, exchange: str,
@@ -1496,7 +1552,7 @@ class TradingBot:
         df = pd.DataFrame(bars)
         if "date" in df.columns:
             df = df.set_index("date")
-        return df
+        return _normalize_bar_index_to_et(df)
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
@@ -1507,6 +1563,31 @@ def _parse_time(value: str) -> time:
     """Parse an ``'HH:MM'`` string into a ``datetime.time`` object."""
     parts: list[str] = str(value).strip().split(":")
     return time(hour=int(parts[0]), minute=int(parts[1]))
+
+
+def _normalize_bar_index_to_et(df: Any) -> Any:
+    """Ensure a bar DataFrame's DatetimeIndex is in US/Eastern.
+
+    Alpaca returns tz-aware UTC timestamps. The backtester ships bars
+    pre-converted to ET, but the live path historically did not — and
+    strategies compare ``df.index[-1].time()`` against ET windows, so a
+    UTC index silently shifts every entry/exit decision four-to-five
+    hours. This helper makes the index ET-canonical regardless of source.
+    """
+    import pandas as pd
+
+    if df is None or len(df) == 0:
+        return df
+
+    idx = df.index
+    if not isinstance(idx, pd.DatetimeIndex):
+        return df
+
+    if idx.tz is None:
+        # Naive index from upstream — assume already-ET (backtest convention).
+        return df
+
+    return df.tz_convert(TZ_EASTERN)
 
 
 # ---------------------------------------------------------------------------
