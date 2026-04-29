@@ -216,11 +216,77 @@ def _migration_v7(conn: sqlite3.Connection) -> None:
     logger.info("Applied migration V7: tick_state + risk_circuit_state")
 
 
+def _migration_v8(conn: sqlite3.Connection) -> None:
+    """V8: retro-convert phantom-CLOSED positions to ENTRY_FAILED.
+
+    Pre-V8, every path in ``order_manager`` that aborted an entry stamped
+    the row ``status='CLOSED'`` even though no fill ever existed on Alpaca
+    (entry-timeout, submit error, rejection-after-DB-insert).  These rows
+    pollute every "completed trade" report and exit-recovery scan because
+    they look identical to a real round-trip.
+
+    A row is a phantom close iff ALL of:
+      - ``status = 'CLOSED'``
+      - ``alpaca_order_id IS NULL``
+        (entry order id is only set on a successful submit_order)
+      - the paired ``trades`` row has ``exit_time IS NULL``
+        (the close path never wrote exit data — confirms no real fill)
+
+    Rows where ``alpaca_order_id`` IS set but the entry was canceled at the
+    broker are NOT touched here — they require a live Alpaca lookup to
+    classify, which is the Phase 1 reconcile tool's job.  This migration
+    only flips the obvious cases that can be detected from local DB state
+    alone.
+
+    The migration is reversible by replaying the SELECT that produced the
+    target ids and restoring ``status='CLOSED'``; it never deletes rows
+    or columns.  Operationally it is also reversible by restoring the
+    SQLite file from the GHA cache artifact.
+    """
+    target_ids: list[int] = [
+        row[0]
+        for row in conn.execute(
+            """
+            SELECT p.id
+              FROM positions p
+              LEFT JOIN trades t
+                ON t.ticker = p.ticker
+               AND t.entry_time = p.entry_time
+             WHERE p.status = 'CLOSED'
+               AND p.alpaca_order_id IS NULL
+               AND (t.exit_time IS NULL OR t.id IS NULL)
+            """
+        ).fetchall()
+    ]
+
+    if target_ids:
+        # IN (?,?,?…) with positional binds — no string interpolation of
+        # row data.
+        placeholders: str = ",".join("?" for _ in target_ids)
+        conn.execute(
+            f"UPDATE positions SET status = 'ENTRY_FAILED', "
+            f"updated_at = datetime('now') "
+            f"WHERE id IN ({placeholders})",
+            target_ids,
+        )
+    logger.info(
+        "V8: retro-converted %d phantom-CLOSED row(s) to ENTRY_FAILED",
+        len(target_ids),
+    )
+
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_version (version, description) "
+        "VALUES (8, 'V8 schema - ENTRY_FAILED terminal status (data-only)')"
+    )
+    logger.info("Applied migration V8: ENTRY_FAILED terminal status")
+
+
 _MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (4, "V4 schema - multi-market adaptive trading bot", _migration_v4),
     (5, "V5 schema - multi-strategy Alpaca trading bot", _migration_v5),
     (6, "V6 schema - positions.strategy_id NOT NULL", _migration_v6),
     (7, "V7 schema - tick_state + risk_circuit_state", _migration_v7),
+    (8, "V8 schema - ENTRY_FAILED terminal status (data-only)", _migration_v8),
 ]
 
 

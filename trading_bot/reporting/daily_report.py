@@ -368,7 +368,9 @@ class ReportGenerator:
         conn.row_factory = sqlite3.Row
         try:
             rows = conn.execute(
-                "SELECT * FROM positions WHERE status != 'CLOSED' ORDER BY entry_time"
+                "SELECT * FROM positions "
+                "WHERE status NOT IN ('CLOSED', 'ENTRY_FAILED') "
+                "ORDER BY entry_time"
             ).fetchall()
             return [dict(r) for r in rows]
         except sqlite3.OperationalError:

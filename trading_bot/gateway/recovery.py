@@ -465,6 +465,17 @@ class StateRecovery:
             conn.close()
 
     def _close_db_position(self, position_id: int, reason: str) -> None:
+        """Mark a DB-only position CLOSED and stamp a matching trades row.
+
+        Phase 3 B4 fix: the trades INSERT now carries the position's
+        strategy_id, derives ``side`` from the quantity sign (positive →
+        BUY long entry, negative → SELL short entry — the schema stores
+        the entry direction; ``exit_reason`` captures the close), and
+        leaves ``exit_price``/``net_pnl`` NULL so the alpaca_backfill
+        tool can populate them from order history. Pre-fix hardcoded
+        side='SELL' made every recovery-driven trade look like a short
+        entry, with no strategy attribution at all.
+        """
         now: str = datetime.now(tz=ET).isoformat()
         conn: sqlite3.Connection = sqlite3.connect(self._db_path)
         # Use Row factory so the audit-table INSERT below references columns
@@ -487,27 +498,38 @@ class StateRecovery:
                         "SELECT * FROM positions WHERE id = ?", (position_id,)
                     ).fetchone()
                     if row:
+                        qty: int = int(row["quantity"] or 0)
+                        # The bot is long-only at the strategy layer, but
+                        # the schema technically allows shorts — derive
+                        # rather than assume. Positive qty == long entry.
+                        entry_side: str = "BUY" if qty >= 0 else "SELL"
                         conn.execute(
-                            """INSERT INTO trades
-                               (ticker, exchange, currency, side, entry_time,
-                                entry_price, quantity, exit_time, exit_reason,
-                                hold_type, phase, notes)
-                               VALUES (:ticker, :exchange, :currency, 'SELL',
-                                       :entry_time, :entry_price, :quantity,
-                                       :exit_time, :exit_reason, :hold_type,
-                                       :phase,
-                                       'Auto-closed by state recovery')""",
+                            "INSERT INTO trades "
+                            "(ticker, exchange, currency, side, entry_time, "
+                            " entry_price, quantity, exit_time, exit_reason, "
+                            " hold_type, phase, strategy_id, notes) "
+                            "VALUES (:ticker, :exchange, :currency, :side, "
+                            "        :entry_time, :entry_price, :quantity, "
+                            "        :exit_time, :exit_reason, :hold_type, "
+                            "        :phase, :strategy_id, :notes)",
                             {
                                 "ticker": row["ticker"],
                                 "exchange": row["exchange"],
                                 "currency": row["currency"],
+                                "side": entry_side,
                                 "entry_time": row["entry_time"],
                                 "entry_price": row["entry_price"],
-                                "quantity": row["quantity"],
+                                "quantity": abs(qty),
                                 "exit_time": now,
                                 "exit_reason": reason,
                                 "hold_type": row["hold_type"],
                                 "phase": row["phase"],
+                                "strategy_id": row["strategy_id"] or "unknown",
+                                "notes": (
+                                    "Auto-closed by state recovery; "
+                                    "exit_price/net_pnl pending "
+                                    "alpaca_backfill"
+                                ),
                             },
                         )
             except sqlite3.OperationalError:

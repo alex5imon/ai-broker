@@ -281,7 +281,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 
 _SEED_VERSION_SQL: str = (
     "INSERT OR IGNORE INTO schema_version (version, description) "
-    "VALUES (?, 'V7 schema - tick_state + risk_circuit_state');"
+    "VALUES (?, 'V8 schema - ENTRY_FAILED terminal status (data-only)');"
 )
 
 # Expected tables — used for quick health check

@@ -146,10 +146,18 @@ def update_trade_exit(conn: sqlite3.Connection, trade_id: int, exit_data: dict[s
 # ---------------------------------------------------------------------------
 
 def get_open_positions(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    """Return all positions that are not CLOSED."""
+    """Return all positions in non-terminal states.
+
+    Terminal states (CLOSED + ENTRY_FAILED) are excluded — see
+    :class:`trading_bot.constants.PositionStatus` for the lifecycle.
+    ``has_attempted_today`` deliberately ignores status entirely; this
+    function is for "what does the bot still need to manage?" callers.
+    """
     _ensure_row_factory(conn)
     rows = conn.execute(
-        "SELECT * FROM positions WHERE status != 'CLOSED' ORDER BY entry_time"
+        "SELECT * FROM positions "
+        "WHERE status NOT IN ('CLOSED', 'ENTRY_FAILED') "
+        "ORDER BY entry_time"
     ).fetchall()
     return _rows_to_dicts(rows)
 
