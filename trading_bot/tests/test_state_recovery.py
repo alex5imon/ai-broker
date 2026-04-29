@@ -205,6 +205,22 @@ class TestStateRecovery:
         gw.client.submit_order.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_emergency_stop_skipped_when_avg_cost_zero(
+        self, tmp_db_path: str, mock_notifier,
+    ) -> None:
+        """avg_cost <= 0 means we can't compute a valid stop price.
+        Recovery should log an error and skip rather than place a
+        bogus stop at price 0."""
+        pos = _alpaca_position("PLTR", qty=100, avg_entry_price=0.0)
+        gw = self._make_gateway(positions=[pos], orders=[])
+
+        recovery = _make_recovery(gw, tmp_db_path, mock_notifier)
+        await recovery.recover()
+
+        # Stop should NOT be submitted when avg_cost is 0
+        gw.client.submit_order.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_no_discrepancy_clean_state(
         self, tmp_db_path: str, mock_notifier
     ) -> None:

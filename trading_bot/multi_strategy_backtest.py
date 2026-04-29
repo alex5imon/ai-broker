@@ -1233,6 +1233,14 @@ class MultiStrategyBacktester:
         ticker = "SPY"
 
         prev_day: date | None = None
+        # Initialize before the loop so the first iteration's
+        # ``day_start_equity.get(sid, total_now)`` read in the
+        # ``prev_day is not None`` branch can never be unbound. ruff
+        # flagged this as F821 along the path where the inner branch
+        # could in theory reach a not-yet-assigned variable; in practice
+        # ``prev_day is None`` on the very first bar prevents the read,
+        # but explicit init removes the smell.
+        day_start_equity: dict[str, float] = {}
 
         for bar_idx in range(LOOKBACK_BARS, len(df_5min)):
             bar = df_5min.iloc[bar_idx]
@@ -1266,7 +1274,7 @@ class MultiStrategyBacktester:
                         for trade in st.open_positions:
                             trade.days_held += 1
 
-                day_start_equity: dict[str, float] = {}
+                day_start_equity = {}
                 for sid, st in states.items():
                     pos_value = sum(
                         t.entry_price * t.shares for t in st.open_positions

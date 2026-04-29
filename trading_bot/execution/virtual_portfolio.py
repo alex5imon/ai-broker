@@ -56,8 +56,15 @@ class VirtualPortfolio:
         pending: float = self._get_pending_settlements()
         return max(cash - pending, 0.0)
 
-    def record_entry(self, shares: int, price: float) -> None:
-        cost: float = shares * price
+    def record_entry(self, shares: float, price: float) -> None:
+        """Deduct ``shares × price`` from this strategy's virtual cash.
+
+        Accepts ``float`` so fractional-share strategies (Alpaca supports
+        down to 1/1000000) don't silently truncate to int and drift the
+        cash accounting. Integer callers are unaffected — ``5 * 100.0``
+        equals ``5.0 * 100.0`` to the precision SQLite stores.
+        """
+        cost: float = float(shares) * price
         conn: sqlite3.Connection = sqlite3.connect(self._db_path)
         try:
             conn.execute(
@@ -67,11 +74,20 @@ class VirtualPortfolio:
             conn.commit()
         finally:
             conn.close()
-        logger.info("[%s] Entry recorded: %d shares @ $%.2f ($%.2f deducted)", self.strategy_id, shares, price, cost)
+        logger.info(
+            "[%s] Entry recorded: %s shares @ $%.2f ($%.2f deducted)",
+            self.strategy_id, shares, price, cost,
+        )
 
-    def record_exit(self, shares: int, exit_price: float, entry_price: float) -> None:
-        proceeds: float = shares * exit_price
-        pnl: float = shares * (exit_price - entry_price)
+    def record_exit(
+        self, shares: float, exit_price: float, entry_price: float,
+    ) -> None:
+        """Credit proceeds and update P&L counters for a closed exit.
+
+        ``shares`` is ``float`` for the same reason as ``record_entry``.
+        """
+        proceeds: float = float(shares) * exit_price
+        pnl: float = float(shares) * (exit_price - entry_price)
         is_win: bool = pnl > 0
 
         conn: sqlite3.Connection = sqlite3.connect(self._db_path)
@@ -90,7 +106,10 @@ class VirtualPortfolio:
             conn.commit()
         finally:
             conn.close()
-        logger.info("[%s] Exit recorded: %d shares @ $%.2f, P&L=$%.2f", self.strategy_id, shares, exit_price, pnl)
+        logger.info(
+            "[%s] Exit recorded: %s shares @ $%.2f, P&L=$%.2f",
+            self.strategy_id, shares, exit_price, pnl,
+        )
 
     def get_open_positions(self) -> list[dict[str, Any]]:
         conn: sqlite3.Connection = sqlite3.connect(self._db_path)

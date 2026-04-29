@@ -108,6 +108,7 @@ def risk_manager():
 def order_manager():
     om = MagicMock()
     om.place_entry = AsyncMock(return_value=42)
+    om.place_exit = AsyncMock(return_value="alpaca-exit-1")
     return om
 
 
@@ -205,7 +206,7 @@ class TestFomcGate:
         )
         n = await sm.scan_for_entries(
             watchlist=["SPY"], get_5min_bars=fake_bars,
-            get_daily_bars=fake_daily_bars, account_equity_gbp=1000.0,
+            get_daily_bars=fake_daily_bars, account_equity_usd=1000.0,
         )
         assert n == 0
         order_manager.place_entry.assert_not_called()
@@ -230,7 +231,7 @@ class TestFomcGate:
         )
         await sm.scan_for_entries(
             watchlist=["SPY"], get_5min_bars=fake_bars,
-            get_daily_bars=fake_daily_bars, account_equity_gbp=1000.0,
+            get_daily_bars=fake_daily_bars, account_equity_usd=1000.0,
         )
         order_manager.place_entry.assert_called_once()
         om_decision = order_manager.place_entry.call_args[0][0]
@@ -262,7 +263,7 @@ class TestLimitSlopClamp:
         )
         await sm.scan_for_entries(
             watchlist=["SPY"], get_5min_bars=fake_bars,
-            get_daily_bars=fake_daily_bars, account_equity_gbp=1000.0,
+            get_daily_bars=fake_daily_bars, account_equity_usd=1000.0,
         )
         om_decision = order_manager.place_entry.call_args[0][0]
         assert om_decision.limit_price == round(100.05 * 1.002, 2)
@@ -285,7 +286,7 @@ class TestLimitSlopClamp:
         )
         await sm.scan_for_entries(
             watchlist=["SPY"], get_5min_bars=fake_bars,
-            get_daily_bars=fake_daily_bars, account_equity_gbp=1000.0,
+            get_daily_bars=fake_daily_bars, account_equity_usd=1000.0,
         )
         om_decision = order_manager.place_entry.call_args[0][0]
         assert om_decision.limit_price == 100.10
@@ -313,7 +314,7 @@ class TestSymbolAllocationCap:
         )
         await sm.scan_for_entries(
             watchlist=["SPY"], get_5min_bars=fake_bars,
-            get_daily_bars=fake_daily_bars, account_equity_gbp=1000.0,
+            get_daily_bars=fake_daily_bars, account_equity_usd=1000.0,
         )
         order_manager.place_entry.assert_called_once()
         om_decision = order_manager.place_entry.call_args[0][0]
@@ -349,7 +350,7 @@ class TestSymbolAllocationCap:
         )
         await sm.scan_for_entries(
             watchlist=["SPY"], get_5min_bars=fake_bars,
-            get_daily_bars=fake_daily_bars, account_equity_gbp=1000.0,
+            get_daily_bars=fake_daily_bars, account_equity_usd=1000.0,
         )
         order_manager.place_entry.assert_not_called()
 
@@ -368,7 +369,7 @@ class TestSymbolAllocationCap:
         )
         await sm.scan_for_entries(
             watchlist=["SPY"], get_5min_bars=fake_bars,
-            get_daily_bars=fake_daily_bars, account_equity_gbp=1000.0,
+            get_daily_bars=fake_daily_bars, account_equity_usd=1000.0,
         )
         om_decision = order_manager.place_entry.call_args[0][0]
         assert om_decision.shares == 5
@@ -404,7 +405,7 @@ class TestLossCooldownGate:
         )
         n = await sm.scan_for_entries(
             watchlist=["SPY"], get_5min_bars=fake_bars,
-            get_daily_bars=fake_daily_bars, account_equity_gbp=1000.0,
+            get_daily_bars=fake_daily_bars, account_equity_usd=1000.0,
         )
         assert n == 0
         order_manager.place_entry.assert_not_called()
@@ -446,3 +447,203 @@ class TestLossCooldownGate:
         await sm.check_exits()
         # Second consecutive loss → cooldown engaged
         assert tracker.is_on_cooldown("stub")[0] is True
+
+
+# ---------------------------------------------------------------------------
+# check_exits broker-order safety
+# ---------------------------------------------------------------------------
+
+
+class TestCheckExitsBrokerSafety:
+    """Regressions for the bug where check_exits recorded virtual exits
+    without ever sending a broker order — silently diverging the virtual
+    portfolio from real Alpaca state on every exit signal."""
+
+    @pytest.mark.asyncio
+    async def test_check_exits_calls_broker_before_recording_virtual_exit(
+        self, market_data, risk_manager, order_manager, sentiment, earnings,
+        portfolio_manager, tmp_db_path,
+    ):
+        cfg = _config()
+        portfolio = portfolio_manager._portfolio
+        portfolio.get_open_positions = MagicMock(return_value=[
+            {"ticker": "SPY", "entry_price": 100.0, "quantity": 3},
+        ])
+        market_data.get_latest_price = MagicMock(return_value=95.0)
+
+        strategy = _StubStrategy("stub", None)
+        strategy.evaluate_exit = lambda *a, **kw: ExitSignal(
+            should_exit=True, reason="stop_loss", is_emergency=True,
+        )
+
+        sm = StrategyManager(
+            strategies=[strategy],
+            portfolio_manager=portfolio_manager,
+            market_data=market_data, order_manager=order_manager,
+            risk_manager=risk_manager, sentiment=sentiment,
+            earnings=earnings, config=cfg, db_path=tmp_db_path,
+        )
+        n = await sm.check_exits()
+
+        assert n == 1
+        # Broker order MUST have been submitted
+        order_manager.place_exit.assert_called_once()
+        kwargs = order_manager.place_exit.call_args.kwargs
+        assert kwargs["ticker"] == "SPY"
+        assert kwargs["qty"] == 3
+        assert kwargs["reason"] == "stop_loss"
+        assert kwargs["is_emergency"] is True
+        # Virtual exit only after broker confirmation
+        portfolio.record_exit.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_check_exits_skips_virtual_exit_when_broker_rejects(
+        self, market_data, risk_manager, order_manager, sentiment, earnings,
+        portfolio_manager, tmp_db_path,
+    ):
+        # Broker rejection → leave virtual portfolio untouched so we
+        # re-attempt next tick (rather than diverging from real state).
+        order_manager.place_exit = AsyncMock(return_value=None)
+
+        cfg = _config()
+        portfolio = portfolio_manager._portfolio
+        portfolio.get_open_positions = MagicMock(return_value=[
+            {"ticker": "SPY", "entry_price": 100.0, "quantity": 3},
+        ])
+        market_data.get_latest_price = MagicMock(return_value=95.0)
+
+        strategy = _StubStrategy("stub", None)
+        strategy.evaluate_exit = lambda *a, **kw: ExitSignal(
+            should_exit=True, reason="stop_loss",
+        )
+
+        tracker = LossCooldownTracker(
+            db_path=tmp_db_path,
+            config=LossCooldownConfig(enabled=True, threshold_losses=2),
+        )
+
+        sm = StrategyManager(
+            strategies=[strategy],
+            portfolio_manager=portfolio_manager,
+            market_data=market_data, order_manager=order_manager,
+            risk_manager=risk_manager, sentiment=sentiment,
+            earnings=earnings, config=cfg, db_path=tmp_db_path,
+            loss_cooldown=tracker,
+        )
+        n = await sm.check_exits()
+
+        assert n == 0
+        portfolio.record_exit.assert_not_called()
+        # No fake loss recorded against the cooldown tracker either
+        assert tracker.is_on_cooldown("stub")[0] is False
+
+    @pytest.mark.asyncio
+    async def test_check_exits_skips_stale_ticker(
+        self, market_data, risk_manager, order_manager, sentiment, earnings,
+        portfolio_manager, tmp_db_path,
+    ):
+        cfg = _config()
+        # Stale-data gate should preempt the exit signal entirely so we
+        # never send a phantom market sell driven by a stale price.
+        market_data.is_stale = MagicMock(return_value=True)
+        portfolio = portfolio_manager._portfolio
+        portfolio.get_open_positions = MagicMock(return_value=[
+            {"ticker": "SPY", "entry_price": 100.0, "quantity": 3},
+        ])
+
+        strategy = _StubStrategy("stub", None)
+        strategy.evaluate_exit = lambda *a, **kw: ExitSignal(
+            should_exit=True, reason="stop_loss",
+        )
+
+        sm = StrategyManager(
+            strategies=[strategy],
+            portfolio_manager=portfolio_manager,
+            market_data=market_data, order_manager=order_manager,
+            risk_manager=risk_manager, sentiment=sentiment,
+            earnings=earnings, config=cfg, db_path=tmp_db_path,
+        )
+        n = await sm.check_exits()
+        assert n == 0
+        order_manager.place_exit.assert_not_called()
+        portfolio.record_exit.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Decision immutability
+# ---------------------------------------------------------------------------
+
+
+class TestDecisionImmutability:
+    """The FOMC scaler and symbol-cap helpers must return new
+    StrategyDecision objects rather than mutating the caller's."""
+
+    def test_scale_decision_shares_does_not_mutate_input(self):
+        original = _decision(shares=10, entry=100.0)
+        scaled = StrategyManager._scale_decision_shares(original, 0.5)
+        assert scaled is not None
+        assert scaled.shares == 5
+        # Original must remain untouched
+        assert original.shares == 10
+
+    def test_scale_decision_preserves_int_intent(self):
+        original = _decision(shares=10, entry=100.0)
+        scaled = StrategyManager._scale_decision_shares(original, 0.33)
+        assert scaled is not None
+        assert isinstance(scaled.shares, int)
+        assert scaled.shares == 3  # int(10 * 0.33)
+
+    def test_scale_decision_preserves_fractional_intent(self):
+        original = _decision(shares=10.0, entry=100.0)
+        scaled = StrategyManager._scale_decision_shares(original, 0.5)
+        assert scaled is not None
+        assert isinstance(scaled.shares, float)
+        assert scaled.shares == 5.0
+
+    def test_scale_decision_below_min_returns_none(self):
+        original = _decision(shares=1, entry=100.0)
+        scaled = StrategyManager._scale_decision_shares(original, 0.5)
+        # 1 * 0.5 = 0.5 → int(0.5) = 0 → below int min of 1
+        assert scaled is None
+        # Original still untouched
+        assert original.shares == 1
+
+    @pytest.mark.asyncio
+    async def test_pipeline_does_not_mutate_strategy_decision(
+        self, market_data, risk_manager, order_manager, sentiment, earnings,
+        portfolio_manager, fake_bars, fake_daily_bars, tmp_db_path, monkeypatch,
+    ):
+        """End-to-end: FOMC scale × symbol cap composition leaves the
+        original decision the strategy returned untouched."""
+        # FOMC half-size, symbol cap 30% of $1000 = $300 → max 3 shares.
+        from trading_bot.strategy import strategy_manager as sm_mod
+        monkeypatch.setattr(
+            sm_mod, "fomc_size_multiplier", lambda _t, _r: 0.5,
+        )
+        cfg = _config(cap_pct=0.30)
+
+        held: list[StrategyDecision] = []
+
+        class _CapturingStrategy(_StubStrategy):
+            def evaluate_entry(self, *a, **kw):
+                d = super().evaluate_entry(*a, **kw)
+                if d is not None:
+                    held.append(d)
+                return d
+
+        strat = _CapturingStrategy("stub", _decision(shares=10, entry=100.0))
+        sm = StrategyManager(
+            strategies=[strat],
+            portfolio_manager=portfolio_manager,
+            market_data=market_data, order_manager=order_manager,
+            risk_manager=risk_manager, sentiment=sentiment,
+            earnings=earnings, config=cfg, db_path=tmp_db_path,
+        )
+        await sm.scan_for_entries(
+            watchlist=["SPY"], get_5min_bars=fake_bars,
+            get_daily_bars=fake_daily_bars, account_equity_usd=1000.0,
+        )
+
+        assert len(held) == 1
+        # Strategy's original decision is preserved.
+        assert held[0].shares == 10

@@ -107,6 +107,21 @@ class Config:
             raise ConfigError(f"Missing required config key: {'.'.join(keys)}")
         return val
 
+    def raw_section(self, *keys: str) -> dict[str, Any]:
+        """Public, type-safe accessor for a raw config subtree.
+
+        ``raw_section()`` (no args) returns a shallow copy of the full
+        config dict. ``raw_section("event_gate")`` returns the
+        ``event_gate`` subtree, or ``{}`` if missing or non-mapping.
+        Callers should use this rather than reaching into ``_raw``
+        directly so a future rename of the storage attribute doesn't
+        silently disable gates.
+        """
+        if not keys:
+            return dict(self._raw)
+        node: Any = self._get(*keys, default={})
+        return node if isinstance(node, dict) else {}
+
     # -----------------------------------------------------------------------
     # Phase detection
     # -----------------------------------------------------------------------

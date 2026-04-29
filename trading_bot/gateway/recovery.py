@@ -7,6 +7,7 @@ SQLite database before resuming normal operation.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 from dataclasses import dataclass, field
@@ -279,7 +280,9 @@ class StateRecovery:
                 time_in_force=TimeInForce.GTC,
                 stop_price=stop_price,
             )
-            self._gw.client.submit_order(order_data=request)
+            # Alpaca SDK is sync — offload to a worker thread so we don't
+            # block the event loop on the HTTP submit.
+            await asyncio.to_thread(self._gw.client.submit_order, order_data=request)
             logger.info("Emergency stop placed for %s: %s %d @ stop %.2f", ticker, side.value, order_qty, stop_price)
         except Exception:
             logger.exception("Failed to place emergency stop for %s", ticker)
@@ -322,7 +325,7 @@ class StateRecovery:
             ticker: str = str(order.symbol)
             order_id: str = str(getattr(order, "id", "") or "")
             try:
-                self._gw.client.cancel_order_by_id(order_id)
+                await asyncio.to_thread(self._gw.client.cancel_order_by_id, order_id)
                 age_min: float = (now - submitted_at).total_seconds() / 60.0
                 logger.warning(
                     "Cancelled stale %s order for %s (id=%s, age=%.1f min)",
@@ -387,7 +390,7 @@ class StateRecovery:
                     side=side,
                     time_in_force=TimeInForce.DAY,
                 )
-                self._gw.client.submit_order(order_data=request)
+                await asyncio.to_thread(self._gw.client.submit_order, order_data=request)
                 logger.warning(
                     "EOD flatten: %s %d %s (cutoff=%s)",
                     side.value, abs(qty), ticker, cutoff_str,
@@ -470,39 +473,45 @@ class StateRecovery:
         # extended by a future migration.
         conn.row_factory = sqlite3.Row
         try:
-            conn.execute(
-                "UPDATE positions SET status = 'CLOSED', updated_at = ? WHERE id = ?",
-                (now, position_id),
-            )
-            row = conn.execute(
-                "SELECT * FROM positions WHERE id = ?", (position_id,)
-            ).fetchone()
-            if row:
-                conn.execute(
-                    """INSERT INTO trades
-                       (ticker, exchange, currency, side, entry_time,
-                        entry_price, quantity, exit_time, exit_reason,
-                        hold_type, phase, notes)
-                       VALUES (:ticker, :exchange, :currency, 'SELL',
-                               :entry_time, :entry_price, :quantity,
-                               :exit_time, :exit_reason, :hold_type, :phase,
-                               'Auto-closed by state recovery')""",
-                    {
-                        "ticker": row["ticker"],
-                        "exchange": row["exchange"],
-                        "currency": row["currency"],
-                        "entry_time": row["entry_time"],
-                        "entry_price": row["entry_price"],
-                        "quantity": row["quantity"],
-                        "exit_time": now,
-                        "exit_reason": reason,
-                        "hold_type": row["hold_type"],
-                        "phase": row["phase"],
-                    },
-                )
-            conn.commit()
-        except sqlite3.OperationalError:
-            logger.warning("Could not close position id=%d", position_id)
+            # Explicit ``with conn:`` makes atomicity self-documenting:
+            # both the UPDATE and the INSERT either commit together or
+            # roll back together if any statement raises.
+            try:
+                with conn:
+                    conn.execute(
+                        "UPDATE positions SET status = 'CLOSED', "
+                        "updated_at = ? WHERE id = ?",
+                        (now, position_id),
+                    )
+                    row = conn.execute(
+                        "SELECT * FROM positions WHERE id = ?", (position_id,)
+                    ).fetchone()
+                    if row:
+                        conn.execute(
+                            """INSERT INTO trades
+                               (ticker, exchange, currency, side, entry_time,
+                                entry_price, quantity, exit_time, exit_reason,
+                                hold_type, phase, notes)
+                               VALUES (:ticker, :exchange, :currency, 'SELL',
+                                       :entry_time, :entry_price, :quantity,
+                                       :exit_time, :exit_reason, :hold_type,
+                                       :phase,
+                                       'Auto-closed by state recovery')""",
+                            {
+                                "ticker": row["ticker"],
+                                "exchange": row["exchange"],
+                                "currency": row["currency"],
+                                "entry_time": row["entry_time"],
+                                "entry_price": row["entry_price"],
+                                "quantity": row["quantity"],
+                                "exit_time": now,
+                                "exit_reason": reason,
+                                "hold_type": row["hold_type"],
+                                "phase": row["phase"],
+                            },
+                        )
+            except sqlite3.OperationalError:
+                logger.warning("Could not close position id=%d", position_id)
         finally:
             conn.close()
 
