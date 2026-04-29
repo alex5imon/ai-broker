@@ -533,3 +533,157 @@ class TestOvernightDriftEntryTime:
         assert signal.should_exit is True
         assert signal.reason == "stop_loss"
         assert signal.is_emergency is True
+
+
+# ---------------------------------------------------------------------------
+# Overnight Drift — entry-window timezone regression
+# ---------------------------------------------------------------------------
+#
+# 2026-04-29 incident: live bars arrived as tz-aware UTC, the strategy
+# compared ``df.index[-1].time()`` against ET windows, and entries fired
+# at 11:45 ET (= 15:45 UTC) instead of 15:45 ET. The fix converts the bar
+# index to US/Eastern before extracting time-of-day.
+
+
+class TestOvernightDriftEntryWindowTimezone:
+    """Entry window must respect ET wall-clock regardless of bar tz."""
+
+    def _strategy(self) -> Any:
+        from trading_bot.strategy.strategies.overnight_drift import OvernightDriftStrategy
+        return OvernightDriftStrategy(
+            config={
+                "max_positions": 12,
+                "entry_window_start": "15:45",
+                "entry_window_end": "15:55",
+                "stop_loss_pct": 0.03,
+                "fractional_shares": True,
+                "position_pct": 0.5,
+            }
+        )
+
+    def _bars(self, last_index: pd.Timestamp) -> pd.DataFrame:
+        # Two bars so len-check passes; only the final timestamp matters.
+        idx = pd.DatetimeIndex([last_index - pd.Timedelta(minutes=5), last_index])
+        return pd.DataFrame(
+            {"open": [100.0, 100.0], "high": [101.0, 101.0],
+             "low": [99.0, 99.0], "close": [100.0, 100.0], "volume": [1000, 1000]},
+            index=idx,
+        )
+
+    def test_utc_bar_at_1545_et_fires(self) -> None:
+        """Last bar at 19:45 UTC == 15:45 ET should fire the entry window."""
+        strat = self._strategy()
+        ts = pd.Timestamp("2026-04-30 19:45:00", tz="UTC")
+        df = self._bars(ts)
+        decision = strat.evaluate_entry(
+            ticker="SPY", exchange="US",
+            df_5min=df, df_daily=df,
+            current_price=500.0, available_cash=1000.0,
+        )
+        assert decision is not None, "expected entry at 15:45 ET (19:45 UTC)"
+
+    def test_utc_bar_at_1145_et_does_not_fire(self) -> None:
+        """Last bar at 15:45 UTC == 11:45 ET (mid-morning) must NOT fire."""
+        strat = self._strategy()
+        ts = pd.Timestamp("2026-04-30 15:45:00", tz="UTC")
+        df = self._bars(ts)
+        decision = strat.evaluate_entry(
+            ticker="SPY", exchange="US",
+            df_5min=df, df_daily=df,
+            current_price=500.0, available_cash=1000.0,
+        )
+        assert decision is None, (
+            "regression: 11:45 ET fired entry — UTC bar leaked into ET window"
+        )
+
+    def test_naive_bar_treated_as_et(self) -> None:
+        """Naive (backtest-shaped) bars are assumed already-ET."""
+        strat = self._strategy()
+        ts = pd.Timestamp("2026-04-30 15:50:00")  # naive ET
+        df = self._bars(ts)
+        decision = strat.evaluate_entry(
+            ticker="SPY", exchange="US",
+            df_5min=df, df_daily=df,
+            current_price=500.0, available_cash=1000.0,
+        )
+        assert decision is not None
+
+    def test_slot_aware_sizing_divides_by_max_positions(self) -> None:
+        """With max_positions=3, per-entry spend must be ~ pct/N of cash."""
+        from trading_bot.strategy.strategies.overnight_drift import OvernightDriftStrategy
+        strat = OvernightDriftStrategy(
+            config={
+                "max_positions": 3,
+                "entry_window_start": "15:45",
+                "entry_window_end": "15:55",
+                "stop_loss_pct": 0.03,
+                "fractional_shares": True,
+                "position_pct": 0.95,
+            }
+        )
+        ts = pd.Timestamp("2026-04-30 19:45:00", tz="UTC")  # 15:45 ET
+        idx = pd.DatetimeIndex([ts - pd.Timedelta(minutes=5), ts])
+        df = pd.DataFrame(
+            {"open": [100.0, 100.0], "high": [101.0, 101.0],
+             "low": [99.0, 99.0], "close": [100.0, 100.0], "volume": [1000, 1000]},
+            index=idx,
+        )
+        decision = strat.evaluate_entry(
+            ticker="SPY", exchange="US",
+            df_5min=df, df_daily=df,
+            current_price=100.0, available_cash=1000.0,
+        )
+        assert decision is not None
+        # Expected per-slot spend: 1000 * 0.95 / 3 = 316.67 -> 3.1667 shares.
+        assert 3.0 < decision.shares < 3.3, (
+            f"expected ~3.17 shares with N=3 sizing, got {decision.shares}"
+        )
+
+    def test_slot_aware_sizing_n_equals_one_unchanged(self) -> None:
+        """With max_positions=1, per-entry spend == pct * cash (legacy)."""
+        from trading_bot.strategy.strategies.overnight_drift import OvernightDriftStrategy
+        strat = OvernightDriftStrategy(
+            config={
+                "max_positions": 1,
+                "entry_window_start": "15:45",
+                "entry_window_end": "15:55",
+                "stop_loss_pct": 0.03,
+                "fractional_shares": True,
+                "position_pct": 0.95,
+            }
+        )
+        ts = pd.Timestamp("2026-04-30 19:45:00", tz="UTC")
+        idx = pd.DatetimeIndex([ts - pd.Timedelta(minutes=5), ts])
+        df = pd.DataFrame(
+            {"open": [100.0, 100.0], "high": [101.0, 101.0],
+             "low": [99.0, 99.0], "close": [100.0, 100.0], "volume": [1000, 1000]},
+            index=idx,
+        )
+        decision = strat.evaluate_entry(
+            ticker="SPY", exchange="US",
+            df_5min=df, df_daily=df,
+            current_price=100.0, available_cash=1000.0,
+        )
+        assert decision is not None
+        # Expected: 950 / 100 = 9.5 shares.
+        assert abs(decision.shares - 9.5) < 0.01
+
+    def test_exit_uses_et_date_for_utc_bars(self) -> None:
+        """Cross-day exit must use ET calendar, not UTC.
+
+        2026-04-30 23:30 UTC == 19:30 ET (still 04-30). A position opened
+        04-30 must NOT exit on this bar even though UTC date is 04-30 too —
+        the test asserts no premature rollover.
+        """
+        from trading_bot.strategy.strategies.overnight_drift import OvernightDriftStrategy
+        strat = OvernightDriftStrategy(config={"max_positions": 1})
+        ts = pd.Timestamp("2026-04-30 19:30:00", tz="UTC")  # 15:30 ET, same day
+        df = self._bars(ts)
+        position = {
+            "entry_price": 100.0,
+            "stop_price": 97.0,
+            "entry_time": "2026-04-30T15:45:00-04:00",
+            "hold_type": "swing",
+        }
+        signal = strat.evaluate_exit(position=position, current_price=100.4, df_5min=df)
+        assert signal.should_exit is False, "exit fired same session"

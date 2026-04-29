@@ -564,6 +564,35 @@ class TestPlaceEntryFailure:
         trade_id = await om.place_entry(_entry())
         assert trade_id is None  # Returned None on failure
 
+    @pytest.mark.asyncio
+    async def test_submit_failure_logs_to_order_rejections(
+        self, config, tmp_db_path: str, mock_notifier
+    ):
+        """2026-04-29 incident: rejections went straight to status=CLOSED with no
+        forensic trail. Now every rejection must persist to order_rejections."""
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        om._gw.client.submit_order = MagicMock(side_effect=RuntimeError("insufficient buying power"))
+
+        await om.place_entry(_entry(ticker="XLF", shares=10, price=51.0))
+
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            row = conn.execute(
+                "SELECT ticker, order_type, intended_price, intended_qty, reason "
+                "FROM order_rejections ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        assert row is not None, "no order_rejections row written"
+        ticker, order_type, intended_price, intended_qty, reason = row
+        assert ticker == "XLF"
+        assert order_type == "ENTRY"
+        assert abs(float(intended_price) - 51.0) < 1e-6
+        assert int(intended_qty) == 10
+        assert "insufficient buying power" in reason
+        assert reason.startswith("alpaca_submit_error")
+
 
 # ---------------------------------------------------------------------------
 # get_active_orders helpers

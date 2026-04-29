@@ -723,6 +723,320 @@ class TestScanForEntries:
 
 
 # ---------------------------------------------------------------------------
+# Drain disabled sleeves (2026-04-29 incident)
+# ---------------------------------------------------------------------------
+
+
+class TestDrainDisabledSleeves:
+    """Positions tagged with a now-disabled strategy must be flushed."""
+
+    @pytest.mark.asyncio
+    async def test_drains_position_for_disabled_strategy(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        tmp_db_path,
+    ):
+        # Seed positions: one for an ACTIVE strategy, one for a DISABLED
+        # strategy. Only the disabled one should be drained.
+        import sqlite3
+
+        conn = sqlite3.connect(tmp_db_path)
+        conn.execute(
+            """
+            INSERT INTO positions (
+                ticker, exchange, currency, quantity, entry_price,
+                entry_time, status, hold_type, phase, strategy_id
+            ) VALUES (?, 'US', 'USD', 5.0, 100.0, ?, 'STOP_AND_TARGET_ACTIVE', 'swing', 1, ?)
+            """,
+            ("SPY", "2026-04-27T15:40:00-04:00", "breakout"),
+        )
+        conn.execute(
+            """
+            INSERT INTO positions (
+                ticker, exchange, currency, quantity, entry_price,
+                entry_time, status, hold_type, phase, strategy_id
+            ) VALUES (?, 'US', 'USD', 1.0, 100.0, ?, 'POSITION_OPEN', 'swing', 1, ?)
+            """,
+            ("XLY", "2026-04-29T10:00:00-04:00", "stub"),  # active
+        )
+        conn.commit()
+        conn.close()
+
+        sm = StrategyManager(
+            strategies=[_StubStrategy(decision=_make_decision())],  # only "stub" active
+            portfolio_manager=base_portfolio_manager,
+            market_data=base_market_data,
+            order_manager=base_order_manager,
+            risk_manager=base_risk_manager,
+            sentiment=base_sentiment,
+            earnings=base_earnings,
+            config=base_config,
+            db_path=tmp_db_path,
+        )
+
+        n = await sm.drain_disabled_sleeves()
+        assert n == 1, f"expected 1 drained, got {n}"
+
+        # Exit was placed on the orphan ticker, NOT the active one.
+        base_order_manager.place_exit.assert_awaited_once()
+        call = base_order_manager.place_exit.await_args
+        assert call.kwargs["ticker"] == "SPY"
+        assert "orphan_sleeve_drain" in call.kwargs["reason"]
+        assert "breakout" in call.kwargs["reason"]
+
+    @pytest.mark.asyncio
+    async def test_drains_unknown_strategy_id(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        tmp_db_path,
+    ):
+        """Untagged ('unknown') legacy positions should be drained too."""
+        import sqlite3
+
+        conn = sqlite3.connect(tmp_db_path)
+        conn.execute(
+            """
+            INSERT INTO positions (
+                ticker, exchange, currency, quantity, entry_price,
+                entry_time, status, hold_type, phase, strategy_id
+            ) VALUES ('QQQ', 'US', 'USD', 1.0, 100.0, ?, 'POSITION_OPEN', 'swing', 1, 'unknown')
+            """,
+            ("2026-04-27T10:26:00-04:00",),
+        )
+        conn.commit()
+        conn.close()
+
+        sm = StrategyManager(
+            strategies=[_StubStrategy(decision=_make_decision())],
+            portfolio_manager=base_portfolio_manager,
+            market_data=base_market_data,
+            order_manager=base_order_manager,
+            risk_manager=base_risk_manager,
+            sentiment=base_sentiment,
+            earnings=base_earnings,
+            config=base_config,
+            db_path=tmp_db_path,
+        )
+
+        n = await sm.drain_disabled_sleeves()
+        assert n == 1
+        base_order_manager.place_exit.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_drain_noop_when_all_active(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        tmp_db_path,
+    ):
+        """No DB rows → drain returns 0 and never touches order_manager."""
+        sm = StrategyManager(
+            strategies=[_StubStrategy(decision=_make_decision())],
+            portfolio_manager=base_portfolio_manager,
+            market_data=base_market_data,
+            order_manager=base_order_manager,
+            risk_manager=base_risk_manager,
+            sentiment=base_sentiment,
+            earnings=base_earnings,
+            config=base_config,
+            db_path=tmp_db_path,
+        )
+        n = await sm.drain_disabled_sleeves()
+        assert n == 0
+        base_order_manager.place_exit.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Within-tick over-firing (2026-04-29 incident)
+# ---------------------------------------------------------------------------
+
+
+class TestWithinTickMaxPositions:
+    """A single scan must not exceed ``max_positions`` even when the
+    in-memory portfolio doesn't see attempts (rejections, async delays).
+
+    Reproduces the path where 12 ETFs were stamped CLOSED in one tick
+    despite ``max_positions`` being far smaller.
+    """
+
+    @pytest.mark.asyncio
+    async def test_attempts_count_against_max_positions(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        fake_5min,
+        fake_daily,
+        tmp_db_path,
+    ):
+        # Strategy allows 2 positions. portfolio.get_open_positions() always
+        # returns [] (simulating rejected entries that go straight to CLOSED
+        # and never appear as open). Manager must still cap at 2 attempts.
+        strategy = _StubStrategy(decision=_make_decision(), max_positions=2)
+        sm = StrategyManager(
+            strategies=[strategy],
+            portfolio_manager=base_portfolio_manager,
+            market_data=base_market_data,
+            order_manager=base_order_manager,
+            risk_manager=base_risk_manager,
+            sentiment=base_sentiment,
+            earnings=base_earnings,
+            config=base_config,
+            db_path=tmp_db_path,
+        )
+
+        n = await sm.scan_for_entries(
+            watchlist=["SPY", "QQQ", "XLK", "XLF", "XLY"],
+            get_5min_bars=fake_5min,
+            get_daily_bars=fake_daily,
+            account_equity_usd=1000.0,
+        )
+        # Hard cap at max_positions even though 5 tickers were eligible.
+        assert n == 2
+        assert base_order_manager.place_entry.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Same-day re-entry dedup (2026-04-29 incident)
+# ---------------------------------------------------------------------------
+
+
+class TestSameDayReentryDedup:
+    """Reject duplicate entries when a row exists for today, even CLOSED ones."""
+
+    @pytest.mark.asyncio
+    async def test_skips_when_today_row_exists_with_closed_status(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        fake_5min,
+        fake_daily,
+        tmp_db_path,
+    ):
+        # Seed a row that mirrors the 2026-04-29 incident: a CLOSED row
+        # with no alpaca_order_id (rejected), entry_time = today (ET).
+        import sqlite3
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        et_today = datetime.now(tz=ZoneInfo("US/Eastern")).date().isoformat()
+        conn = sqlite3.connect(tmp_db_path)
+        conn.execute(
+            """
+            INSERT INTO positions (
+                ticker, exchange, currency, quantity, entry_price,
+                entry_time, status, hold_type, phase, strategy_id
+            ) VALUES (?, 'US', 'USD', 1.0, 100.0, ?, 'CLOSED', 'swing', 1, 'stub')
+            """,
+            ("SPY", f"{et_today}T11:45:41-04:00"),
+        )
+        conn.commit()
+        conn.close()
+
+        sm = StrategyManager(
+            strategies=[_StubStrategy(decision=_make_decision())],
+            portfolio_manager=base_portfolio_manager,
+            market_data=base_market_data,
+            order_manager=base_order_manager,
+            risk_manager=base_risk_manager,
+            sentiment=base_sentiment,
+            earnings=base_earnings,
+            config=base_config,
+            db_path=tmp_db_path,
+        )
+
+        n = await sm.scan_for_entries(
+            watchlist=["SPY"],
+            get_5min_bars=fake_5min,
+            get_daily_bars=fake_daily,
+            account_equity_usd=1000.0,
+        )
+        assert n == 0
+        base_order_manager.place_entry.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_allows_when_no_today_row(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        fake_5min,
+        fake_daily,
+        tmp_db_path,
+    ):
+        # Seed a row from YESTERDAY — must NOT block today's entry.
+        import sqlite3
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+
+        et_yesterday = (
+            datetime.now(tz=ZoneInfo("US/Eastern")).date() - timedelta(days=1)
+        ).isoformat()
+        conn = sqlite3.connect(tmp_db_path)
+        conn.execute(
+            """
+            INSERT INTO positions (
+                ticker, exchange, currency, quantity, entry_price,
+                entry_time, status, hold_type, phase, strategy_id
+            ) VALUES (?, 'US', 'USD', 1.0, 100.0, ?, 'CLOSED', 'swing', 1, 'stub')
+            """,
+            ("SPY", f"{et_yesterday}T11:45:41-04:00"),
+        )
+        conn.commit()
+        conn.close()
+
+        sm = StrategyManager(
+            strategies=[_StubStrategy(decision=_make_decision())],
+            portfolio_manager=base_portfolio_manager,
+            market_data=base_market_data,
+            order_manager=base_order_manager,
+            risk_manager=base_risk_manager,
+            sentiment=base_sentiment,
+            earnings=base_earnings,
+            config=base_config,
+            db_path=tmp_db_path,
+        )
+
+        n = await sm.scan_for_entries(
+            watchlist=["SPY"],
+            get_5min_bars=fake_5min,
+            get_daily_bars=fake_daily,
+            account_equity_usd=1000.0,
+        )
+        assert n == 1
+
+
+# ---------------------------------------------------------------------------
 # check_exits
 # ---------------------------------------------------------------------------
 

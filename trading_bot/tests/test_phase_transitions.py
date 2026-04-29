@@ -50,6 +50,22 @@ class TestPhaseDetection:
         phase = cfg.get_phase()
         assert phase == Phase.MICRO
 
+    def test_cache_invalidate_then_resolve_with_equity(
+        self, config: Config
+    ) -> None:
+        """Regression: ``__init__`` cached MICRO and never re-resolved.
+
+        After invalidating ``_phase`` we must be able to re-detect the
+        true phase from live equity (the bug was that get_phase() with
+        no equity argument always returned the cached default).
+        """
+        cfg = Config(dict(config._raw))
+        # Trigger the bad cache: equity unknown → caches MICRO.
+        assert cfg.get_phase() == Phase.MICRO
+        # The fix path: invalidate and re-resolve with real equity.
+        cfg._phase = None
+        assert cfg.get_phase(equity_gbp=25000.0) == Phase.FULL
+
 
 # ---------------------------------------------------------------------------
 # Phase transition criteria (SPEC §phase transitions)

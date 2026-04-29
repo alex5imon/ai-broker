@@ -14,6 +14,7 @@ import pandas as pd
 
 from trading_bot.constants import GICS_SECTOR, PositionStatus, TZ_EASTERN
 from trading_bot.data.event_calendar import fomc_size_multiplier
+from trading_bot.db import repository as repo
 from trading_bot.execution.loss_cooldown import LossCooldownTracker
 from trading_bot.execution.order_manager import EntryDecision as OMEntryDecision
 from trading_bot.execution.virtual_portfolio import PortfolioManager, VirtualPortfolio
@@ -76,6 +77,12 @@ class StrategyManager:
         an already-USD figure.
         """
         entries_placed: int = 0
+        # Per-strategy attempt counter for THIS scan. Counts every entry
+        # we tried to place — successful, rejected, or recorded-only — so
+        # ``max_positions`` is enforced even when the broker rejects us
+        # or the in-memory portfolio hasn't refreshed yet. This was the
+        # 2026-04-29 within-tick over-firing path.
+        attempts_by_strategy: dict[str, int] = {}
 
         if self._market_data.trading_paused:
             logger.warning("Market data paused — skipping multi-strategy entry scan")
@@ -162,11 +169,28 @@ class StrategyManager:
                         continue
 
                 open_positions: list[dict[str, Any]] = portfolio.get_open_positions()
-                if len(open_positions) >= strategy.get_max_positions():
+                # Effective open count = persisted open + attempts so
+                # far in this scan that haven't yet flushed to the
+                # ``positions`` table (or were rejected and stamped
+                # CLOSED).
+                attempts: int = attempts_by_strategy.get(strategy.strategy_id, 0)
+                if len(open_positions) + attempts >= strategy.get_max_positions():
                     continue
 
                 # Don't double up on same ticker in same strategy
                 if any(p["ticker"] == ticker for p in open_positions):
+                    continue
+
+                # 2026-04-29 incident dedup: rejected entries get stamped
+                # CLOSED in the DB and the in-memory portfolio above
+                # doesn't see them — so the next 5-min tick re-fires the
+                # same order. Cross-check the DB for any same-day attempt
+                # (open OR closed) by this strategy on this ticker.
+                if self._already_attempted_today(ticker, strategy.strategy_id):
+                    logger.debug(
+                        "[%s] %s already attempted today — skipping",
+                        strategy.strategy_id, ticker,
+                    )
                     continue
 
                 try:
@@ -205,6 +229,10 @@ class StrategyManager:
                     continue
 
                 om_decision: OMEntryDecision = self._build_om_decision(decision)
+
+                # Reserve a slot BEFORE issuing the order so a slow/failed
+                # broker call can't let the next ticker iteration over-fire.
+                attempts_by_strategy[strategy.strategy_id] = attempts + 1
 
                 if self._dry_run:
                     logger.info(
@@ -331,6 +359,70 @@ class StrategyManager:
     def get_comparison_report(self) -> dict[str, dict[str, Any]]:
         return self._portfolio_manager.get_comparison_report()
 
+    async def drain_disabled_sleeves(self) -> int:
+        """Close positions whose strategy is no longer active.
+
+        After a regime rebalance disables a sleeve, its open positions
+        sit indefinitely — ``check_exits`` only iterates active strategies,
+        so the broker-side stops are the only thing protecting them.
+        That stranded SPY/breakout and XLRE/trend_following on
+        2026-04-29. This routine flushes them on each tick (cheap when
+        empty: a single SELECT).
+        """
+        active_ids: set[str] = {s.strategy_id for s in self._strategies}
+        try:
+            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM positions WHERE status != 'CLOSED'"
+                ).fetchall()
+            finally:
+                conn.close()
+        except Exception:
+            logger.warning("Drain orphan positions: DB read failed", exc_info=True)
+            return 0
+
+        closed: int = 0
+        for row in rows:
+            pos: dict[str, Any] = dict(row)
+            sid: str | None = pos.get("strategy_id")
+            # Treat both unknown sleeves and missing strategy_id as orphan.
+            if sid in active_ids:
+                continue
+            ticker: str = pos["ticker"]
+            qty: float = float(pos.get("quantity") or 0.0)
+            if qty <= 0:
+                continue
+
+            logger.warning(
+                "Draining orphan position: ticker=%s strategy=%s qty=%.4f",
+                ticker, sid or "<none>", qty,
+            )
+
+            if self._dry_run:
+                continue
+
+            try:
+                exit_order_id: str | None = await self._order_manager.place_exit(
+                    ticker=ticker,
+                    qty=qty,
+                    reason=f"orphan_sleeve_drain:{sid or 'unknown'}",
+                    is_emergency=False,
+                )
+            except Exception:
+                logger.exception(
+                    "Drain exit failed for %s (strategy=%s)", ticker, sid,
+                )
+                continue
+
+            if exit_order_id is None:
+                # Leave the row open so we retry next tick.
+                continue
+            closed += 1
+
+        return closed
+
     def _build_om_decision(self, decision: StrategyDecision) -> OMEntryDecision:
         sector: str = GICS_SECTOR.get(decision.ticker, "Unknown")
         limit_price: float = self._clamp_limit_price(
@@ -360,6 +452,29 @@ class StrategyManager:
     # ------------------------------------------------------------------
     # Helpers — symbol cap, slop clamp, FOMC gate
     # ------------------------------------------------------------------
+
+    def _already_attempted_today(self, ticker: str, strategy_id: str) -> bool:
+        """Persistent same-day-attempt check (any status, any tick)."""
+        et_today: str = datetime.now(tz=ET).date().isoformat()
+        try:
+            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
+            try:
+                return repo.has_attempted_today(
+                    conn,
+                    ticker=ticker,
+                    strategy_id=strategy_id,
+                    et_today_iso=et_today,
+                )
+            finally:
+                conn.close()
+        except Exception:
+            # On DB error, fail OPEN (allow entry) — we have other guards
+            # (in-memory portfolio dedup above, broker-side rejections).
+            logger.warning(
+                "Same-day attempt lookup failed for %s/%s — proceeding",
+                strategy_id, ticker, exc_info=True,
+            )
+            return False
 
     def _fomc_size_multiplier(self) -> float:
         """Lookup today's FOMC multiplier from config (defaults to 1.0).
