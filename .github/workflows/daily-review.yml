@@ -1,0 +1,126 @@
+name: daily-review
+
+# Self-improvement research agent. Runs after market close on weekdays,
+# pulls the day's trades from the cached SQLite, computes a postmortem,
+# proposes config tweaks (rule-based, deterministic), validates them on
+# a recent backtest window, and opens a draft PR with a markdown report.
+#
+# The agent never edits config.yaml. The PR only adds a file under
+# self_improve_reports/. Humans review and apply patches by hand.
+
+on:
+  # NOTE: scheduled cron deliberately disabled until the data layer is
+  # fixed. The agent's postmortem reads from the `trades` table, but the
+  # live bot is not currently persisting closed trades correctly (see
+  # docs/self_improve_followups.md tasks #2 and #3). Running on cron
+  # would just open empty draft PRs every weekday. Re-enable the schedule
+  # below once those tasks are resolved and a real trade history exists.
+  workflow_dispatch: {}
+  # schedule:
+  #   - cron: "30 21 * * 1-5"
+
+concurrency:
+  group: daily-review
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Restore SQLite DB
+        # Same key prefix bot.yml writes to — we read the latest cached DB
+        # so the postmortem sees today's trades.
+        uses: actions/cache@v5
+        with:
+          path: trading_bot/data/trading_bot.db*
+          key: daily-review-db-${{ github.run_id }}
+          restore-keys: |
+            bot-db-
+
+      - name: Compute date window
+        id: dates
+        run: |
+          # Backtest window: last 60 calendar days ending yesterday.
+          # Postmortem window: last 20 days inside the agent.
+          BT_TO=$(date -u -d "yesterday" +%Y-%m-%d)
+          BT_FROM=$(date -u -d "61 days ago" +%Y-%m-%d)
+          REPORT_DATE=$(date -u +%Y-%m-%d)
+          BRANCH="daily-review/${REPORT_DATE}"
+          echo "bt_from=${BT_FROM}" >> "$GITHUB_OUTPUT"
+          echo "bt_to=${BT_TO}" >> "$GITHUB_OUTPUT"
+          echo "report_date=${REPORT_DATE}" >> "$GITHUB_OUTPUT"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Run self-improvement agent
+        env:
+          ALPACA_ENV: ${{ vars.ALPACA_ENV || 'paper' }}
+          ALPACA_PAPER_KEY_ID: ${{ secrets.ALPACA_PAPER_KEY_ID }}
+          ALPACA_PAPER_SECRET: ${{ secrets.ALPACA_PAPER_SECRET }}
+          ALPACA_LIVE_KEY_ID: ${{ secrets.ALPACA_LIVE_KEY_ID }}
+          ALPACA_LIVE_SECRET: ${{ secrets.ALPACA_LIVE_SECRET }}
+          BOT_LOG_DIR: logs
+        run: |
+          python -m trading_bot.self_improve \
+            --window-days 20 \
+            --bt-from "${{ steps.dates.outputs.bt_from }}" \
+            --bt-to "${{ steps.dates.outputs.bt_to }}" \
+            --tickers SPY,QQQ,XLF,XLK,XLE,XLV,XLI,XLY,XLP,XLU,XLB,XLRE,XLC \
+            --out self_improve_reports
+
+      - name: Open draft PR if a report was written
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REPORT="self_improve_reports/${{ steps.dates.outputs.report_date }}.md"
+          if [ ! -f "$REPORT" ]; then
+            echo "No report file produced; nothing to do."
+            exit 0
+          fi
+
+          BRANCH="${{ steps.dates.outputs.branch }}"
+          git config user.name "ai-broker-bot"
+          git config user.email "ai-broker-bot@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add "$REPORT"
+          if git diff --cached --quiet; then
+            echo "Report file unchanged — no PR needed."
+            exit 0
+          fi
+          git commit -m "daily-review: research report ${{ steps.dates.outputs.report_date }}"
+          git push -u origin "$BRANCH"
+
+          gh pr create \
+            --draft \
+            --base main \
+            --head "$BRANCH" \
+            --title "daily-review: ${{ steps.dates.outputs.report_date }}" \
+            --body "Automated self-improvement research report. **Advisory only — apply suggested patches by hand.** See \`$REPORT\`."
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: daily-review-${{ steps.dates.outputs.report_date }}
+          path: |
+            self_improve_reports/
+            logs/
+          retention-days: 60
+          if-no-files-found: ignore
