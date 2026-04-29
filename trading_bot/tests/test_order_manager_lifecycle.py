@@ -556,9 +556,13 @@ class TestPlaceExit:
 
 class TestPlaceEntryFailure:
     @pytest.mark.asyncio
-    async def test_alpaca_submit_failure_marks_closed(
+    async def test_alpaca_submit_failure_returns_none(
         self, config, tmp_db_path: str, mock_notifier
     ):
+        """place_entry returns None on submit failure. The position row's
+        terminal status (ENTRY_FAILED) is asserted in
+        test_phase3_regressions.TestB2_FailedEntryGetsEntryFailedStatus.
+        """
         om = _make_om(config, tmp_db_path, mock_notifier)
         om._gw.client.submit_order = MagicMock(side_effect=RuntimeError("rejected"))
         trade_id = await om.place_entry(_entry())

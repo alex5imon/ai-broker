@@ -105,6 +105,12 @@ class _ActiveOrder:
     trail_pct: float | None = None
     trail_activation_price: float | None = None
     trail_activated: bool = False
+    # Trades-table primary key for this position. Populated when the row is
+    # inserted in _create_position_record and rehydrated via (ticker,
+    # entry_time) match. Used as the WHERE on UPDATE trades during exit so
+    # the update lands on the correct row — pre-Phase-3, the code reused
+    # trade_id (which is positions.id) and silently missed.
+    db_trade_id: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +138,10 @@ class OrderManager:
 
         self._active_orders: dict[int, _ActiveOrder] = {}
         self._alpaca_to_trade: dict[str, int] = {}
+        # Holds positions.id -> trades.id between _create_position_record
+        # and place_entry constructing the _ActiveOrder. Cleared once the
+        # tracker takes ownership.
+        self._pending_db_trade_ids: dict[int, int] = {}
 
     # ------------------------------------------------------------------
     # Tick-model hydration + status check
@@ -149,9 +159,22 @@ class OrderManager:
             conn.row_factory = sqlite3.Row
             try:
                 rows = conn.execute(
-                    "SELECT * FROM positions WHERE status != ?",
-                    (PositionStatus.CLOSED.value,),
+                    "SELECT * FROM positions "
+                    "WHERE status NOT IN (?, ?)",
+                    (
+                        PositionStatus.CLOSED.value,
+                        PositionStatus.ENTRY_FAILED.value,
+                    ),
                 ).fetchall()
+                # Pair-key index for trades.id lookup. Same pairing the
+                # alpaca_backfill tool uses (ticker, entry_time) since
+                # there is no FK between the tables.
+                trades_index: dict[tuple[str, str], int] = {
+                    (str(t["ticker"]), str(t["entry_time"])): int(t["id"])
+                    for t in conn.execute(
+                        "SELECT id, ticker, entry_time FROM trades"
+                    ).fetchall()
+                }
             finally:
                 conn.close()
         except sqlite3.OperationalError:
@@ -187,6 +210,9 @@ class OrderManager:
                 target_price=float(row["target_price"] or 0),
                 hold_type=str(row["hold_type"]),
                 strategy_id=row["strategy_id"],
+                db_trade_id=trades_index.get(
+                    (str(row["ticker"]), str(row["entry_time"]))
+                ),
             )
             self._active_orders[trade_id] = active
             for oid in (
@@ -241,8 +267,12 @@ class OrderManager:
                             "Entry %s: %s (trade_id=%d)",
                             order.status.value, active.ticker, trade_id,
                         )
-                        self._update_position_status(trade_id, PositionStatus.CLOSED)
-                        active.status = PositionStatus.CLOSED
+                        # Phase 3 B2: Use ENTRY_FAILED, not CLOSED — no fill
+                        # ever happened so this is not a real round-trip.
+                        self._update_position_status(
+                            trade_id, PositionStatus.ENTRY_FAILED
+                        )
+                        active.status = PositionStatus.ENTRY_FAILED
                         self._log_rejection(
                             ticker=active.ticker,
                             exchange=active.exchange,
@@ -371,6 +401,7 @@ class OrderManager:
                 strategy_id=decision.strategy_id,
                 trail_pct=decision.trail_pct,
                 trail_activation_price=decision.trail_activation_price,
+                db_trade_id=self._pending_db_trade_ids.pop(trade_id, None),
             )
             self._active_orders[trade_id] = active
             self._alpaca_to_trade[alpaca_order_id] = trade_id
@@ -381,7 +412,13 @@ class OrderManager:
 
         except Exception as exc:
             logger.exception("Failed to place entry order for %s", decision.ticker)
-            self._update_position_status(trade_id, PositionStatus.CLOSED)
+            # Phase 3 B2: ENTRY_FAILED, not CLOSED — Alpaca rejected the
+            # submit so no order ever existed. CLOSED implies a real
+            # round-trip and pollutes every postmortem report.
+            self._update_position_status(trade_id, PositionStatus.ENTRY_FAILED)
+            # Drop the unused mapping so it can't leak into a stale
+            # _ActiveOrder if the same positions.id is later rehydrated.
+            self._pending_db_trade_ids.pop(trade_id, None)
             self._log_rejection(
                 ticker=decision.ticker,
                 exchange=decision.exchange,
@@ -442,8 +479,10 @@ class OrderManager:
                     active.ticker, active.filled_shares, active.exchange,
                 )
 
-            self._update_position_status(trade_id, PositionStatus.CLOSED)
-            active.status = PositionStatus.CLOSED
+            # Phase 3 B2: zero-fill timeout cancels the order at the broker
+            # so no entry ever happens — ENTRY_FAILED, not CLOSED.
+            self._update_position_status(trade_id, PositionStatus.ENTRY_FAILED)
+            active.status = PositionStatus.ENTRY_FAILED
             self._log_rejection(
                 ticker=active.ticker,
                 exchange=active.exchange,
@@ -796,19 +835,53 @@ class OrderManager:
         active.status = PositionStatus.CLOSED
         self._update_position_status(trade_id, PositionStatus.CLOSED)
 
-        try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
+        # Compute realised P&L while we still have the active order in hand.
+        # The bot is commission-free so net == gross; FX is 1.0 for USD.
+        gross_pnl: float = (exit_price - active.entry_price) * active.filled_shares
+
+        # B3: target the trades row by trades.id, not positions.id. The two
+        # tables have independent autoincrements; pre-fix this UPDATE
+        # silently matched the wrong row (or zero rows).
+        db_trade_id: int | None = active.db_trade_id
+        if db_trade_id is None:
+            logger.warning(
+                "_close_position called with no db_trade_id (trade_id=%d "
+                "ticker=%s); exit data will be backfilled from Alpaca.",
+                trade_id, active.ticker,
+            )
+        else:
             try:
-                conn.execute(
-                    "UPDATE trades SET exit_time = ?, exit_price = ?, "
-                    "exit_reason = ? WHERE id = ?",
-                    (now_str, exit_price, exit_reason, trade_id),
+                conn: sqlite3.Connection = sqlite3.connect(self._db_path)
+                try:
+                    cur = conn.execute(
+                        "UPDATE trades SET exit_time = ?, exit_price = ?, "
+                        "exit_reason = ?, gross_pnl = ?, net_pnl = ? "
+                        "WHERE id = ?",
+                        (
+                            now_str,
+                            exit_price,
+                            exit_reason,
+                            gross_pnl,
+                            gross_pnl,
+                            db_trade_id,
+                        ),
+                    )
+                    conn.commit()
+                    if cur.rowcount != 1:
+                        logger.warning(
+                            "Exit UPDATE on trades.id=%d affected "
+                            "rows_affected=%d (expected 1) ticker=%s "
+                            "trade_id=%d",
+                            db_trade_id, cur.rowcount, active.ticker, trade_id,
+                        )
+                finally:
+                    conn.close()
+            except Exception:
+                logger.exception(
+                    "Failed to update trade record for db_trade_id=%d "
+                    "(positions.id=%d)",
+                    db_trade_id, trade_id,
                 )
-                conn.commit()
-            finally:
-                conn.close()
-        except Exception:
-            logger.exception("Failed to update trade record for trade_id=%d", trade_id)
 
         if trade_id in self._active_orders:
             del self._active_orders[trade_id]
@@ -864,12 +937,16 @@ class OrderManager:
                 )
                 trade_id: int = cursor.lastrowid  # type: ignore[assignment]
 
-                conn.execute(
+                # Tag the trades row with strategy_id so postmortems and
+                # daily reports can attribute outcomes. Falls back to
+                # 'unknown' to mirror the positions row above and keep
+                # downstream queries NULL-safe.
+                trades_cursor = conn.execute(
                     "INSERT INTO trades "
                     "(ticker, exchange, currency, side, entry_time, entry_price, "
                     " quantity, hold_type, phase, signal_price, sentiment_score, "
-                    " signals) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " signals, strategy_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         decision.ticker,
                         decision.exchange,
@@ -883,13 +960,22 @@ class OrderManager:
                         decision.limit_price,
                         decision.sentiment_score,
                         decision.signals,
+                        decision.strategy_id or "unknown",
                     ),
                 )
+                # Capture trades.id so the exit-update path can target the
+                # correct trades row (B3). trades.id and positions.id are
+                # independent autoincrements; pre-fix _close_position used
+                # positions.id as the trades WHERE clause.
+                db_trade_id: int = trades_cursor.lastrowid  # type: ignore[assignment]
                 conn.commit()
                 logger.info(
-                    "Created position record: %s trade_id=%d",
-                    decision.ticker, trade_id,
+                    "Created position record: %s positions.id=%d trades.id=%d",
+                    decision.ticker, trade_id, db_trade_id,
                 )
+                # Stash on the in-memory tracker so the active order can
+                # carry the trades.id forward.
+                self._pending_db_trade_ids[trade_id] = db_trade_id
                 return trade_id
             finally:
                 conn.close()
@@ -925,14 +1011,33 @@ class OrderManager:
         try:
             conn: sqlite3.Connection = sqlite3.connect(self._db_path)
             try:
-                conn.execute(sql, (value, now_str, trade_id))
+                cursor = conn.execute(sql, (value, now_str, trade_id))
                 conn.commit()
+                rows_affected: int = cursor.rowcount
             finally:
                 conn.close()
         except Exception:
             logger.exception(
                 "Failed to update positions.%s for trade_id=%d",
                 field_name, trade_id,
+            )
+            return
+
+        # B5 observability: pin which writes succeeded with rows_affected so a
+        # silent no-op (wrong WHERE clause, missing row) surfaces immediately.
+        # Pre-Phase-3 hypothesis was that this UPDATE was hitting the wrong
+        # trade_id; the real cause was upstream submit_order errors / recovery
+        # paths skipping the call entirely. Either way, we want the breadcrumb.
+        if rows_affected == 1:
+            logger.debug(
+                "positions UPDATE field=%s trade_id=%d rows_affected=1",
+                field_name, trade_id,
+            )
+        else:
+            logger.warning(
+                "positions UPDATE field=%s trade_id=%d rows_affected=%d "
+                "(expected 1) — silent write-back failure",
+                field_name, trade_id, rows_affected,
             )
 
     def _log_rejection(
