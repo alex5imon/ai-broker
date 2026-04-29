@@ -16,6 +16,7 @@ dist/
 build/
 backtest_results/
 reports/
+self_improve_reports/
 logs/
 .DS_Store
 state/local_*.json

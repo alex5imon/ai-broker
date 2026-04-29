@@ -57,7 +57,33 @@ python -m trading_bot.data.alpaca_downloader --from 2020-01-01 --to 2020-12-31 \
 
 # Local pre-flight + launch (manual run, not used by GHA)
 bash start_bot.sh
+
+# Daily self-improvement review — postmortem + rule-based proposals + backtest A/B
+python -m trading_bot.self_improve \
+    --window-days 20 \
+    --bt-from 2026-02-20 --bt-to 2026-04-29 \
+    --tickers SPY,QQQ,XLF,XLK,XLE,XLV,XLI,XLY,XLP,XLU,XLB,XLRE,XLC \
+    --out self_improve_reports
+
+# Same, but skip the backtest gate (postmortem-only smoke test)
+python -m trading_bot.self_improve \
+    --window-days 20 --bt-from 2026-04-01 --bt-to 2026-04-29 --dry-run
 ```
+
+## Self-improvement agent
+
+`trading_bot/self_improve/` is a research-only agent that runs after market
+close (via `.github/workflows/daily-review.yml`, 21:30 UTC weekdays). It:
+
+1. Reads recent closed trades from SQLite, computes per-strategy stats.
+2. Runs rule-based hypotheses (each requires ≥ 20 trades of evidence and
+   proposes a single, bounded ±10% parameter step).
+3. Validates each proposal with an in-process A/B backtest. Pass requires
+   no Sharpe drop > 0.10, no drawdown increase > 2pp, and ≥ 95% of
+   baseline return.
+4. Writes a markdown report to `self_improve_reports/YYYY-MM-DD.md` and
+   opens a draft PR. **The agent never edits config.yaml** — patches in
+   the report are advisory text the human applies by hand.
 
 ## Code Conventions
 
