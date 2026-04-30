@@ -313,16 +313,40 @@ def plan_and_execute(
         print("DRY RUN — re-run with --execute to send these orders.")
         return 0
 
-    print("EXECUTING — submitting market orders to Alpaca...")
+    print("EXECUTING — submitting flatten orders to Alpaca...")
     print()
+
+    # If the planned orphans are exactly the live position set, use the
+    # broker-atomic close_all_positions(cancel_orders=True). That endpoint
+    # cancels every open order AND closes every position in one operation
+    # — broker-side, so it works pre-market when manual cancel + submit
+    # is blocked by held_for_orders on PENDING_CANCEL stops.
+    planned_tickers = {p.ticker for p in plans}
+    live_tickers = set(by_ticker.keys())
+    use_bulk = planned_tickers == live_tickers
 
     failures = 0
     try:
         conn.row_factory = sqlite3.Row
-        for plan in plans:
-            ok = _execute_one(plan, client, conn, is_market_open=is_market_open)
-            if not ok:
-                failures += 1
+        if use_bulk:
+            logger.info(
+                "Planned orphans (%s) == live Alpaca positions; using "
+                "close_all_positions(cancel_orders=True) for atomic flatten",
+                sorted(planned_tickers),
+            )
+            failures = _execute_bulk(plans, client, conn)
+        else:
+            extra = live_tickers - planned_tickers
+            logger.warning(
+                "Live Alpaca positions (%s) include non-orphan tickers (%s); "
+                "falling back to per-ticker close. Some flattens may fail "
+                "pre-market due to held_for_orders on pending stop cancels.",
+                sorted(live_tickers), sorted(extra),
+            )
+            for plan in plans:
+                ok = _execute_one(plan, client, conn, is_market_open=is_market_open)
+                if not ok:
+                    failures += 1
     finally:
         conn.close()
 
@@ -331,6 +355,55 @@ def plan_and_execute(
         return 1
     logger.info("All %d orphan(s) flattened successfully", len(plans))
     return 0
+
+
+def _execute_bulk(
+    plans: list[OrphanPlan],
+    client,
+    conn: sqlite3.Connection,
+) -> int:
+    """Atomic bulk flatten via close_all_positions. Returns failure count."""
+    try:
+        responses = client.close_all_positions(cancel_orders=True)
+    except Exception:
+        logger.exception("close_all_positions raised; nothing flattened")
+        return len(plans)
+
+    # Each response carries .symbol and .status (HTTP code from the broker).
+    # 200 / 207 = accepted; anything else means that ticker did not flatten.
+    by_symbol_status: dict[str, int] = {}
+    for r in responses:
+        sym = str(getattr(r, "symbol", "?"))
+        status = int(getattr(r, "status", 0))
+        by_symbol_status[sym] = status
+        body = getattr(r, "body", None)
+        order_id = getattr(body, "id", None) if body is not None else None
+        logger.info("Bulk close: %s -> status=%d order_id=%s", sym, status, order_id)
+
+    failures = 0
+    now_str = datetime.now(tz=ET).isoformat()
+    for plan in plans:
+        status = by_symbol_status.get(plan.ticker)
+        if status is None or status >= 300:
+            logger.error("Bulk close did not flatten %s (status=%s)", plan.ticker, status)
+            failures += 1
+            continue
+        if plan.db_position_id is not None:
+            try:
+                conn.execute(
+                    "UPDATE positions SET status = 'CLOSED', updated_at = ? "
+                    "WHERE id = ? AND status NOT IN ('CLOSED', 'ENTRY_FAILED')",
+                    (now_str, plan.db_position_id),
+                )
+                conn.commit()
+                logger.info("Updated DB positions.id=%d -> CLOSED", plan.db_position_id)
+            except Exception:
+                logger.exception(
+                    "Order accepted but DB update failed for positions.id=%d. "
+                    "Reconcile after the fill.", plan.db_position_id,
+                )
+                failures += 1
+    return failures
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
