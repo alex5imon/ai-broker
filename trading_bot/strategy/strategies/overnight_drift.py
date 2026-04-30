@@ -151,7 +151,14 @@ class OvernightDriftStrategy(StrategyBase):
         bar_date: date | None = _latest_bar_date(df_5min)
         if bar_date is None:
             # No bar data — fall back to "now" (live path may not pass bars).
-            bar_date = datetime.now().date()
+            # Use ET (the trading calendar's timezone) explicitly so this
+            # check doesn't skew when run from a non-UTC machine or in the
+            # 00:00–05:00 UTC window where naive `datetime.now().date()`
+            # would return tomorrow's UTC date and force a premature
+            # overnight_exit.  GHA cron firings all land at safe UTC times
+            # but manual / off-cron runs (backfills, dry-runs from non-UTC
+            # systems) hit this path.
+            bar_date = datetime.now(tz=TZ_EASTERN).date()
 
         # Exit on the first bar of any later trading day.
         if bar_date > entry_date:
