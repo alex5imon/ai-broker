@@ -278,7 +278,7 @@ def _make_evaluator(
     market_data: Any,
     sentiment: Any,
     earnings: Any,
-    fx: Any,
+    
     signals: dict[str, Any] | None = None,
 ):
     from trading_bot.strategy.entry import EntryEvaluator
@@ -293,7 +293,6 @@ def _make_evaluator(
         sentiment=sentiment,
         earnings=earnings,
         market_data=market_data,
-        fx=fx,
         db_path=db_path,
     )
 
@@ -315,14 +314,14 @@ class TestEntryEvaluator:
     @pytest.mark.asyncio
     async def test_all_signals_required_phase1(
         self, config, tmp_db_path, mock_market_data, mock_sentiment,
-        mock_earnings, mock_fx,
+        mock_earnings,
     ) -> None:
         """Only 2 of 3 signals present — entry rejected in Phase 1."""
         bad = _good_signals()
         bad["signal_count"] = 2
         bad["volume_confirmed"] = False
         ev = _make_evaluator(config, tmp_db_path, mock_market_data,
-                             mock_sentiment, mock_earnings, mock_fx,
+                             mock_sentiment, mock_earnings,
                              signals=bad)
         decision = await ev.evaluate("PLTR", "NASDAQ", pd.DataFrame(),
                                      pd.DataFrame(), 1000.0)
@@ -332,11 +331,11 @@ class TestEntryEvaluator:
     @pytest.mark.asyncio
     async def test_entry_rejected_earnings_blackout(
         self, config, tmp_db_path, mock_market_data, mock_sentiment,
-        mock_earnings, mock_fx,
+        mock_earnings,
     ) -> None:
         mock_earnings.is_in_blackout.return_value = True
         ev = _make_evaluator(config, tmp_db_path, mock_market_data,
-                             mock_sentiment, mock_earnings, mock_fx,
+                             mock_sentiment, mock_earnings,
                              signals=_good_signals())
         decision = await ev.evaluate("PLTR", "NASDAQ", pd.DataFrame(),
                                      pd.DataFrame(), 1000.0)
@@ -346,7 +345,7 @@ class TestEntryEvaluator:
     @pytest.mark.asyncio
     async def test_entry_rejected_cooldown(
         self, config, tmp_db_path, mock_market_data, mock_sentiment,
-        mock_earnings, mock_fx,
+        mock_earnings,
     ) -> None:
         conn = sqlite3.connect(tmp_db_path)
         future = datetime.now(ET) + timedelta(hours=1)
@@ -358,7 +357,7 @@ class TestEntryEvaluator:
         conn.close()
 
         ev = _make_evaluator(config, tmp_db_path, mock_market_data,
-                             mock_sentiment, mock_earnings, mock_fx,
+                             mock_sentiment, mock_earnings,
                              signals=_good_signals())
         decision = await ev.evaluate("PLTR", "NASDAQ", pd.DataFrame(),
                                      pd.DataFrame(), 1000.0)
@@ -368,7 +367,7 @@ class TestEntryEvaluator:
     @pytest.mark.asyncio
     async def test_entry_rejected_daily_limit(
         self, config, tmp_db_path, mock_market_data, mock_sentiment,
-        mock_earnings, mock_fx,
+        mock_earnings,
     ) -> None:
         """A -1.5% loss recorded today triggers daily loss limit."""
         conn = sqlite3.connect(tmp_db_path)
@@ -376,19 +375,19 @@ class TestEntryEvaluator:
         conn.execute(
             """INSERT INTO trades (ticker, exchange, currency, side, entry_time,
                entry_price, quantity, exit_time, exit_reason, gross_pnl,
-               net_pnl, pnl_gbp, fx_rate, hold_type, phase)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               net_pnl, pnl_usd, hold_type, phase)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             ("F", "NYSE", "USD", "BUY", today_iso, 10.0, 100,
-             today_iso, "stop_loss", -15.0, -15.0, -15.0, 1.25,
+             today_iso, "stop_loss", -15.0, -15.0, -15.0,
              "swing", 1),
         )
         conn.commit()
         conn.close()
 
         ev = _make_evaluator(config, tmp_db_path, mock_market_data,
-                             mock_sentiment, mock_earnings, mock_fx,
+                             mock_sentiment, mock_earnings,
                              signals=_good_signals())
-        # 1000 GBP equity, -15 GBP pnl = -1.5% which exceeds -1% limit
+        # 1000 USD equity, -15 USD pnl = -1.5% which exceeds -1% limit
         decision = await ev.evaluate("PLTR", "NASDAQ", pd.DataFrame(),
                                      pd.DataFrame(), 1000.0)
         assert decision.should_enter is False
@@ -400,14 +399,14 @@ class TestEntryEvaluator:
     @pytest.mark.asyncio
     async def test_entry_accepted_all_signals(
         self, config, tmp_db_path, mock_market_data, mock_sentiment,
-        mock_earnings, mock_fx,
+        mock_earnings,
     ) -> None:
         """All gates pass — entry should be approved."""
         mock_market_data.get_bid_ask.return_value = (9.98, 10.02)
         mock_market_data.get_spread_pct.return_value = 0.0003
 
         ev = _make_evaluator(config, tmp_db_path, mock_market_data,
-                             mock_sentiment, mock_earnings, mock_fx,
+                             mock_sentiment, mock_earnings,
                              signals=_good_signals())
         decision = await ev.evaluate("PLTR", "NASDAQ", pd.DataFrame(),
                                      pd.DataFrame(), 2000.0)

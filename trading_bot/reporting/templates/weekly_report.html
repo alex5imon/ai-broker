@@ -248,8 +248,8 @@
     </div>
     <div class="stat-box">
       <div class="label">Net P&amp;L</div>
-      <div class="value {% if period_metrics.net_pnl_gbp > 0 %}positive{% elif period_metrics.net_pnl_gbp < 0 %}negative{% else %}neutral{% endif %}">
-        &pound;{{ "%.2f"|format(period_metrics.net_pnl_gbp) }}
+      <div class="value {% if period_metrics.net_pnl_usd > 0 %}positive{% elif period_metrics.net_pnl_usd < 0 %}negative{% else %}neutral{% endif %}">
+        ${{ "%.2f"|format(period_metrics.net_pnl_usd) }}
       </div>
     </div>
     <div class="stat-box">
@@ -267,18 +267,18 @@
   <div class="metrics-grid">
     <div class="metric-card">
       <div class="label">Gross P&amp;L</div>
-      <div class="value {% if period_metrics.gross_pnl_gbp >= 0 %}positive{% else %}negative{% endif %}">
-        &pound;{{ "%.2f"|format(period_metrics.gross_pnl_gbp) }}
+      <div class="value {% if period_metrics.gross_pnl_usd >= 0 %}positive{% else %}negative{% endif %}">
+        ${{ "%.2f"|format(period_metrics.gross_pnl_usd) }}
       </div>
     </div>
     <div class="metric-card">
       <div class="label">Commissions</div>
-      <div class="value negative">&pound;{{ "%.2f"|format(period_metrics.commissions_gbp) }}</div>
+      <div class="value negative">${{ "%.2f"|format(period_metrics.commissions_usd) }}</div>
     </div>
     <div class="metric-card">
       <div class="label">Net P&amp;L</div>
-      <div class="value {% if period_metrics.net_pnl_gbp >= 0 %}positive{% else %}negative{% endif %}">
-        &pound;{{ "%.2f"|format(period_metrics.net_pnl_gbp) }}
+      <div class="value {% if period_metrics.net_pnl_usd >= 0 %}positive{% else %}negative{% endif %}">
+        ${{ "%.2f"|format(period_metrics.net_pnl_usd) }}
       </div>
     </div>
     <div class="metric-card">
@@ -287,11 +287,11 @@
     </div>
     <div class="metric-card">
       <div class="label">Avg Win</div>
-      <div class="value positive">&pound;{{ "%.2f"|format(period_metrics.avg_win) }}</div>
+      <div class="value positive">${{ "%.2f"|format(period_metrics.avg_win) }}</div>
     </div>
     <div class="metric-card">
       <div class="label">Avg Loss</div>
-      <div class="value negative">&pound;{{ "%.2f"|format(period_metrics.avg_loss) }}</div>
+      <div class="value negative">${{ "%.2f"|format(period_metrics.avg_loss) }}</div>
     </div>
     <div class="metric-card">
       <div class="label">Profit Factor</div>
@@ -309,23 +309,23 @@
 </section>
 
 <!-- MONTHLY TARGET COMPARISON (monthly only) -->
-{% if month_name is defined and target_low_gbp is defined %}
+{% if month_name is defined and target_low_usd is defined %}
 <section>
   <h2>Monthly Target Comparison</h2>
   <div class="metrics-grid">
     <div class="metric-card">
       <div class="label">Actual Net P&amp;L</div>
-      <div class="value {% if period_metrics.net_pnl_gbp >= 0 %}positive{% else %}negative{% endif %}">
-        &pound;{{ "%.2f"|format(period_metrics.net_pnl_gbp) }}
+      <div class="value {% if period_metrics.net_pnl_usd >= 0 %}positive{% else %}negative{% endif %}">
+        ${{ "%.2f"|format(period_metrics.net_pnl_usd) }}
       </div>
     </div>
     <div class="metric-card">
       <div class="label">Target (0.3%/day)</div>
-      <div class="value neutral">&pound;{{ "%.2f"|format(target_low_gbp) }}</div>
+      <div class="value neutral">${{ "%.2f"|format(target_low_usd) }}</div>
     </div>
     <div class="metric-card">
       <div class="label">Target (0.5%/day)</div>
-      <div class="value neutral">&pound;{{ "%.2f"|format(target_high_gbp) }}</div>
+      <div class="value neutral">${{ "%.2f"|format(target_high_usd) }}</div>
     </div>
     <div class="metric-card">
       <div class="label">Sharpe Ratio</div>
@@ -366,14 +366,14 @@
           <td class="positive">{{ day.wins }}</td>
           <td class="negative">{{ day.losses }}</td>
           <td>{{ "%.1f"|format((day.win_rate or 0) * 100) }}%</td>
-          <td class="{% if (day.gross_pnl_gbp or 0) >= 0 %}positive{% else %}negative{% endif %}">
-            &pound;{{ "%.2f"|format(day.gross_pnl_gbp or 0) }}
+          <td class="{% if (day.gross_pnl_usd or 0) >= 0 %}positive{% else %}negative{% endif %}">
+            ${{ "%.2f"|format(day.gross_pnl_usd or 0) }}
           </td>
-          <td>&pound;{{ "%.2f"|format(day.commissions_gbp or 0) }}</td>
-          <td class="{% if (day.net_pnl_gbp or 0) >= 0 %}positive{% else %}negative{% endif %}">
-            <strong>&pound;{{ "%.2f"|format(day.net_pnl_gbp or 0) }}</strong>
+          <td>${{ "%.2f"|format(day.commissions_usd or 0) }}</td>
+          <td class="{% if (day.net_pnl_usd or 0) >= 0 %}positive{% else %}negative{% endif %}">
+            <strong>${{ "%.2f"|format(day.net_pnl_usd or 0) }}</strong>
           </td>
-          <td>&pound;{{ "%.2f"|format(day.account_equity_gbp or 0) }}</td>
+          <td>${{ "%.2f"|format(day.account_equity_usd or 0) }}</td>
           <td>{{ day.lse_trades or 0 }}</td>
           <td>{{ day.us_trades or 0 }}</td>
         </tr>
@@ -387,13 +387,13 @@
   <div class="bar-chart">
     {% set max_abs_daily = namespace(val=0.01) %}
     {% for day in period_metrics.daily_summaries %}
-      {% set day_pnl = day.net_pnl_gbp or 0 %}
+      {% set day_pnl = day.net_pnl_usd or 0 %}
       {% if day_pnl|abs > max_abs_daily.val %}
         {% set max_abs_daily.val = day_pnl|abs %}
       {% endif %}
     {% endfor %}
     {% for day in period_metrics.daily_summaries %}
-      {% set day_pnl = day.net_pnl_gbp or 0 %}
+      {% set day_pnl = day.net_pnl_usd or 0 %}
     <div class="bar-row">
       <div class="bar-label">{{ day.date[5:] }}</div>
       <div class="bar-container">
@@ -402,7 +402,7 @@
              style="width: {{ "%.1f"|format(width_pct) }}%"></div>
       </div>
       <div class="bar-value {% if day_pnl >= 0 %}positive{% else %}negative{% endif %}">
-        &pound;{{ "%.2f"|format(day_pnl) }}
+        ${{ "%.2f"|format(day_pnl) }}
       </div>
     </div>
     {% endfor %}
@@ -417,11 +417,11 @@
   <div class="metrics-grid">
     <div class="metric-card">
       <div class="label">Best Day</div>
-      <div class="value positive">{{ period_metrics.best_day.date }} (&pound;{{ "%.2f"|format(period_metrics.best_day.net_pnl_gbp) }})</div>
+      <div class="value positive">{{ period_metrics.best_day.date }} (${{ "%.2f"|format(period_metrics.best_day.net_pnl_usd) }})</div>
     </div>
     <div class="metric-card">
       <div class="label">Worst Day</div>
-      <div class="value negative">{{ period_metrics.worst_day.date }} (&pound;{{ "%.2f"|format(period_metrics.worst_day.net_pnl_gbp) }})</div>
+      <div class="value negative">{{ period_metrics.worst_day.date }} (${{ "%.2f"|format(period_metrics.worst_day.net_pnl_usd) }})</div>
     </div>
   </div>
 </section>
@@ -454,11 +454,11 @@
           <td class="positive">{{ ts.wins }}</td>
           <td class="negative">{{ ts.losses }}</td>
           <td>{{ "%.1f"|format(ts.win_rate * 100) }}%</td>
-          <td class="{% if ts.net_pnl_gbp >= 0 %}positive{% else %}negative{% endif %}">
-            <strong>&pound;{{ "%.2f"|format(ts.net_pnl_gbp) }}</strong>
+          <td class="{% if ts.net_pnl_usd >= 0 %}positive{% else %}negative{% endif %}">
+            <strong>${{ "%.2f"|format(ts.net_pnl_usd) }}</strong>
           </td>
-          <td class="{% if ts.avg_pnl_gbp >= 0 %}positive{% else %}negative{% endif %}">
-            &pound;{{ "%.2f"|format(ts.avg_pnl_gbp) }}
+          <td class="{% if ts.avg_pnl_usd >= 0 %}positive{% else %}negative{% endif %}">
+            ${{ "%.2f"|format(ts.avg_pnl_usd) }}
           </td>
         </tr>
         {% endfor %}
@@ -471,20 +471,20 @@
   <div class="bar-chart">
     {% set max_abs_ticker = namespace(val=0.01) %}
     {% for ts in ticker_stats %}
-      {% if ts.net_pnl_gbp|abs > max_abs_ticker.val %}
-        {% set max_abs_ticker.val = ts.net_pnl_gbp|abs %}
+      {% if ts.net_pnl_usd|abs > max_abs_ticker.val %}
+        {% set max_abs_ticker.val = ts.net_pnl_usd|abs %}
       {% endif %}
     {% endfor %}
     {% for ts in ticker_stats %}
     <div class="bar-row">
       <div class="bar-label">{{ ts.ticker }}</div>
       <div class="bar-container">
-        {% set width_pct = (ts.net_pnl_gbp|abs / max_abs_ticker.val * 100) if max_abs_ticker.val > 0 else 0 %}
-        <div class="bar-fill {% if ts.net_pnl_gbp >= 0 %}positive-bar{% else %}negative-bar{% endif %}"
+        {% set width_pct = (ts.net_pnl_usd|abs / max_abs_ticker.val * 100) if max_abs_ticker.val > 0 else 0 %}
+        <div class="bar-fill {% if ts.net_pnl_usd >= 0 %}positive-bar{% else %}negative-bar{% endif %}"
              style="width: {{ "%.1f"|format(width_pct) }}%"></div>
       </div>
-      <div class="bar-value {% if ts.net_pnl_gbp >= 0 %}positive{% else %}negative{% endif %}">
-        &pound;{{ "%.2f"|format(ts.net_pnl_gbp) }}
+      <div class="bar-value {% if ts.net_pnl_usd >= 0 %}positive{% else %}negative{% endif %}">
+        ${{ "%.2f"|format(ts.net_pnl_usd) }}
       </div>
     </div>
     {% endfor %}
@@ -497,7 +497,7 @@
 <section>
   <h2>Equity Curve (Last {{ equity_curve|length }} Days)</h2>
   <div class="chart-container">
-    {% set eq_values = equity_curve|map(attribute='account_equity_gbp')|list %}
+    {% set eq_values = equity_curve|map(attribute='account_equity_usd')|list %}
     {% set min_eq = eq_values|min %}
     {% set max_eq = eq_values|max %}
     {% set eq_range = max_eq - min_eq if max_eq != min_eq else 1 %}
@@ -519,27 +519,27 @@
             stroke="#30363d" stroke-width="1"/>
 
       <text x="{{ pad_left - 5 }}" y="{{ pad_top + 4 }}" fill="#8b949e" font-size="10" text-anchor="end">
-        &pound;{{ "%.0f"|format(max_eq) }}
+        ${{ "%.0f"|format(max_eq) }}
       </text>
       <text x="{{ pad_left - 5 }}" y="{{ chart_h - pad_bottom + 4 }}" fill="#8b949e" font-size="10" text-anchor="end">
-        &pound;{{ "%.0f"|format(min_eq) }}
+        ${{ "%.0f"|format(min_eq) }}
       </text>
       {% set mid_eq = (min_eq + max_eq) / 2 %}
       <text x="{{ pad_left - 5 }}" y="{{ pad_top + plot_h / 2 + 4 }}" fill="#8b949e" font-size="10" text-anchor="end">
-        &pound;{{ "%.0f"|format(mid_eq) }}
+        ${{ "%.0f"|format(mid_eq) }}
       </text>
       <line x1="{{ pad_left }}" y1="{{ pad_top + plot_h / 2 }}" x2="{{ chart_w - pad_right }}" y2="{{ pad_top + plot_h / 2 }}"
             stroke="#21262d" stroke-width="1" stroke-dasharray="4,4"/>
 
       <polyline fill="none" stroke="#58a6ff" stroke-width="2" stroke-linejoin="round"
-        points="{% for ec in equity_curve %}{% set x = pad_left + loop.index0 * x_step %}{% set y = pad_top + plot_h - ((ec.account_equity_gbp - min_eq) / eq_range * plot_h) %}{{ "%.1f"|format(x) }},{{ "%.1f"|format(y) }}{% if not loop.last %} {% endif %}{% endfor %}"/>
+        points="{% for ec in equity_curve %}{% set x = pad_left + loop.index0 * x_step %}{% set y = pad_top + plot_h - ((ec.account_equity_usd - min_eq) / eq_range * plot_h) %}{{ "%.1f"|format(x) }},{{ "%.1f"|format(y) }}{% if not loop.last %} {% endif %}{% endfor %}"/>
 
       <polygon fill="rgba(88, 166, 255, 0.08)"
-        points="{{ pad_left }},{{ chart_h - pad_bottom }} {% for ec in equity_curve %}{% set x = pad_left + loop.index0 * x_step %}{% set y = pad_top + plot_h - ((ec.account_equity_gbp - min_eq) / eq_range * plot_h) %}{{ "%.1f"|format(x) }},{{ "%.1f"|format(y) }} {% endfor %}{{ "%.1f"|format(pad_left + (n_points - 1) * x_step) }},{{ chart_h - pad_bottom }}"/>
+        points="{{ pad_left }},{{ chart_h - pad_bottom }} {% for ec in equity_curve %}{% set x = pad_left + loop.index0 * x_step %}{% set y = pad_top + plot_h - ((ec.account_equity_usd - min_eq) / eq_range * plot_h) %}{{ "%.1f"|format(x) }},{{ "%.1f"|format(y) }} {% endfor %}{{ "%.1f"|format(pad_left + (n_points - 1) * x_step) }},{{ chart_h - pad_bottom }}"/>
 
       {% for ec in equity_curve %}
         {% set x = pad_left + loop.index0 * x_step %}
-        {% set y = pad_top + plot_h - ((ec.account_equity_gbp - min_eq) / eq_range * plot_h) %}
+        {% set y = pad_top + plot_h - ((ec.account_equity_usd - min_eq) / eq_range * plot_h) %}
         <circle cx="{{ "%.1f"|format(x) }}" cy="{{ "%.1f"|format(y) }}" r="3" fill="#58a6ff" stroke="#0d1117" stroke-width="1"/>
       {% endfor %}
 
@@ -573,11 +573,11 @@
     </div>
     <div class="metric-card">
       <div class="label">Equity</div>
-      <div class="value">&pound;{{ "%.2f"|format(account_equity_gbp) }}</div>
+      <div class="value">${{ "%.2f"|format(account_equity_usd) }}</div>
     </div>
     <div class="metric-card">
       <div class="label">Equity Target</div>
-      <div class="value">&pound;{{ "%.0f"|format(phase_progress.equity_target or 0) }}</div>
+      <div class="value">${{ "%.0f"|format(phase_progress.equity_target or 0) }}</div>
     </div>
     <div class="metric-card">
       <div class="label">Days in Phase</div>

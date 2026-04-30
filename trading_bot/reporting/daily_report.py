@@ -94,7 +94,7 @@ class ReportGenerator:
         # Phase progress (use latest equity from summaries or 0)
         current_equity: float = 0.0
         if equity_curve:
-            current_equity = equity_curve[-1].get("account_equity_gbp", 0.0)
+            current_equity = equity_curve[-1].get("account_equity_usd", 0.0)
 
         phase: int = self._config.get_phase().value
         phase_progress: dict[str, Any] = self._performance.get_phase_progress(
@@ -118,7 +118,7 @@ class ReportGenerator:
             "phase_progress": phase_progress,
             "sharpe_ratio": round(sharpe_ratio, 2),
             "open_positions": open_positions,
-            "account_equity_gbp": current_equity,
+            "account_equity_usd": current_equity,
             "generated_at": datetime.now(TZ_EASTERN).strftime("%Y-%m-%d %H:%M:%S ET"),
         }
 
@@ -217,7 +217,7 @@ class ReportGenerator:
         phase: int = self._config.get_phase().value
         current_equity: float = 0.0
         if equity_curve:
-            current_equity = equity_curve[-1].get("account_equity_gbp", 0.0)
+            current_equity = equity_curve[-1].get("account_equity_usd", 0.0)
 
         phase_progress: dict[str, Any] = self._performance.get_phase_progress(
             current_equity, phase
@@ -240,9 +240,9 @@ class ReportGenerator:
             "equity_curve": equity_curve,
             "sharpe_ratio": round(sharpe_ratio, 2),
             "phase_progress": phase_progress,
-            "target_low_gbp": round(target_low, 2),
-            "target_high_gbp": round(target_high, 2),
-            "account_equity_gbp": current_equity,
+            "target_low_usd": round(target_low, 2),
+            "target_high_usd": round(target_high, 2),
+            "account_equity_usd": current_equity,
             "generated_at": datetime.now(TZ_EASTERN).strftime("%Y-%m-%d %H:%M:%S ET"),
         }
 
@@ -269,7 +269,7 @@ class ReportGenerator:
         report_date: str,
         assessments: list[dict[str, Any]],
         portfolio: list[dict[str, Any]],
-        account_equity_gbp: float,
+        account_equity_usd: float,
         dry_run: bool = True,
         log_highlights: list[dict[str, str]] | None = None,
     ) -> str:
@@ -283,8 +283,8 @@ class ReportGenerator:
             List of assessment dicts (from DB or PositionAssessment objects).
         portfolio:
             List of IB portfolio position dicts.
-        account_equity_gbp:
-            Current account equity in GBP.
+        account_equity_usd:
+            Current account equity in USD.
         dry_run:
             Whether this was a dry-run execution.
         log_highlights:
@@ -313,7 +313,7 @@ class ReportGenerator:
         context: dict[str, Any] = {
             "date": report_date,
             "dry_run": dry_run,
-            "account_equity_gbp": account_equity_gbp,
+            "account_equity_usd": account_equity_usd,
             "portfolio": portfolio,
             "assessments": assessments,
             "total_unrealised_pnl": total_unrealised,
@@ -379,7 +379,7 @@ def _fmt_pct(value: float | None, decimals: int = 1) -> str:
 
 
 def _fmt_money(value: float | None) -> str:
-    """Format a monetary value in GBP."""
+    """Format a monetary value in USD."""
     if value is None:
         return "N/A"
     return f"\u00a3{value:,.2f}"

@@ -22,7 +22,6 @@ from trading_bot.constants import (
 
 if TYPE_CHECKING:
     from trading_bot.config import Config
-    from trading_bot.data.fx import FXManager
     from trading_bot.data.market_data import MarketDataManager
     from trading_bot.gateway import GatewayConnection
     from trading_bot.notifications import Notifier
@@ -48,18 +47,16 @@ class RiskManager:
         self,
         config: Config,
         db_path: str,
-        fx: FXManager,
         notifier: Notifier,
     ) -> None:
         self._config: Config = config
         self._db_path: str = db_path
-        self._fx: FXManager = fx
         self._notifier: Notifier = notifier
 
         # Daily counters (reset each trading day via reset_daily)
-        self._daily_pnl_gbp: float = 0.0
-        self._daily_gross_pnl_gbp: float = 0.0
-        self._daily_commissions_gbp: float = 0.0
+        self._daily_pnl_usd: float = 0.0
+        self._daily_gross_pnl_usd: float = 0.0
+        self._daily_commissions_usd: float = 0.0
         self._trade_count: int = 0
         self._trading_day: date = datetime.now(tz=ET).date()
 
@@ -147,20 +144,20 @@ class RiskManager:
 
     def check_daily_loss_limit(
         self,
-        current_pnl_gbp: float,
-        account_equity_gbp: float,
+        current_pnl_usd: float,
+        account_equity_usd: float,
     ) -> bool:
         """Return ``True`` if the daily loss limit (-1% of equity) is breached.
 
         The caller should supply realised + unrealised P&L for the day.
         """
-        limit: float = account_equity_gbp * self._config.daily_loss_limit_pct
-        breached: bool = current_pnl_gbp <= -limit
+        limit: float = account_equity_usd * self._config.daily_loss_limit_pct
+        breached: bool = current_pnl_usd <= -limit
         if breached and not self._daily_loss_limit_hit:
             self._daily_loss_limit_hit = True
             logger.warning(
-                "Daily loss limit breached: P&L GBP%.2f <= -%.2f (%.1f%% of equity)",
-                current_pnl_gbp,
+                "Daily loss limit breached: P&L USD%.2f <= -%.2f (%.1f%% of equity)",
+                current_pnl_usd,
                 limit,
                 self._config.daily_loss_limit_pct * 100,
             )
@@ -313,7 +310,7 @@ class RiskManager:
         max_trades: int = self._config.get_max_daily_trades()
         return self._trade_count >= max_trades
 
-    def check_drawdown_breaker(self, account_equity_gbp: float) -> bool:
+    def check_drawdown_breaker(self, account_equity_usd: float) -> bool:
         """Return ``True`` if 5-day rolling drawdown exceeds 5% from peak.
 
         Reads the last N days of equity from ``daily_summaries`` to find
@@ -324,21 +321,21 @@ class RiskManager:
         threshold_pct: float = self._config.drawdown_breaker_threshold
 
         peak_equity: float = self._get_rolling_peak_equity(
-            rolling_days, account_equity_gbp,
+            rolling_days, account_equity_usd,
         )
 
         if peak_equity <= 0:
             return False
 
-        drawdown_pct: float = (peak_equity - account_equity_gbp) / peak_equity
+        drawdown_pct: float = (peak_equity - account_equity_usd) / peak_equity
 
         if drawdown_pct >= threshold_pct:
             logger.warning(
                 "Drawdown breaker triggered: %.2f%% from 5-day peak "
-                "(peak=GBP%.2f, current=GBP%.2f)",
+                "(peak=USD%.2f, current=USD%.2f)",
                 drawdown_pct * 100,
                 peak_equity,
-                account_equity_gbp,
+                account_equity_usd,
             )
             self._activate_drawdown_breaker(drawdown_pct)
             return True
@@ -358,7 +355,7 @@ class RiskManager:
                     date.today() - timedelta(days=rolling_days)
                 ).isoformat()
                 rows = conn.execute(
-                    "SELECT account_equity_gbp FROM daily_summaries "
+                    "SELECT account_equity_usd FROM daily_summaries "
                     "WHERE date >= ? ORDER BY date DESC",
                     (cutoff,),
                 ).fetchall()
@@ -527,8 +524,8 @@ class RiskManager:
             if daily_commissions > 0 and self._trade_count >= 3:
                 self._commission_stop_active = True
                 logger.warning(
-                    "Commission budget stop: commissions GBP%.2f with "
-                    "non-positive gross P&L GBP%.2f",
+                    "Commission budget stop: commissions USD%.2f with "
+                    "non-positive gross P&L USD%.2f",
                     daily_commissions,
                     daily_gross_pnl,
                 )
@@ -540,8 +537,8 @@ class RiskManager:
         if ratio >= stop_ratio:
             self._commission_stop_active = True
             logger.warning(
-                "Commission budget STOP: ratio %.1f%% (commissions GBP%.2f / "
-                "gross P&L GBP%.2f)",
+                "Commission budget STOP: ratio %.1f%% (commissions USD%.2f / "
+                "gross P&L USD%.2f)",
                 ratio * 100,
                 daily_commissions,
                 daily_gross_pnl,
@@ -566,25 +563,25 @@ class RiskManager:
     # Trade recording
     # ------------------------------------------------------------------
 
-    def record_trade(self, pnl_gbp: float, commission_gbp: float) -> None:
+    def record_trade(self, pnl_usd: float, commission_usd: float) -> None:
         """Record a completed trade for daily tracking."""
         self._trade_count += 1
-        self._daily_pnl_gbp += pnl_gbp
-        self._daily_gross_pnl_gbp += abs(pnl_gbp) + commission_gbp
-        self._daily_commissions_gbp += commission_gbp
+        self._daily_pnl_usd += pnl_usd
+        self._daily_gross_pnl_usd += abs(pnl_usd) + commission_usd
+        self._daily_commissions_usd += commission_usd
 
         logger.info(
-            "Trade recorded: P&L GBP%.2f, commission GBP%.2f "
-            "(daily: count=%d, net_pnl=GBP%.2f)",
-            pnl_gbp,
-            commission_gbp,
+            "Trade recorded: P&L USD%.2f, commission USD%.2f "
+            "(daily: count=%d, net_pnl=USD%.2f)",
+            pnl_usd,
+            commission_usd,
             self._trade_count,
-            self._daily_pnl_gbp,
+            self._daily_pnl_usd,
         )
 
         # Decrement recovery trades counter if drawdown breaker is active
         if self._drawdown_breaker_active and self._recovery_trades_remaining > 0:
-            if pnl_gbp > 0:
+            if pnl_usd > 0:
                 self._recovery_trades_remaining -= 1
                 logger.info(
                     "Drawdown recovery: %d profitable trades remaining "
@@ -602,9 +599,9 @@ class RiskManager:
 
     def reset_daily(self) -> None:
         """Reset daily counters (called at start of each trading day)."""
-        self._daily_pnl_gbp = 0.0
-        self._daily_gross_pnl_gbp = 0.0
-        self._daily_commissions_gbp = 0.0
+        self._daily_pnl_usd = 0.0
+        self._daily_gross_pnl_usd = 0.0
+        self._daily_commissions_usd = 0.0
         self._trade_count = 0
         self._trading_day = datetime.now(tz=ET).date()
         self._daily_loss_limit_hit = False
@@ -684,12 +681,12 @@ class RiskManager:
         return self._pause_reason
 
     @property
-    def daily_pnl_gbp(self) -> float:
-        return self._daily_pnl_gbp
+    def daily_pnl_usd(self) -> float:
+        return self._daily_pnl_usd
 
     @property
-    def daily_commissions_gbp(self) -> float:
-        return self._daily_commissions_gbp
+    def daily_commissions_usd(self) -> float:
+        return self._daily_commissions_usd
 
     @property
     def trade_count(self) -> int:

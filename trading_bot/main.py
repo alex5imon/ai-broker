@@ -35,7 +35,6 @@ from trading_bot.constants import (
     TZ_UTC,
 )
 from trading_bot.data.earnings import EarningsCalendar
-from trading_bot.data.fx import FXManager
 from trading_bot.data.market_data import MarketDataManager
 from trading_bot.data.sentiment import SentimentAnalyzer
 from trading_bot.db import repository as repo
@@ -103,7 +102,6 @@ class TradingBot:
         self._gateway: GatewayConnection = GatewayConnection(raw, self._notifier)
 
         # --- Data layer ---
-        self._fx: FXManager = FXManager(self._gateway, raw)
         self._market_data: MarketDataManager = MarketDataManager(
             self._gateway, raw, self._notifier
         )
@@ -118,10 +116,9 @@ class TradingBot:
             sentiment=self._sentiment,
             earnings=self._earnings,
             market_data=self._market_data,
-            fx=self._fx,
             db_path=db_path,
         )
-        self._exit_manager: ExitManager = ExitManager(config, self._market_data, self._fx)
+        self._exit_manager: ExitManager = ExitManager(config, self._market_data)
 
         # --- Execution layer ---
         self._order_manager: OrderManager = OrderManager(
@@ -133,7 +130,6 @@ class TradingBot:
         self._risk_manager: RiskManager = RiskManager(
             config=config,
             db_path=db_path,
-            fx=self._fx,
             notifier=self._notifier,
         )
 
@@ -272,13 +268,7 @@ class TradingBot:
             return
 
         try:
-            # --- 4. FX refresh ---
-            try:
-                await self._fx.refresh()
-            except Exception:
-                logger.warning("FX refresh failed — using cached rate", exc_info=True)
-
-            # --- 5. State recovery (reconcile broker vs SQLite) ---
+            # --- 4. State recovery (reconcile broker vs SQLite) ---
             try:
                 recovery_result = await self._state_recovery.recover()
                 logger.info("State recovery: %s", recovery_result.summary())
@@ -559,13 +549,13 @@ class TradingBot:
             watchlist: list[str] = (
                 self._active_watchlist.get(market) or self._config.get_watchlist(market)
             )
-            # NOTE: ``_get_account_equity_gbp`` returns USD on Alpaca
+            # NOTE: ``_get_account_equity_usd`` returns USD on Alpaca
             # (NetLiquidation is reported in account currency = USD).
             # The function name is a legacy IBKR-era misnomer pending a
             # broader rename that also touches the daily_summaries DB
             # column. Pass through as USD here for the new
             # StrategyManager API.
-            account_equity_usd: float = await self._get_account_equity_gbp()
+            account_equity_usd: float = await self._get_account_equity_usd()
             await self._strategy_manager.scan_for_entries(
                 watchlist=watchlist,
                 get_5min_bars=self._get_5min_bars,
@@ -587,11 +577,11 @@ class TradingBot:
         if not watchlist:
             return
 
-        account_equity_gbp: float = await self._get_account_equity_gbp()
+        account_equity_usd: float = await self._get_account_equity_usd()
 
         # Update risk manager with today's P&L
         self._risk_manager.check_daily_loss_limit(
-            self._risk_manager.daily_pnl_gbp, account_equity_gbp
+            self._risk_manager.daily_pnl_usd, account_equity_usd
         )
 
         exchange_str: str = "US"
@@ -641,7 +631,7 @@ class TradingBot:
                     exchange=exchange_str,
                     df_5min=df_5min,
                     df_daily=df_daily,
-                    account_equity_gbp=account_equity_gbp,
+                    account_equity_usd=account_equity_usd,
                 )
             except Exception:
                 logger.warning("Entry evaluation error for %s", ticker, exc_info=True)
@@ -1092,7 +1082,7 @@ class TradingBot:
     # Phase transition check
     # ------------------------------------------------------------------
 
-    async def _check_phase_transition(self, account_equity_gbp: float) -> None:
+    async def _check_phase_transition(self, account_equity_usd: float) -> None:
         """Daily phase transition check using equity and win-rate metrics."""
         current_phase: Phase = self._config.get_phase()
         raw_cfg: dict[str, Any] = self._config._raw
@@ -1115,28 +1105,28 @@ class TradingBot:
             p2_cfg: dict[str, Any] = (
                 raw_cfg.get("phases", {}).get("phase1_to_phase2", {})
             )
-            eq_threshold: float = float(p2_cfg.get("equity_gbp", 5000))
+            eq_threshold: float = float(p2_cfg.get("equity_usd", 5000))
             min_days: int = int(p2_cfg.get("min_trading_days", 40))
             min_wr: float = float(p2_cfg.get("min_win_rate_last_n", 0.52))
             wr_lookback: int = int(p2_cfg.get("win_rate_lookback_trades", 20))
 
-            if account_equity_gbp >= eq_threshold and trading_days >= min_days:
+            if account_equity_usd >= eq_threshold and trading_days >= min_days:
                 recent_wr: float = self._calc_recent_win_rate(wr_lookback)
                 if recent_wr >= min_wr:
                     logger.info(
                         "Phase promotion: MICRO -> SMALL (equity=£%.2f, wr=%.1f%%)",
-                        account_equity_gbp, recent_wr * 100,
+                        account_equity_usd, recent_wr * 100,
                     )
                     self._record_phase_transition(
                         from_phase=Phase.MICRO.value,
                         to_phase=Phase.SMALL.value,
-                        reason=f"equity={account_equity_gbp:.2f}, win_rate={recent_wr:.3f}",
-                        equity=account_equity_gbp,
+                        reason=f"equity={account_equity_usd:.2f}, win_rate={recent_wr:.3f}",
+                        equity=account_equity_usd,
                     )
                     await self._notifier.phase_transition(
                         from_phase=Phase.MICRO.value,
                         to_phase=Phase.SMALL.value,
-                        equity=account_equity_gbp,
+                        equity=account_equity_usd,
                     )
                     self._config._phase = None  # invalidate cache
 
@@ -1145,28 +1135,28 @@ class TradingBot:
             p3_cfg: dict[str, Any] = (
                 raw_cfg.get("phases", {}).get("phase2_to_phase3", {})
             )
-            eq_threshold = float(p3_cfg.get("equity_gbp", 20000))
+            eq_threshold = float(p3_cfg.get("equity_usd", 20000))
             min_days = int(p3_cfg.get("min_trading_days", 60))
             min_wr = float(p3_cfg.get("min_win_rate_last_n", 0.55))
             wr_lookback = int(p3_cfg.get("win_rate_lookback_trades", 40))
 
-            if account_equity_gbp >= eq_threshold and trading_days >= min_days:
+            if account_equity_usd >= eq_threshold and trading_days >= min_days:
                 recent_wr = self._calc_recent_win_rate(wr_lookback)
                 if recent_wr >= min_wr:
                     logger.info(
                         "Phase promotion: SMALL -> FULL (equity=£%.2f, wr=%.1f%%)",
-                        account_equity_gbp, recent_wr * 100,
+                        account_equity_usd, recent_wr * 100,
                     )
                     self._record_phase_transition(
                         from_phase=Phase.SMALL.value,
                         to_phase=Phase.FULL.value,
-                        reason=f"equity={account_equity_gbp:.2f}, win_rate={recent_wr:.3f}",
-                        equity=account_equity_gbp,
+                        reason=f"equity={account_equity_usd:.2f}, win_rate={recent_wr:.3f}",
+                        equity=account_equity_usd,
                     )
                     await self._notifier.phase_transition(
                         from_phase=Phase.SMALL.value,
                         to_phase=Phase.FULL.value,
-                        equity=account_equity_gbp,
+                        equity=account_equity_usd,
                     )
                     self._config._phase = None
 
@@ -1179,47 +1169,47 @@ class TradingBot:
 
         if current_phase == Phase.SMALL:
             p2_threshold: float = float(
-                raw_cfg.get("phases", {}).get("phase1_to_phase2", {}).get("equity_gbp", 5000)
+                raw_cfg.get("phases", {}).get("phase1_to_phase2", {}).get("equity_usd", 5000)
             )
             demotion_threshold: float = p2_threshold * demotion_pct
-            if account_equity_gbp < demotion_threshold:
+            if account_equity_usd < demotion_threshold:
                 logger.warning(
                     "Phase demotion: SMALL -> MICRO (equity=£%.2f < £%.2f)",
-                    account_equity_gbp, demotion_threshold,
+                    account_equity_usd, demotion_threshold,
                 )
                 self._record_phase_transition(
                     from_phase=Phase.SMALL.value,
                     to_phase=Phase.MICRO.value,
-                    reason=f"demotion: equity={account_equity_gbp:.2f}",
-                    equity=account_equity_gbp,
+                    reason=f"demotion: equity={account_equity_usd:.2f}",
+                    equity=account_equity_usd,
                 )
                 await self._notifier.phase_transition(
                     from_phase=Phase.SMALL.value,
                     to_phase=Phase.MICRO.value,
-                    equity=account_equity_gbp,
+                    equity=account_equity_usd,
                 )
                 self._config._phase = None
 
         elif current_phase == Phase.FULL:
             p3_threshold: float = float(
-                raw_cfg.get("phases", {}).get("phase2_to_phase3", {}).get("equity_gbp", 20000)
+                raw_cfg.get("phases", {}).get("phase2_to_phase3", {}).get("equity_usd", 20000)
             )
             demotion_threshold = p3_threshold * demotion_pct
-            if account_equity_gbp < demotion_threshold:
+            if account_equity_usd < demotion_threshold:
                 logger.warning(
                     "Phase demotion: FULL -> SMALL (equity=£%.2f < £%.2f)",
-                    account_equity_gbp, demotion_threshold,
+                    account_equity_usd, demotion_threshold,
                 )
                 self._record_phase_transition(
                     from_phase=Phase.FULL.value,
                     to_phase=Phase.SMALL.value,
-                    reason=f"demotion: equity={account_equity_gbp:.2f}",
-                    equity=account_equity_gbp,
+                    reason=f"demotion: equity={account_equity_usd:.2f}",
+                    equity=account_equity_usd,
                 )
                 await self._notifier.phase_transition(
                     from_phase=Phase.FULL.value,
                     to_phase=Phase.SMALL.value,
-                    equity=account_equity_gbp,
+                    equity=account_equity_usd,
                 )
                 self._config._phase = None
 
@@ -1230,7 +1220,7 @@ class TradingBot:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 """
-                SELECT pnl_gbp FROM trades
+                SELECT pnl_usd FROM trades
                 WHERE exit_time IS NOT NULL
                 ORDER BY exit_time DESC
                 LIMIT ?
@@ -1240,7 +1230,7 @@ class TradingBot:
             conn.close()
             if not rows:
                 return 0.0
-            wins: int = sum(1 for r in rows if (r["pnl_gbp"] or 0) > 0)
+            wins: int = sum(1 for r in rows if (r["pnl_usd"] or 0) > 0)
             return wins / len(rows)
         except Exception:
             logger.warning("Win rate calculation failed", exc_info=True)
@@ -1265,7 +1255,7 @@ class TradingBot:
                     "from_phase": from_phase,
                     "to_phase": to_phase,
                     "direction": direction,
-                    "account_equity_gbp": equity,
+                    "account_equity_usd": equity,
                     "metrics_json": json.dumps({"reason": reason}),
                     "reason": reason,
                 },
@@ -1391,7 +1381,7 @@ class TradingBot:
         if now_et.time() < check_after:
             return
 
-        equity: float = await self._get_account_equity_gbp()
+        equity: float = await self._get_account_equity_usd()
         if equity > 0:
             await self._check_phase_transition(equity)
         flags["phase_check_done"] = True
@@ -1424,7 +1414,7 @@ class TradingBot:
     async def _save_daily_summary(self, today: date) -> bool:
         """Compute and persist daily metrics, then send a summary notification."""
         today_str: str = today.isoformat()
-        equity: float = await self._get_account_equity_gbp()
+        equity: float = await self._get_account_equity_usd()
 
         try:
             metrics: dict[str, Any] = self._performance.calculate_daily_metrics(today_str)
@@ -1437,14 +1427,14 @@ class TradingBot:
             "total_trades": metrics.get("total_trades", 0),
             "wins": metrics.get("wins", 0),
             "losses": metrics.get("losses", 0),
-            "gross_pnl_gbp": metrics.get("gross_pnl_gbp", 0.0),
-            "commissions_gbp": metrics.get("commissions_gbp", 0.0),
-            "net_pnl_gbp": metrics.get("net_pnl_gbp", 0.0),
-            "account_equity_gbp": equity,
+            "gross_pnl_usd": metrics.get("gross_pnl_usd", 0.0),
+            "commissions_usd": metrics.get("commissions_usd", 0.0),
+            "net_pnl_usd": metrics.get("net_pnl_usd", 0.0),
+            "account_equity_usd": equity,
             "max_drawdown_pct": metrics.get("max_drawdown_pct"),
             "win_rate": metrics.get("win_rate"),
-            "avg_win_gbp": metrics.get("avg_win"),
-            "avg_loss_gbp": metrics.get("avg_loss"),
+            "avg_win_usd": metrics.get("avg_win"),
+            "avg_loss_usd": metrics.get("avg_loss"),
             "profit_factor": metrics.get("profit_factor"),
             "phase": self._config.get_phase().value,
             "lse_trades": metrics.get("lse_trades", 0),
@@ -1461,14 +1451,14 @@ class TradingBot:
             conn.close()
             saved = True
             logger.info("Daily summary saved for %s (trades=%d, net_pnl=£%.2f)",
-                        today_str, summary["total_trades"], summary["net_pnl_gbp"])
+                        today_str, summary["total_trades"], summary["net_pnl_usd"])
         except Exception:
             logger.exception("Failed to save daily summary for %s", today_str)
 
         try:
             await self._notifier.daily_summary(
                 trades=summary["total_trades"],
-                net_pnl=summary["net_pnl_gbp"],
+                net_pnl=summary["net_pnl_usd"],
                 win_rate=summary.get("win_rate") or 0.0,
             )
         except Exception:
@@ -1487,15 +1477,15 @@ class TradingBot:
     # Utility helpers
     # ------------------------------------------------------------------
 
-    async def _get_account_equity_gbp(self) -> float:
-        """Return account NetLiquidation in GBP; 0.0 on failure."""
+    async def _get_account_equity_usd(self) -> float:
+        """Return account NetLiquidation in USD; 0.0 on failure."""
         try:
             summary: dict[str, Any] = await self._gateway.get_account_summary()
             equity_str: str | None = summary.get("NetLiquidation")
             if equity_str:
                 return float(equity_str)
         except Exception:
-            logger.warning("get_account_equity_gbp failed", exc_info=True)
+            logger.warning("get_account_equity_usd failed", exc_info=True)
         return 0.0
 
     async def _refresh_phase_from_equity(self) -> None:
@@ -1506,13 +1496,13 @@ class TradingBot:
         always pinned MICRO. We reset the cache and re-resolve with
         live equity so per-tick phase-aware accessors match reality.
         """
-        equity_usd: float = await self._get_account_equity_gbp()
+        equity_usd: float = await self._get_account_equity_usd()
         if equity_usd <= 0:
             return
 
         prior: Phase | None = getattr(self._config, "_phase", None)
         self._config._phase = None
-        new_phase: Phase = self._config.get_phase(equity_gbp=equity_usd)
+        new_phase: Phase = self._config.get_phase(equity_usd=equity_usd)
         if prior is not None and prior != new_phase:
             logger.info(
                 "Phase refresh: %s -> %s (equity=$%.2f)",

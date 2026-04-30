@@ -9,7 +9,7 @@
 # Account Settings
 # -----------------------------------------------------------------------------
 account:
-  base_currency: "GBP"
+  base_currency: "USD"
   trading_mode: "live"              # 'live' or 'backtest'
   phase_override: null              # Set to 0, 1, 2, or 3 to force a phase (null = auto-detect)
 
@@ -419,13 +419,6 @@ notifications:
   rate_limit_per_minute: 5
 
 # -----------------------------------------------------------------------------
-# FX
-# -----------------------------------------------------------------------------
-fx:
-  refresh_interval_seconds: 300   # 5 min (uses free API, not broker)
-  fallback_gbp_usd: 1.27         # Used if external FX API unavailable
-
-# -----------------------------------------------------------------------------
 # Phase 0 - Portfolio Cleanup
 # -----------------------------------------------------------------------------
 phase0:
@@ -453,7 +446,7 @@ phase0:
 # -----------------------------------------------------------------------------
 phases:
   phase1_to_phase2:
-    equity_gbp: 5000
+    equity_usd: 5000
     min_trading_days: 40
     min_win_rate_last_n: 0.52
     win_rate_lookback_trades: 20
@@ -461,7 +454,7 @@ phases:
     max_loss_limit_breaches_last_n: 0
     loss_breach_lookback_days: 20
   phase2_to_phase3:
-    equity_gbp: 20000
+    equity_usd: 20000
     min_trading_days: 60
     min_win_rate_last_n: 0.55
     win_rate_lookback_trades: 40

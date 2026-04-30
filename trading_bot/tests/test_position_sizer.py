@@ -17,9 +17,9 @@ from trading_bot.execution.position_sizer import PositionSize, PositionSizer
 
 
 @pytest.fixture
-def sizer(config: Config, mock_fx) -> PositionSizer:
-    """PositionSizer with GBP/USD=1.25."""
-    return PositionSizer(config, mock_fx)
+def sizer(config: Config) -> PositionSizer:
+    """PositionSizer for USD-only Alpaca account."""
+    return PositionSizer(config)
 
 
 # ---------------------------------------------------------------------------
@@ -29,19 +29,20 @@ def sizer(config: Config, mock_fx) -> PositionSizer:
 
 class TestBasicSizing:
     def test_basic_sizing_us(self, sizer: PositionSizer) -> None:
-        """equity=£1000, risk=2% → £20 at risk. stop=$0.20 → ~125 shares."""
+        """equity=$1000, risk=2% → $20 at risk. stop=$0.20 → 100 shares
+        (capped at 40% × $1000 / $10 = 40 shares by max position rule)."""
         result = sizer.calculate(
             ticker="PLTR",
             exchange="NASDAQ",
             entry_price=10.00,
             stop_price=9.80,
-            account_equity_gbp=1000.0,
+            account_equity_usd=1000.0,
             sentiment_score=0.2,
             atr_rank=50.0,
         )
         assert result.is_valid
         assert result.shares > 0
-        assert 50 <= result.shares <= 300
+        assert 30 <= result.shares <= 300
 
     def test_sizing_capped_by_max_position(self, sizer: PositionSizer) -> None:
         """Very tight stop → enormous shares; should be capped at 40% equity."""
@@ -50,13 +51,13 @@ class TestBasicSizing:
             exchange="NASDAQ",
             entry_price=10.00,
             stop_price=9.999,
-            account_equity_gbp=1000.0,
+            account_equity_usd=1000.0,
             sentiment_score=0.2,
             atr_rank=50.0,
         )
         if result.is_valid:
-            position_value_gbp = result.position_value_gbp
-            assert position_value_gbp <= 1000.0 * 0.40 + 1
+            position_value_usd = result.position_value_usd
+            assert position_value_usd <= 1000.0 * 0.40 + 1
 
     def test_sizing_floored_by_min_position(self, sizer: PositionSizer) -> None:
         """Very wide stop → tiny position; should be rejected at minimum."""
@@ -65,7 +66,7 @@ class TestBasicSizing:
             exchange="NASDAQ",
             entry_price=10.00,
             stop_price=5.00,
-            account_equity_gbp=1000.0,
+            account_equity_usd=1000.0,
             sentiment_score=0.2,
             atr_rank=50.0,
         )
@@ -77,7 +78,7 @@ class TestBasicSizing:
             exchange="NASDAQ",
             entry_price=10.0,
             stop_price=10.0,
-            account_equity_gbp=1000.0,
+            account_equity_usd=1000.0,
             sentiment_score=0.2,
             atr_rank=50.0,
         )
@@ -95,13 +96,13 @@ class TestAdjustments:
         base = sizer.calculate(
             ticker="PLTR", exchange="NASDAQ",
             entry_price=10.0, stop_price=9.8,
-            account_equity_gbp=2000.0,
+            account_equity_usd=2000.0,
             sentiment_score=0.2, atr_rank=50.0,
         )
         high_vol = sizer.calculate(
             ticker="PLTR", exchange="NASDAQ",
             entry_price=10.0, stop_price=9.8,
-            account_equity_gbp=2000.0,
+            account_equity_usd=2000.0,
             sentiment_score=0.2, atr_rank=75.0,
         )
         if base.is_valid and high_vol.is_valid:
@@ -113,13 +114,13 @@ class TestAdjustments:
         with_sentiment = sizer.calculate(
             ticker="PLTR", exchange="NASDAQ",
             entry_price=10.0, stop_price=9.8,
-            account_equity_gbp=2000.0,
+            account_equity_usd=2000.0,
             sentiment_score=0.2, atr_rank=50.0,
         )
         no_sentiment = sizer.calculate(
             ticker="PLTR", exchange="NASDAQ",
             entry_price=10.0, stop_price=9.8,
-            account_equity_gbp=2000.0,
+            account_equity_usd=2000.0,
             sentiment_score=None, atr_rank=50.0,
         )
         if with_sentiment.is_valid and no_sentiment.is_valid:
@@ -130,13 +131,13 @@ class TestAdjustments:
         base = sizer.calculate(
             ticker="PLTR", exchange="NASDAQ",
             entry_price=10.0, stop_price=9.5,
-            account_equity_gbp=5000.0,
+            account_equity_usd=5000.0,
             sentiment_score=0.2, atr_rank=50.0,
         )
         reduced = sizer.calculate(
             ticker="PLTR", exchange="NASDAQ",
             entry_price=10.0, stop_price=9.5,
-            account_equity_gbp=5000.0,
+            account_equity_usd=5000.0,
             sentiment_score=None, atr_rank=75.0,
         )
         if base.is_valid and reduced.is_valid and base.shares > 10:
@@ -150,7 +151,7 @@ class TestAdjustments:
         result = sizer.calculate(
             ticker="PLTR", exchange="NASDAQ",
             entry_price=10.0, stop_price=9.8,
-            account_equity_gbp=2000.0,
+            account_equity_usd=2000.0,
             sentiment_score=None, atr_rank=75.0,
         )
         if result.is_valid:

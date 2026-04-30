@@ -15,7 +15,6 @@ from zoneinfo import ZoneInfo
 
 from trading_bot.config import Config
 from trading_bot.constants import TZ_EASTERN, ExitReason, HoldType
-from trading_bot.data.fx import FXManager
 from trading_bot.data.market_data import MarketDataManager
 from trading_bot.utils import coalesce
 
@@ -56,11 +55,9 @@ class ExitManager:
         self,
         config: Config,
         market_data: MarketDataManager,
-        fx: FXManager,
     ) -> None:
         self._config: Config = config
         self._market_data: MarketDataManager = market_data
-        self._fx: FXManager = fx
 
         # Cache exit-spread protection config
         self._spread_max_pct: float = float(

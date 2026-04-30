@@ -21,17 +21,17 @@ from trading_bot.constants import Phase
 class TestPhaseDetection:
     def test_phase1_auto_detect_below_threshold(self, config: Config) -> None:
         """Equity below Phase 2 threshold → Phase.MICRO."""
-        phase = config.get_phase(equity_gbp=4999.0)
+        phase = config.get_phase(equity_usd=4999.0)
         assert phase == Phase.MICRO
 
     def test_phase2_auto_detect_at_threshold(self, config: Config) -> None:
         """Equity at exactly £5000 → Phase.SMALL."""
-        phase = config.get_phase(equity_gbp=5000.0)
+        phase = config.get_phase(equity_usd=5000.0)
         assert phase == Phase.SMALL
 
     def test_phase3_auto_detect_at_threshold(self, config: Config) -> None:
         """Equity at exactly £20000 → Phase.FULL."""
-        phase = config.get_phase(equity_gbp=20000.0)
+        phase = config.get_phase(equity_usd=20000.0)
         assert phase == Phase.FULL
 
     def test_phase_override_forces_phase(self, raw_config: dict[str, Any]) -> None:
@@ -64,7 +64,7 @@ class TestPhaseDetection:
         assert cfg.get_phase() == Phase.MICRO
         # The fix path: invalidate and re-resolve with real equity.
         cfg._phase = None
-        assert cfg.get_phase(equity_gbp=25000.0) == Phase.FULL
+        assert cfg.get_phase(equity_usd=25000.0) == Phase.FULL
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +101,7 @@ class TestPhaseTransitionCriteria:
             d = (today - timedelta(days=offset_days + i)).isoformat()
             conn.execute(
                 """INSERT OR REPLACE INTO daily_summaries
-                   (date, account_equity_gbp, phase)
+                   (date, account_equity_usd, phase)
                    VALUES (?, ?, ?)""",
                 (d, equity, phase),
             )
@@ -124,15 +124,15 @@ class TestPhaseTransitionCriteria:
             conn.execute(
                 """INSERT INTO trades (ticker, exchange, currency, side,
                    entry_time, entry_price, quantity, exit_time, exit_reason,
-                   gross_pnl, net_pnl, pnl_gbp, fx_rate,
+                   gross_pnl, net_pnl, pnl_usd,
                    hold_type, phase)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 ("PLTR", "NASDAQ", "USD", "BUY",
                  (today - timedelta(days=i)).isoformat(),
                  10.0, 100,
                  (today - timedelta(days=i)).isoformat(),
                  "take_profit" if i < wins else "stop_loss",
-                 pnl, pnl, pnl, 1.25, "swing", 1),
+                 pnl, pnl, pnl, "swing", 1),
             )
         conn.commit()
 
@@ -150,7 +150,7 @@ class TestPhaseTransitionCriteria:
         conn = sqlite3.connect(tmp_db_path)
         # Equity check
         row = conn.execute(
-            "SELECT MAX(account_equity_gbp) FROM daily_summaries"
+            "SELECT MAX(account_equity_usd) FROM daily_summaries"
         ).fetchone()
         assert row[0] >= 5000.0
 
@@ -174,7 +174,7 @@ class TestPhaseTransitionCriteria:
     ) -> None:
         """Equity £4999 — below threshold, no promotion."""
         equity = 4999.0
-        p2_threshold = float(config._require("phases", "phase1_to_phase2", "equity_gbp"))
+        p2_threshold = float(config._require("phases", "phase1_to_phase2", "equity_usd"))
         assert equity < p2_threshold
 
     def test_phase1_not_promoted_insufficient_days(
@@ -225,7 +225,7 @@ class TestDemotion:
     def test_demotion_on_equity_drop(self, config: Config) -> None:
         """Phase 2, equity drops to £3999 (< 80% of £5000 threshold) → demoted."""
         p2_threshold = float(
-            config._require("phases", "phase1_to_phase2", "equity_gbp")
+            config._require("phases", "phase1_to_phase2", "equity_usd")
         )
         demotion_pct = float(
             config._get("phases", "demotion", "equity_pct_of_threshold")
@@ -238,7 +238,7 @@ class TestDemotion:
     def test_no_demotion_above_threshold(self, config: Config) -> None:
         """Equity at £4100 — above 80% of £5000 threshold (= £4000), no demotion."""
         p2_threshold = float(
-            config._require("phases", "phase1_to_phase2", "equity_gbp")
+            config._require("phases", "phase1_to_phase2", "equity_usd")
         )
         demotion_pct = float(
             config._get("phases", "demotion", "equity_pct_of_threshold")
