@@ -233,3 +233,66 @@ WHERE p.status = 'CLOSED' AND p.strategy_id IS NOT NULL AND p.strategy_id != 'un
 SELECT id, ticker, entry_time FROM trades
 WHERE exit_time IS NULL OR strategy_id IS NULL ORDER BY entry_time DESC LIMIT 20;
 ```
+
+## Lessons learned — Alpaca order behavior outside RTH
+
+Captured 2026-04-30 while iterating on `trading_bot/self_improve/flatten_orphans.py`
+to flatten the three orphan positions identified by Phase 1 reconcile.
+Each item below cost real cycles to discover — leave them here so the
+next operator does not re-learn them.
+
+### `held_for_orders` is enforced at submission time, regardless of TIF
+
+Submitting a flatten while a stop on the same symbol is in
+`PENDING_CANCEL` returns:
+
+```
+APIError: {
+  "code": 40310000,
+  "message": "insufficient qty available for order (requested: 1, available: 0)",
+  "existing_qty": "1",
+  "held_for_orders": "1",
+  "related_orders": ["<the pending-cancel stop id>"]
+}
+```
+
+This fires for `TimeInForce.DAY` AND for `TimeInForce.OPG`. OPG does not
+bypass the qty check — Alpaca validates `held_for_orders` at the
+`POST /v2/orders` endpoint, before the order ever reaches the auction
+queue. Don't reach for OPG as a workaround.
+
+### Stop-order cancellations stay in PENDING_CANCEL until the next open
+
+`DELETE /v2/orders/{id}` against a stop placed during a previous session
+returns `200` immediately, but the order's status sits at
+`PENDING_CANCEL` and the held qty stays reserved until the next
+opening cross. Polling with `GetOrdersRequest(status=OPEN)` will keep
+returning the same stop the entire pre-market window — there is no
+amount of waiting (within reason) that releases the qty before 09:30 ET.
+
+### `close_all_positions(cancel_orders=True)` is the broker-atomic flatten
+
+When the planned-flatten set exactly matches the live position set,
+prefer this endpoint over per-ticker submit. It cancels every open
+order AND closes every position in a single broker-side operation, so
+it bypasses the manual cancel + qty-release dance entirely.
+
+Caveat: even this endpoint can return `503 Service Unavailable` from
+the paper API outside RTH (observed 2026-04-30 08:29 ET against
+`paper-api.alpaca.markets`). Whether that's a transient outage or a
+documented restriction is unclear, but in practice the cleanest path is
+to run any flatten/close operation **during regular trading hours**.
+Pre-market, every available approach hits one wall or another.
+
+### Operational rule
+
+For one-shot flatten / liquidation tools:
+- Run **inside RTH** (09:30–16:00 ET).
+- Use `close_all_positions(cancel_orders=True)` when planned == live.
+- Per-ticker `close_position` is the fallback when planned ⊊ live.
+- Never assume a `200` from `DELETE /v2/orders` means qty has released.
+
+For the live bot's continuous order management, the existing pattern
+(bracket orders + tick-time fill detection) sidesteps this entirely
+because every cancel + flatten happens during RTH by definition.
+```

@@ -13,9 +13,14 @@ from dataclasses import dataclass
 
 import pytest
 
+from datetime import datetime
+from unittest.mock import MagicMock
+
 from trading_bot.self_improve.flatten_orphans import (
+    OrphanPlan,
     _build_plan,
     _choose_tif,
+    _execute_bulk,
     _find_db_position,
 )
 
@@ -167,8 +172,95 @@ def test_choose_tif_market_open_returns_day():
 
 @pytest.mark.unit
 def test_choose_tif_market_closed_returns_opg():
-    """OPG queues for the opening auction and bypasses the held_for_orders
-    check that would block a DAY order while stop-cancellations are stuck
-    in PENDING_CANCEL pre-market."""
+    """OPG queues for the opening auction. Note: in practice OPG also
+    fails the held_for_orders check pre-market, so the script prefers
+    close_all_positions(cancel_orders=True) when planned == live; this
+    helper is the per-ticker fallback path."""
     from alpaca.trading.enums import TimeInForce
     assert _choose_tif(is_market_open=False) == TimeInForce.OPG
+
+
+# ---------------------------------------------------------------------------
+# _execute_bulk — broker-atomic close_all_positions path
+# ---------------------------------------------------------------------------
+
+
+def _plan(ticker: str, db_id: int | None = None) -> OrphanPlan:
+    return OrphanPlan(
+        ticker=ticker,
+        alpaca_qty=1.0,
+        flatten_side="SELL",
+        flatten_qty=1.0,
+        db_position_id=db_id,
+        child_order_ids_to_cancel=[],
+    )
+
+
+def _bulk_response(symbol: str, status: int, order_id: str = "ord-1"):
+    body = MagicMock()
+    body.id = order_id
+    resp = MagicMock()
+    resp.symbol = symbol
+    resp.status = status
+    resp.body = body
+    return resp
+
+
+@pytest.mark.unit
+def test_execute_bulk_marks_db_closed_on_accepted_response(tmp_db):
+    tmp_db.execute(
+        """INSERT INTO positions
+           (id, ticker, exchange, currency, quantity, entry_price, entry_time,
+            status, hold_type, phase, strategy_id)
+           VALUES (5, 'SPY', 'NYSE', 'USD', 1, 700.0,
+                   '2026-04-27T15:40:00-04:00', 'POSITION_OPEN', 'swing', 1, 'breakout')"""
+    )
+    tmp_db.commit()
+
+    client = MagicMock()
+    client.close_all_positions.return_value = [_bulk_response("SPY", 200)]
+
+    failures = _execute_bulk([_plan("SPY", db_id=5)], client, tmp_db)
+    assert failures == 0
+    client.close_all_positions.assert_called_once_with(cancel_orders=True)
+    row = tmp_db.execute("SELECT status FROM positions WHERE id = 5").fetchone()
+    assert row[0] == "CLOSED"
+
+
+@pytest.mark.unit
+def test_execute_bulk_counts_failure_on_non_2xx(tmp_db):
+    client = MagicMock()
+    # Bulk endpoint returned 422 for SPY — broker rejected it.
+    client.close_all_positions.return_value = [_bulk_response("SPY", 422)]
+
+    failures = _execute_bulk([_plan("SPY")], client, tmp_db)
+    assert failures == 1
+
+
+@pytest.mark.unit
+def test_execute_bulk_counts_failure_when_ticker_missing_from_response(tmp_db):
+    client = MagicMock()
+    client.close_all_positions.return_value = [_bulk_response("XLRE", 200)]
+
+    failures = _execute_bulk([_plan("SPY"), _plan("XLRE")], client, tmp_db)
+    assert failures == 1  # SPY missing from response
+
+
+@pytest.mark.unit
+def test_execute_bulk_handles_endpoint_exception(tmp_db):
+    client = MagicMock()
+    client.close_all_positions.side_effect = RuntimeError("network down")
+
+    failures = _execute_bulk([_plan("SPY"), _plan("QQQ")], client, tmp_db)
+    assert failures == 2  # all plans failed
+
+
+@pytest.mark.unit
+def test_execute_bulk_skips_db_update_when_no_db_id(tmp_db):
+    """A planned orphan with db_id=None still counts as success when
+    Alpaca accepts the close — there's just no local row to mark."""
+    client = MagicMock()
+    client.close_all_positions.return_value = [_bulk_response("SPY", 200)]
+
+    failures = _execute_bulk([_plan("SPY", db_id=None)], client, tmp_db)
+    assert failures == 0
