@@ -1,6 +1,6 @@
 """Phase 3 regression tests — live order logic data-layer fixes.
 
-Each bug from docs/self_improve_followups.md gets a deterministic test that
+Each bug from trading_bot/docs/self_improve_followups.md gets a deterministic test that
 fails on the broken code path and passes after the fix lands. These are the
 tests that should fire FIRST if any future change re-introduces one of the
 five regressions Phase 3 closes:

@@ -5,7 +5,7 @@ Usage:
         --window-days 20 \\
         --bt-from 2026-02-01 --bt-to 2026-04-29 \\
         --tickers SPY,QQQ,XLF,XLK,XLE,XLV,XLI,XLY,XLP,XLU,XLB,XLRE,XLC \\
-        --out self_improve_reports
+        --out trading_bot/docs/self_improve_reports
 """
 
 from __future__ import annotations
@@ -61,8 +61,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="USD allocated per strategy in the backtest (default: 2500)",
     )
     parser.add_argument(
-        "--out", default="self_improve_reports",
-        help="Output directory for the report file (default: self_improve_reports)",
+        "--out", default="trading_bot/docs/self_improve_reports",
+        help="Output directory for the report file "
+             "(default: trading_bot/docs/self_improve_reports)",
     )
     parser.add_argument(
         "--dry-run", action="store_true",

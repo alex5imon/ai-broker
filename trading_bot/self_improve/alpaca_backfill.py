@@ -1,7 +1,7 @@
 """One-shot backfill: reconstruct closed trades from Alpaca order history.
 
 The live bot writes entries into the ``trades`` table but does not currently
-persist exit data (see follow-up doc ``docs/self_improve_followups.md``).
+persist exit data (see follow-up doc ``trading_bot/docs/self_improve_followups.md``).
 Strategy attribution survives in the ``positions`` table, which holds
 ``alpaca_*_order_id`` for the entry, stop, target, and trailing orders.
 

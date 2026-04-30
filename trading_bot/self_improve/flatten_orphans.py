@@ -1,7 +1,7 @@
 """One-shot operational tool: flatten orphan positions on Alpaca.
 
 Surfaced by the Phase 1 reconcile report (see
-docs/self_improve_followups.md task #3). Three open positions on the
+trading_bot/docs/self_improve_followups.md task #3). Three open positions on the
 paper account no live tick code is managing:
 
   - SPY +1   strategy=breakout            (DISABLED in config)

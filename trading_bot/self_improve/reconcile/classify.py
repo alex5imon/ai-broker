@@ -2,7 +2,7 @@
 
 Classifications are deliberately fine-grained so the report doubles as the
 inventory needed to plan Phase 2 (DB migration) and Phase 3 (live order
-logic fixes). See ``docs/self_improve_followups.md`` for the data-layer bug
+logic fixes). See ``trading_bot/docs/self_improve_followups.md`` for the data-layer bug
 hypotheses each label is designed to surface.
 """
 

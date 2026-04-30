@@ -6,7 +6,7 @@ name: daily-review
 # a recent backtest window, and opens a draft PR with a markdown report.
 #
 # The agent never edits config.yaml. The PR only adds a file under
-# self_improve_reports/. Humans review and apply patches by hand.
+# trading_bot/docs/self_improve_reports/. Humans review and apply patches by hand.
 
 on:
   workflow_dispatch: {}
@@ -84,13 +84,13 @@ jobs:
             --bt-from "${{ steps.dates.outputs.bt_from }}" \
             --bt-to "${{ steps.dates.outputs.bt_to }}" \
             --tickers SPY,QQQ,XLF,XLK,XLE,XLV,XLI,XLY,XLP,XLU,XLB,XLRE,XLC \
-            --out self_improve_reports
+            --out trading_bot/docs/self_improve_reports
 
       - name: Open draft PR if a report was written
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          REPORT="self_improve_reports/${{ steps.dates.outputs.report_date }}.md"
+          REPORT="trading_bot/docs/self_improve_reports/${{ steps.dates.outputs.report_date }}.md"
           if [ ! -f "$REPORT" ]; then
             echo "No report file produced; nothing to do."
             exit 0
@@ -121,7 +121,7 @@ jobs:
         with:
           name: daily-review-${{ steps.dates.outputs.report_date }}
           path: |
-            self_improve_reports/
+            trading_bot/docs/self_improve_reports/
             logs/
           retention-days: 60
           if-no-files-found: ignore

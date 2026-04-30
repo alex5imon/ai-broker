@@ -63,7 +63,7 @@ python -m trading_bot.self_improve \
     --window-days 20 \
     --bt-from 2026-02-20 --bt-to 2026-04-29 \
     --tickers SPY,QQQ,XLF,XLK,XLE,XLV,XLI,XLY,XLP,XLU,XLB,XLRE,XLC \
-    --out self_improve_reports
+    --out trading_bot/docs/self_improve_reports
 
 # Same, but skip the backtest gate (postmortem-only smoke test)
 python -m trading_bot.self_improve \
@@ -81,7 +81,7 @@ close (via `.github/workflows/daily-review.yml`, 21:30 UTC weekdays). It:
 3. Validates each proposal with an in-process A/B backtest. Pass requires
    no Sharpe drop > 0.10, no drawdown increase > 2pp, and ≥ 95% of
    baseline return.
-4. Writes a markdown report to `self_improve_reports/YYYY-MM-DD.md` and
+4. Writes a markdown report to `trading_bot/docs/self_improve_reports/YYYY-MM-DD.md` and
    opens a draft PR. **The agent never edits config.yaml** — patches in
    the report are advisory text the human applies by hand.
 

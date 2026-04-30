@@ -3,7 +3,7 @@
 The report groups every classified row by category, prints a per-row
 evidence line and a proposed corrective action, and ends with a
 bug-hypothesis confirmation table that maps category counts back to the
-five bugs in ``docs/self_improve_followups.md``.
+five bugs in ``trading_bot/docs/self_improve_followups.md``.
 """
 
 from __future__ import annotations
@@ -154,7 +154,7 @@ def _render_bug_confirmation(
         "## Bug-hypothesis confirmation",
         "",
         "Counts above map directly to the data-layer bugs in "
-        "[docs/self_improve_followups.md](../docs/self_improve_followups.md):",
+        "[trading_bot/docs/self_improve_followups.md](../self_improve_followups.md):",
         "",
         f"1. **trades.strategy_id NULL on entry** — "
         f"{trade_counts.get(TradeClass.ENTRY_ONLY_PHANTOM.value, 0)} "
