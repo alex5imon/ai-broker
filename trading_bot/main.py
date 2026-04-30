@@ -306,7 +306,24 @@ class TradingBot:
                     exc_info=True,
                 )
 
-            # --- 5b. Anchor phase to live equity ---
+            # --- 5b. Daily-summary backfill check ---
+            # If we missed a daily_summaries write (no tick after the
+            # previous day's wind-down) the postmortem agent will see a
+            # gap. Surface it loudly so the operator can manually
+            # backfill or investigate.
+            try:
+                missing = self._config.detect_missing_daily_summaries(
+                    self._db_path, lookback_days=5,
+                )
+                for warning in missing:
+                    logger.critical("Missing daily_summary: %s", warning)
+            except Exception:
+                logger.warning(
+                    "Daily-summary consistency check failed (non-fatal)",
+                    exc_info=True,
+                )
+
+            # --- 5c. Anchor phase to live equity ---
             # ``__init__`` logs the cached default phase (MICRO) because
             # equity isn't known yet at construction time. After Alpaca
             # connects, refresh from real NetLiquidation so the per-tick
