@@ -242,13 +242,13 @@ def insert_backfilled_trade(
             ticker, exchange, currency, side,
             entry_time, entry_price, quantity,
             exit_time, exit_price, exit_reason,
-            gross_pnl, net_pnl, pnl_gbp, fx_rate,
+            gross_pnl, net_pnl, pnl_usd,
             hold_type, phase, strategy_id, notes
         )
-        VALUES (?, ?, ?, 'long',
+        VALUES (?, ?, ?, 'BUY',
                 ?, ?, ?,
                 ?, ?, ?,
-                ?, ?, ?, 1.0,
+                ?, ?, ?,
                 ?, ?, ?, ?)
         """,
         (

@@ -65,13 +65,13 @@ def save_trade(conn: sqlite3.Connection, trade: dict[str, Any]) -> int:
         INSERT INTO trades (
             ticker, exchange, currency, side, entry_time, entry_price,
             quantity, exit_time, exit_price, exit_reason,
-            gross_pnl, commission, net_pnl, pnl_gbp, fx_rate,
+            gross_pnl, commission, net_pnl, pnl_usd,
             signal_price, slippage_bps, sentiment_score, signals,
             hold_type, phase, notes
         ) VALUES (
             :ticker, :exchange, :currency, :side, :entry_time, :entry_price,
             :quantity, :exit_time, :exit_price, :exit_reason,
-            :gross_pnl, :commission, :net_pnl, :pnl_gbp, :fx_rate,
+            :gross_pnl, :commission, :net_pnl, :pnl_usd,
             :signal_price, :slippage_bps, :sentiment_score, :signals,
             :hold_type, :phase, :notes
         )
@@ -90,8 +90,7 @@ def save_trade(conn: sqlite3.Connection, trade: dict[str, Any]) -> int:
             "gross_pnl": trade.get("gross_pnl"),
             "commission": trade.get("commission"),
             "net_pnl": trade.get("net_pnl"),
-            "pnl_gbp": trade.get("pnl_gbp"),
-            "fx_rate": trade.get("fx_rate"),
+            "pnl_usd": trade.get("pnl_usd"),
             "signal_price": trade.get("signal_price"),
             "slippage_bps": trade.get("slippage_bps"),
             "sentiment_score": trade.get("sentiment_score"),
@@ -119,8 +118,7 @@ def update_trade_exit(conn: sqlite3.Connection, trade_id: int, exit_data: dict[s
             gross_pnl       = :gross_pnl,
             commission      = :commission,
             net_pnl         = :net_pnl,
-            pnl_gbp         = :pnl_gbp,
-            fx_rate         = :fx_rate,
+            pnl_usd         = :pnl_usd,
             slippage_bps    = :slippage_bps
         WHERE id = :id
         """,
@@ -132,8 +130,7 @@ def update_trade_exit(conn: sqlite3.Connection, trade_id: int, exit_data: dict[s
             "gross_pnl": exit_data.get("gross_pnl"),
             "commission": exit_data.get("commission"),
             "net_pnl": exit_data.get("net_pnl"),
-            "pnl_gbp": exit_data.get("pnl_gbp"),
-            "fx_rate": exit_data.get("fx_rate"),
+            "pnl_usd": exit_data.get("pnl_usd"),
             "slippage_bps": exit_data.get("slippage_bps"),
         },
     )
@@ -428,15 +425,15 @@ def save_daily_summary(conn: sqlite3.Connection, summary: dict[str, Any]) -> Non
         """
         INSERT OR REPLACE INTO daily_summaries (
             date, total_trades, wins, losses,
-            gross_pnl_gbp, commissions_gbp, net_pnl_gbp,
-            account_equity_gbp, max_drawdown_pct, win_rate,
-            avg_win_gbp, avg_loss_gbp, profit_factor,
+            gross_pnl_usd, commissions_usd, net_pnl_usd,
+            account_equity_usd, max_drawdown_pct, win_rate,
+            avg_win_usd, avg_loss_usd, profit_factor,
             phase, us_trades, notes
         ) VALUES (
             :date, :total_trades, :wins, :losses,
-            :gross_pnl_gbp, :commissions_gbp, :net_pnl_gbp,
-            :account_equity_gbp, :max_drawdown_pct, :win_rate,
-            :avg_win_gbp, :avg_loss_gbp, :profit_factor,
+            :gross_pnl_usd, :commissions_usd, :net_pnl_usd,
+            :account_equity_usd, :max_drawdown_pct, :win_rate,
+            :avg_win_usd, :avg_loss_usd, :profit_factor,
             :phase, :us_trades, :notes
         )
         """,
@@ -445,14 +442,14 @@ def save_daily_summary(conn: sqlite3.Connection, summary: dict[str, Any]) -> Non
             "total_trades": summary.get("total_trades", 0),
             "wins": summary.get("wins", 0),
             "losses": summary.get("losses", 0),
-            "gross_pnl_gbp": summary.get("gross_pnl_gbp", 0.0),
-            "commissions_gbp": summary.get("commissions_gbp", 0.0),
-            "net_pnl_gbp": summary.get("net_pnl_gbp", 0.0),
-            "account_equity_gbp": summary["account_equity_gbp"],
+            "gross_pnl_usd": summary.get("gross_pnl_usd", 0.0),
+            "commissions_usd": summary.get("commissions_usd", 0.0),
+            "net_pnl_usd": summary.get("net_pnl_usd", 0.0),
+            "account_equity_usd": summary["account_equity_usd"],
             "max_drawdown_pct": summary.get("max_drawdown_pct"),
             "win_rate": summary.get("win_rate"),
-            "avg_win_gbp": summary.get("avg_win_gbp"),
-            "avg_loss_gbp": summary.get("avg_loss_gbp"),
+            "avg_win_usd": summary.get("avg_win_usd"),
+            "avg_loss_usd": summary.get("avg_loss_usd"),
             "profit_factor": summary.get("profit_factor"),
             "phase": summary["phase"],
             "us_trades": summary.get("us_trades", 0),
@@ -541,10 +538,10 @@ def save_phase_transition(conn: sqlite3.Connection, transition: dict[str, Any]) 
         """
         INSERT INTO phase_transitions (
             date, from_phase, to_phase, direction,
-            account_equity_gbp, metrics_json, reason
+            account_equity_usd, metrics_json, reason
         ) VALUES (
             :date, :from_phase, :to_phase, :direction,
-            :account_equity_gbp, :metrics_json, :reason
+            :account_equity_usd, :metrics_json, :reason
         )
         """,
         {
@@ -552,7 +549,7 @@ def save_phase_transition(conn: sqlite3.Connection, transition: dict[str, Any]) 
             "from_phase": transition["from_phase"],
             "to_phase": transition["to_phase"],
             "direction": transition["direction"],
-            "account_equity_gbp": transition["account_equity_gbp"],
+            "account_equity_usd": transition["account_equity_usd"],
             "metrics_json": transition["metrics_json"],
             "reason": transition["reason"],
         },
@@ -563,7 +560,7 @@ def save_phase_transition(conn: sqlite3.Connection, transition: dict[str, Any]) 
         transition["from_phase"],
         transition["to_phase"],
         transition["direction"],
-        transition["account_equity_gbp"],
+        transition["account_equity_usd"],
     )
 
 
@@ -605,13 +602,13 @@ def save_phase0_assessments(
         conn.execute(
             """
             INSERT INTO phase0_assessments (
-                run_date, ticker, exchange, current_value_gbp,
-                unrealized_pnl_gbp, score, classification,
+                run_date, ticker, exchange, current_value_usd,
+                unrealized_pnl_usd, score, classification,
                 scores_breakdown, reasoning, recommended_action,
                 trailing_stop_price, dry_run
             ) VALUES (
-                :run_date, :ticker, :exchange, :current_value_gbp,
-                :unrealized_pnl_gbp, :score, :classification,
+                :run_date, :ticker, :exchange, :current_value_usd,
+                :unrealized_pnl_usd, :score, :classification,
                 :scores_breakdown, :reasoning, :recommended_action,
                 :trailing_stop_price, :dry_run
             )
@@ -620,8 +617,8 @@ def save_phase0_assessments(
                 "run_date": run_date,
                 "ticker": a["ticker"],
                 "exchange": a["exchange"],
-                "current_value_gbp": a.get("current_value_gbp", 0.0),
-                "unrealized_pnl_gbp": a.get("unrealized_pnl_gbp", 0.0),
+                "current_value_usd": a.get("current_value_usd", 0.0),
+                "unrealized_pnl_usd": a.get("unrealized_pnl_usd", 0.0),
                 "score": a["score"],
                 "classification": a["classification"],
                 "scores_breakdown": json.dumps(a.get("scores_breakdown", {})),
@@ -707,15 +704,15 @@ def get_trade_count_today(conn: sqlite3.Connection) -> int:
     return int(row["cnt"]) if row else 0
 
 
-def get_daily_pnl_gbp(conn: sqlite3.Connection) -> float:
-    """Return today's net P&L in GBP (sum of ``pnl_gbp`` for closed trades today)."""
+def get_daily_pnl_usd(conn: sqlite3.Connection) -> float:
+    """Return today's net P&L in USD (sum of ``pnl_usd`` for closed trades today)."""
     _ensure_row_factory(conn)
     today: str = _today_eastern()
     row = conn.execute(
         """
-        SELECT COALESCE(SUM(pnl_gbp), 0.0) AS total
+        SELECT COALESCE(SUM(pnl_usd), 0.0) AS total
         FROM trades
-        WHERE substr(exit_time, 1, 10) = ? AND pnl_gbp IS NOT NULL
+        WHERE substr(exit_time, 1, 10) = ? AND pnl_usd IS NOT NULL
         """,
         (today,),
     ).fetchone()

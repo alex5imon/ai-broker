@@ -31,8 +31,7 @@ CREATE TABLE IF NOT EXISTS trades (
     exit_reason     TEXT,
     gross_pnl       REAL,
     net_pnl         REAL,
-    pnl_gbp         REAL,
-    fx_rate         REAL,
+    pnl_usd         REAL,
     signal_price    REAL,
     slippage_bps    REAL,
     sentiment_score REAL,
@@ -84,14 +83,14 @@ CREATE TABLE IF NOT EXISTS daily_summaries (
     total_trades    INTEGER NOT NULL DEFAULT 0,
     wins            INTEGER NOT NULL DEFAULT 0,
     losses          INTEGER NOT NULL DEFAULT 0,
-    gross_pnl_gbp   REAL NOT NULL DEFAULT 0.0,
-    commissions_gbp REAL NOT NULL DEFAULT 0.0,
-    net_pnl_gbp      REAL NOT NULL DEFAULT 0.0,
-    account_equity_gbp REAL NOT NULL,
+    gross_pnl_usd   REAL NOT NULL DEFAULT 0.0,
+    commissions_usd REAL NOT NULL DEFAULT 0.0,
+    net_pnl_usd      REAL NOT NULL DEFAULT 0.0,
+    account_equity_usd REAL NOT NULL,
     max_drawdown_pct REAL,
     win_rate        REAL,
-    avg_win_gbp     REAL,
-    avg_loss_gbp    REAL,
+    avg_win_usd     REAL,
+    avg_loss_usd    REAL,
     profit_factor   REAL,
     phase           INTEGER NOT NULL,
     us_trades       INTEGER NOT NULL DEFAULT 0,
@@ -156,7 +155,7 @@ CREATE TABLE IF NOT EXISTS phase_transitions (
     from_phase      INTEGER NOT NULL,
     to_phase        INTEGER NOT NULL,
     direction       TEXT NOT NULL,
-    account_equity_gbp REAL NOT NULL,
+    account_equity_usd REAL NOT NULL,
     metrics_json    TEXT NOT NULL,
     reason          TEXT NOT NULL,
     created_at      TEXT NOT NULL DEFAULT (datetime('now'))
@@ -196,8 +195,8 @@ CREATE TABLE IF NOT EXISTS phase0_assessments (
     run_date        TEXT NOT NULL,
     ticker          TEXT NOT NULL,
     exchange        TEXT NOT NULL,
-    current_value_gbp REAL,
-    unrealized_pnl_gbp REAL,
+    current_value_usd REAL,
+    unrealized_pnl_usd REAL,
     score           INTEGER NOT NULL,
     classification  TEXT NOT NULL,
     scores_breakdown TEXT,
@@ -262,7 +261,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 
 _SEED_VERSION_SQL: str = (
     "INSERT OR IGNORE INTO schema_version (version, description) "
-    "VALUES (?, 'V9 schema - settlements table removed');"
+    "VALUES (?, 'V10 schema - USD-only column rename');"
 )
 
 # Expected tables — used for quick health check

@@ -16,7 +16,6 @@ GitHub: https://github.com/alex5imon/ai-broker
 - **finnhub-python** - market news and sentiment data
 - **sqlite3** - trade persistence, tick state, daily reporting
 - **requests** - HTTP calls for external APIs
-- **aiohttp** - async HTTP for FX rates
 - **pyyaml** - YAML configuration parsing
 - **ntfy.sh** - push notifications for trade alerts and system events
 - **jinja2** - HTML report templating

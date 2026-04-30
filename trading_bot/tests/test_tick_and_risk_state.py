@@ -155,14 +155,14 @@ def test_save_tripped_risk_state_records_tripped_at(
         "global",
         tripped=True,
         reason="daily drawdown exceeded -2%",
-        state={"equity_gbp": 900.0},
+        state={"equity_usd": 900.0},
     )
     row = load_risk_state(tmp_db, "global")
     assert row is not None
     assert row["tripped"] is True
     assert row["tripped_at"] is not None
     assert row["reason"] == "daily drawdown exceeded -2%"
-    assert row["state"] == {"equity_gbp": 900.0}
+    assert row["state"] == {"equity_usd": 900.0}
 
 
 def test_tripped_at_preserved_across_updates(tmp_db: sqlite3.Connection) -> None:

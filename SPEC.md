@@ -60,11 +60,10 @@ There is **no long-running process**, **no WebSocket stream**, and **no in-proce
 
 1. **Trading-day + operating-hours gate** (`config.is_trading_day()` + Alpaca clock).
 2. **Connect to Alpaca** and validate credentials.
-3. **Refresh FX rate** (informational only — used for any optional currency reporting).
-4. **Reconcile broker state** with the SQLite `positions` and `orders` tables.
-5. **Poll outstanding order statuses** (fills, cancels, rejections).
-6. **Run the active window**: pre-market scan, entry scan, exit check, or wind-down — gated by day-scoped flags so each window fires at most once per day per phase.
-7. **Phase-transition check + daily-summary** once per day.
+3. **Reconcile broker state** with the SQLite `positions` and `orders` tables.
+4. **Poll outstanding order statuses** (fills, cancels, rejections).
+5. **Run the active window**: pre-market scan, entry scan, exit check, or wind-down — gated by day-scoped flags so each window fires at most once per day per phase.
+6. **Phase-transition check + daily-summary** once per day.
 
 ### Operating Window
 
@@ -568,7 +567,7 @@ Aggregations on top of the daily report — week-over-week comparison, best/wors
 | 2 | ~$1.5k - ~$3k | 4 | Minutes to days | 6 ETFs (subset) |
 | 3 | ~$3k+ | 8 | Minutes to hours | 12 (ETFs + mega-cap) |
 
-Note: live `phases` thresholds in `config.yaml` are denominated in the legacy `equity_gbp` field; the engine treats the configured number as the equity floor in account currency. Update the field name if/when the schema migrates to USD-explicit naming.
+Note: `phases` thresholds in `config.yaml` are USD (the account base currency).
 
 ### Phase 1 → Phase 2 Promotion
 
@@ -628,7 +627,6 @@ Top-level sections:
 - `exit_intraday` / `exit_swing` / `exit_intraday_phase2` / `exit_intraday_phase3` — fixed-percent exit fallbacks
 - `exit_spread_protection` — defer-on-wide-spread parameters
 - `notifications` — ntfy topic, priorities, retry behavior
-- `fx` — informational FX rate API + fallback
 - `phases` — promotion / demotion thresholds
 - `reporting` — output dir, daily/weekly/monthly toggles, equity curve window
 - `health` — host/port for the health check
@@ -669,7 +667,7 @@ pytest-asyncio>=0.21.0
 | `pyyaml` | Parse `config.yaml`. |
 | `requests` | ntfy.sh notifications and synchronous HTTP. |
 | `jinja2` | HTML templating for daily/weekly/monthly reports. |
-| `aiohttp` | FX rate queries. |
+| `aiohttp` | Health-check HTTP server. |
 | `pytest`, `pytest-asyncio` | Test framework. |
 
 ### Python Version
@@ -707,7 +705,6 @@ trading_bot/
 │   │                               # bar aggregation, staleness detection
 │   ├── sentiment.py                # Finnhub news-sentiment, normalization, caching
 │   ├── earnings.py                 # Finnhub earnings calendar + blackout
-│   ├── fx.py                       # Optional FX rate query (informational)
 │   └── alpaca_downloader.py        # Download 1-min + daily bars (Adjustment.ALL)
 │
 ├── strategy/

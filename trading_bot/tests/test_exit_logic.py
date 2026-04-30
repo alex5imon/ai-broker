@@ -22,8 +22,8 @@ ET = ZoneInfo("US/Eastern")
 
 
 @pytest.fixture
-def exit_manager(config: Config, mock_market_data, mock_fx) -> ExitManager:
-    return ExitManager(config, mock_market_data, mock_fx)
+def exit_manager(config: Config, mock_market_data) -> ExitManager:
+    return ExitManager(config, mock_market_data)
 
 
 def _long_position(

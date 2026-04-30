@@ -229,7 +229,7 @@
   <div class="header-right">
     <div class="stat-box">
       <div class="label">Equity</div>
-      <div class="value">{{ account_equity_gbp | fmt_money }}</div>
+      <div class="value">{{ account_equity_usd | fmt_money }}</div>
     </div>
     <div class="stat-box">
       <div class="label">Positions</div>
@@ -303,7 +303,7 @@
       <tr>
         <td><strong>{{ a.ticker }}</strong></td>
         <td>{{ a.exchange }}</td>
-        <td>{{ a.current_value_gbp | fmt_money }}</td>
+        <td>{{ a.current_value_usd | fmt_money }}</td>
         <td>
           <span class="score-bar-bg">
             <span class="score-bar-fill"

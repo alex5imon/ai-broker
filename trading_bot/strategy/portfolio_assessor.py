@@ -24,7 +24,6 @@ from trading_bot.config import Config
 from trading_bot.constants import (
     TZ_EASTERN,
 )
-from trading_bot.data.fx import FXManager
 from trading_bot.data.market_data import MarketDataManager
 from trading_bot.data.sentiment import SentimentAnalyzer
 
@@ -48,8 +47,8 @@ class PositionAssessment:
 
     ticker: str
     exchange: str
-    current_value_gbp: float
-    unrealized_pnl_gbp: float
+    current_value_usd: float
+    unrealized_pnl_usd: float
     score: int  # 0-100
     classification: str  # 'HOLD', 'SELL', 'URGENT_SELL'
     scores_breakdown: dict[str, int] = field(default_factory=dict)
@@ -80,13 +79,11 @@ class PortfolioAssessor:
         config: Config,
         market_data: MarketDataManager,
         sentiment: SentimentAnalyzer,
-        fx: FXManager,
         notifier: Notifier,
     ) -> None:
         self._config: Config = config
         self._market_data: MarketDataManager = market_data
         self._sentiment: SentimentAnalyzer = sentiment
-        self._fx: FXManager = fx
         self._notifier: Notifier = notifier
 
         # Scoring weights from config
@@ -174,9 +171,9 @@ class PortfolioAssessor:
         avg_cost: float = float(position.get("avg_cost", 0.0))
         quantity: int = int(position.get("quantity", 0))
 
-        # Convert to GBP
-        value_gbp: float = self._fx.to_gbp(market_value, currency)
-        pnl_gbp: float = self._fx.to_gbp(unrealized_pnl, currency)
+        # Account is USD-only — Alpaca returns USD, no conversion needed
+        value_usd: float = market_value
+        pnl_usd: float = unrealized_pnl
 
         # P&L percentage
         cost_basis: float = avg_cost * abs(quantity) if avg_cost > 0 else 0.0
@@ -241,8 +238,8 @@ class PortfolioAssessor:
         return PositionAssessment(
             ticker=ticker,
             exchange=exchange,
-            current_value_gbp=value_gbp,
-            unrealized_pnl_gbp=pnl_gbp,
+            current_value_usd=value_usd,
+            unrealized_pnl_usd=pnl_usd,
             score=total,
             classification=classification,
             scores_breakdown=breakdown,
@@ -578,10 +575,8 @@ class PortfolioAssessor:
                 f"to bid after {self._adjust_to_bid_hours}h"
             )
 
-        # URGENT_SELL
+        # URGENT_SELL — account is USD-only, market_value is already USD
         value_usd: float = market_value
-        if currency == "GBP":
-            value_usd = self._fx.to_usd(market_value, "GBP")
 
         if value_usd < self._market_order_threshold:
             return (
