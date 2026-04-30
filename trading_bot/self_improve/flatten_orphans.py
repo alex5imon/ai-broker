@@ -10,10 +10,18 @@ paper account no live tick code is managing:
 
 For each orphan this script:
   1. Re-checks the position is still live on Alpaca (idempotent).
-  2. Cancels any open child orders (stop / target / trail).
+  2. Cancels every open Alpaca order on the ticker (releases held qty).
   3. Submits a MARKET order for the OPPOSITE side & matching qty
      (SELL for long, BUY for short).
   4. Updates positions.status = 'CLOSED' in the local DB.
+
+The market-state-aware order pick is what makes the script robust outside
+RTH. Outside market hours, Alpaca queues stop-cancellations until the
+next open and the held qty stays reserved, so a normal MARKET DAY
+submitted pre-market would be rejected ("insufficient qty available for
+order"). Instead we submit MARKET-on-Open (TimeInForce.OPG) when the
+clock is closed, which queues for the opening auction and bypasses the
+held-qty check on the live order book.
 
 SAFETY:
   - --dry-run is the default. The script prints what it would do and
@@ -21,8 +29,9 @@ SAFETY:
   - --execute is required to actually submit orders.
   - --tickers can scope the run to a subset (default: SPY,XLRE,QQQ).
   - Each ticker runs independently; one failure does not block the rest.
-  - Submitted orders are always MARKET DAY — fills near current price,
-    expires at session close if untouched.
+  - Order TIF is chosen from Alpaca's clock:
+      * Market open  -> MARKET DAY (fills near current price)
+      * Market closed -> MARKET OPG (executes at the next opening cross)
 
 Run:
     python -m trading_bot.self_improve.flatten_orphans               # dry-run
@@ -107,38 +116,95 @@ def _find_db_position(conn: sqlite3.Connection, ticker: str) -> tuple[int | None
     return int(pos_id), child_ids
 
 
+def _choose_tif(is_market_open: bool):
+    """Pick the flatten order's TimeInForce based on Alpaca's clock.
+
+    Pulled out as a free function so tests can pin both branches without
+    touching the network.
+
+    Market open  -> DAY (immediate fill on the live order book).
+    Market closed -> OPG (queued for the next opening cross). OPG bypasses
+    the held_for_orders check that blocks a DAY order placed pre-market
+    when stop-cancellations are stuck in PENDING_CANCEL until the open.
+    """
+    from alpaca.trading.enums import TimeInForce
+    return TimeInForce.DAY if is_market_open else TimeInForce.OPG
+
+
 def _execute_one(
     plan: OrphanPlan,
     client,
     conn: sqlite3.Connection,
+    *,
+    is_market_open: bool,
 ) -> bool:
     """Cancel children, submit flatten market order, update DB.
 
     Returns True on full success. On failure, logs and returns False so
     the next orphan can still be attempted.
     """
-    from alpaca.trading.requests import MarketOrderRequest
-    from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
+    from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
+    from alpaca.trading.enums import OrderSide, OrderType, QueryOrderStatus
 
-    # 1. Cancel child orders. Best-effort; an already-canceled child is fine.
-    for child_id in plan.child_order_ids_to_cancel:
+    # 1. Cancel ALL open orders for this ticker on Alpaca, not just the ones
+    # the local DB knows about. Lingering bracket children reserve qty
+    # (held_for_orders) and Alpaca will reject a DAY flatten with
+    # "insufficient qty available for order" until those are released.
+    # When market is closed the cancellations queue (PENDING_CANCEL) and
+    # only process at the next open — that's why we use OPG below.
+    open_req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[plan.ticker])
+    try:
+        open_orders = client.get_orders(filter=open_req)
+    except Exception:
+        logger.exception("Could not list open orders for %s", plan.ticker)
+        open_orders = []
+    for o in open_orders:
         try:
-            client.cancel_order_by_id(child_id)
-            logger.info("Cancelled child order %s for %s", child_id, plan.ticker)
+            client.cancel_order_by_id(str(o.id))
+            logger.info(
+                "Cancelled open order %s for %s (side=%s qty=%s type=%s)",
+                o.id, plan.ticker, o.side, o.qty, o.order_type,
+            )
         except Exception as exc:
             logger.warning(
-                "Could not cancel child order %s for %s (may already be done): %s",
-                child_id, plan.ticker, exc,
+                "Could not cancel order %s for %s (may already be done): %s",
+                o.id, plan.ticker, exc,
+            )
+    # Only poll for cancellation completion when market is open. Outside
+    # RTH the cancels stay PENDING_CANCEL until the open and polling
+    # would just burn the timeout. Both the cancel and the OPG flatten
+    # process together at the auction.
+    if open_orders and is_market_open:
+        import time
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            try:
+                still_open = client.get_orders(filter=open_req)
+            except Exception:
+                still_open = []
+            if not still_open:
+                logger.info(
+                    "All open orders cleared for %s after cancellation",
+                    plan.ticker,
+                )
+                break
+            time.sleep(1.0)
+        else:
+            logger.warning(
+                "Open orders for %s did not clear within 30s; "
+                "flatten may still fail with insufficient qty",
+                plan.ticker,
             )
 
-    # 2. Submit the flatten order. Refuse if Alpaca side enum doesn't match.
+    # 2. Submit the flatten order. TIF chosen from clock state.
     side_enum = OrderSide.BUY if plan.flatten_side == "BUY" else OrderSide.SELL
+    tif = _choose_tif(is_market_open)
     request = MarketOrderRequest(
         symbol=plan.ticker,
         qty=plan.flatten_qty,
         side=side_enum,
         type=OrderType.MARKET,
-        time_in_force=TimeInForce.DAY,
+        time_in_force=tif,
     )
     try:
         order = client.submit_order(order_data=request)
@@ -147,8 +213,8 @@ def _execute_one(
         return False
 
     logger.info(
-        "Submitted FLATTEN %s %s %.6f (alpaca_id=%s)",
-        plan.flatten_side, plan.ticker, plan.flatten_qty, order.id,
+        "Submitted FLATTEN %s %s %.6f (tif=%s, alpaca_id=%s)",
+        plan.flatten_side, plan.ticker, plan.flatten_qty, tif.value, order.id,
     )
 
     # 3. Update DB only after the order is accepted by Alpaca.
@@ -198,11 +264,20 @@ def plan_and_execute(
         logger.error("DB not found at %s", db_path)
         return 2
 
-    # Pull live Alpaca positions and build per-ticker plans.
+    # Pull live Alpaca positions and the clock state up front. The clock
+    # informs the TIF chosen for the flatten orders (see _choose_tif).
     alpaca_positions = client.get_all_positions()
     by_ticker = {str(p.symbol): p for p in alpaca_positions if float(p.qty) != 0}
     logger.info("Alpaca holds %d non-zero positions: %s",
                 len(by_ticker), sorted(by_ticker.keys()))
+
+    try:
+        clock = client.get_clock()
+        is_market_open = bool(getattr(clock, "is_open", False))
+    except Exception:
+        logger.exception("Could not fetch Alpaca clock; assuming market closed")
+        is_market_open = False
+    logger.info("Market state: %s", "OPEN" if is_market_open else "CLOSED")
 
     plans: list[OrphanPlan] = []
     conn = sqlite3.connect(db_path)
@@ -224,7 +299,8 @@ def plan_and_execute(
     # Print the plan unconditionally so dry-run is the same as the first
     # half of an execute run.
     print()
-    print("=== Flatten plan ===")
+    tif_label = "DAY (market open)" if is_market_open else "OPG (market closed — queues for next open)"
+    print(f"=== Flatten plan ===  TIF={tif_label}")
     for p in plans:
         print(
             f"  {p.ticker:6s} alpaca_qty={p.alpaca_qty:+.4f}  "
@@ -244,7 +320,7 @@ def plan_and_execute(
     try:
         conn.row_factory = sqlite3.Row
         for plan in plans:
-            ok = _execute_one(plan, client, conn)
+            ok = _execute_one(plan, client, conn, is_market_open=is_market_open)
             if not ok:
                 failures += 1
     finally:
