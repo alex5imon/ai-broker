@@ -1,7 +1,7 @@
 """Render the daily self-improvement report as Markdown.
 
 The report is the entire artifact the agent produces. The PR adds a single
-file under ``self_improve_reports/YYYY-MM-DD.md`` containing:
+file under ``trading_bot/docs/self_improve_reports/YYYY-MM-DD.md`` containing:
   - Postmortem table per strategy
   - Each proposal: rule, rationale, evidence
   - A/B backtest result (baseline vs candidate)

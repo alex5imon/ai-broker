@@ -134,7 +134,7 @@ WHERE status != 'CLOSED' GROUP BY strategy_id, status;
 ```
 
 Both `breakout` and `trend_following` were disabled in
-[`config.yaml:626,654`](../config.yaml) on 2026-04-28 after the evening
+[`config.yaml:626,654`](../../config.yaml) on 2026-04-28 after the evening
 walkforward. Their allocations were set to `$0` and routed to
 mean_reversion + overnight_drift. But two positions on those strategies
 are still open with `STOP_AND_TARGET_ACTIVE` status — meaning Alpaca is
@@ -267,12 +267,12 @@ broker's truth.
 
 ## Files referenced
 
-- [trading_bot/execution/order_manager.py](../trading_bot/execution/order_manager.py)
-- [trading_bot/db/repository.py](../trading_bot/db/repository.py)
-- [trading_bot/db/schema.py](../trading_bot/db/schema.py)
-- [trading_bot/strategy/strategies/__init__.py](../trading_bot/strategy/strategies/__init__.py)
-- [trading_bot/self_improve/alpaca_backfill.py](../trading_bot/self_improve/alpaca_backfill.py)
-- [config.yaml](../config.yaml)
+- [trading_bot/execution/order_manager.py](../execution/order_manager.py)
+- [trading_bot/db/repository.py](../db/repository.py)
+- [trading_bot/db/schema.py](../db/schema.py)
+- [trading_bot/strategy/strategies/__init__.py](../strategy/strategies/__init__.py)
+- [trading_bot/self_improve/alpaca_backfill.py](../self_improve/alpaca_backfill.py)
+- [config.yaml](../../config.yaml)
 
 ## Useful queries
 

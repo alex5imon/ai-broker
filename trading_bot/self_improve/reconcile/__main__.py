@@ -75,7 +75,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=None,
         help=(
             "Output path for the markdown report. Default: "
-            "self_improve_reports/reconcile_<UTC date>.md."
+            "trading_bot/docs/self_improve_reports/reconcile_<UTC date>.md."
         ),
     )
     parser.add_argument(
@@ -133,7 +133,7 @@ def _resolve_output_path(args: argparse.Namespace) -> Path:
     if args.output:
         return Path(args.output).expanduser().resolve()
     today: str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
-    return Path("self_improve_reports").resolve() / f"reconcile_{today}.md"
+    return Path("trading_bot/docs/self_improve_reports").resolve() / f"reconcile_{today}.md"
 
 
 def main(argv: list[str] | None = None) -> int:

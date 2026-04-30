@@ -10,7 +10,7 @@ order + position in the window, walks the local DB, classifies each row, and
 renders a markdown report grouped by classification with a proposed corrective
 action per row.
 
-See ``docs/self_improve_followups.md`` for the data-layer bug hypotheses this
+See ``trading_bot/docs/self_improve_followups.md`` for the data-layer bug hypotheses this
 report is designed to confirm.
 """
 
