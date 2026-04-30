@@ -1,9 +1,7 @@
 """Phase-aware position sizing.
 
 Calculates position sizes respecting risk limits and phase-specific
-parameters.  All monetary values are converted to GBP (the account base
-currency) for risk calculations, then converted back to USD for order
-placement.
+parameters.  All monetary values are USD (Alpaca account base currency).
 
 Alpaca is commission-free, so no commission checks are needed.
 """
@@ -21,7 +19,6 @@ from trading_bot.constants import (
 
 if TYPE_CHECKING:
     from trading_bot.config import Config
-    from trading_bot.data.fx import FXManager
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -36,9 +33,8 @@ class PositionSize:
 
     shares: int
     entry_price: float
-    position_value: float       # In USD
-    position_value_gbp: float
-    risk_amount_gbp: float      # Expected loss if stop hit
+    position_value_usd: float   # In USD
+    risk_amount_usd: float      # Expected loss if stop hit
     adjustments: list[str]      # Human-readable adjustment descriptions
     is_valid: bool
     rejection_reason: str | None  # Why sizing failed (None when valid)
@@ -63,10 +59,8 @@ class PositionSizer:
     def __init__(
         self,
         config: Config,
-        fx: FXManager,
     ) -> None:
         self._config: Config = config
-        self._fx: FXManager = fx
 
     # ------------------------------------------------------------------
     # Main calculation
@@ -78,7 +72,7 @@ class PositionSizer:
         exchange: str,
         entry_price: float,
         stop_price: float,
-        account_equity_gbp: float,
+        account_equity_usd: float,
         sentiment_score: float | None,
         atr_rank: float,
     ) -> PositionSize:
@@ -94,8 +88,8 @@ class PositionSizer:
             Planned entry price in USD.
         stop_price:
             Stop-loss price in USD.
-        account_equity_gbp:
-            Current account equity in GBP.
+        account_equity_usd:
+            Current account equity in USD.
         sentiment_score:
             Normalized sentiment score (-1 to 1), or ``None`` if no data.
         atr_rank:
@@ -108,13 +102,9 @@ class PositionSizer:
         """
         adjustments: list[str] = []
 
-        # FX conversion factor: USD -> GBP
-        gbp_usd_rate: float = self._fx.get_rate()
-        fx_to_gbp: float = 1.0 / gbp_usd_rate if gbp_usd_rate > 0 else 1.0
-
         # ---- step 1: risk-based sizing ----
         risk_pct: float = self._config.get_risk_per_trade()
-        max_risk_gbp: float = account_equity_gbp * risk_pct
+        max_risk_usd: float = account_equity_usd * risk_pct
         stop_distance: float = abs(entry_price - stop_price)
 
         if stop_distance <= 0:
@@ -124,19 +114,17 @@ class PositionSizer:
                 f"(entry={entry_price:.4f}, stop={stop_price:.4f})",
             )
 
-        stop_distance_gbp: float = stop_distance * fx_to_gbp
-        shares_from_risk: float = max_risk_gbp / stop_distance_gbp
+        shares_from_risk: float = max_risk_usd / stop_distance
         shares: int = math.floor(shares_from_risk)
         adjustments.append(
             f"Risk-based: {shares} shares "
-            f"(risk={risk_pct:.1%}, max_risk=GBP{max_risk_gbp:.2f}, "
+            f"(risk={risk_pct:.1%}, max_risk=USD{max_risk_usd:.2f}, "
             f"stop_dist={stop_distance:.4f})"
         )
 
         # ---- step 2: cap by max position pct ----
         max_pos_pct: float = self._config.get_max_position_pct()
-        max_pos_gbp: float = account_equity_gbp * max_pos_pct
-        max_pos_usd: float = max_pos_gbp / fx_to_gbp if fx_to_gbp > 0 else max_pos_gbp
+        max_pos_usd: float = account_equity_usd * max_pos_pct
         max_shares_from_pos: int = math.floor(max_pos_usd / entry_price) if entry_price > 0 else 0
 
         if shares > max_shares_from_pos:
@@ -145,9 +133,6 @@ class PositionSizer:
                 f"(max {max_pos_pct:.0%} of equity)"
             )
             shares = max_shares_from_pos
-
-        position_value_usd: float = shares * entry_price
-        position_value_gbp: float = position_value_usd * fx_to_gbp
 
         # ---- step 3: ATR adjustment ----
         atr_high_pct: float = float(
@@ -181,9 +166,8 @@ class PositionSizer:
         shares = max(shares, 0)
 
         # ---- recalculate final values ----
-        position_value_usd = shares * entry_price
-        position_value_gbp = position_value_usd * fx_to_gbp
-        risk_amount_gbp: float = shares * stop_distance_gbp
+        position_value_usd: float = shares * entry_price
+        risk_amount_usd: float = shares * stop_distance
 
         # ---- step 6: minimum position value ----
         min_value: float = self._config.get_min_position_value(Market.US)
@@ -200,9 +184,8 @@ class PositionSizer:
         return PositionSize(
             shares=shares,
             entry_price=entry_price,
-            position_value=position_value_usd,
-            position_value_gbp=position_value_gbp,
-            risk_amount_gbp=risk_amount_gbp,
+            position_value_usd=position_value_usd,
+            risk_amount_usd=risk_amount_usd,
             adjustments=adjustments,
             is_valid=True,
             rejection_reason=None,
@@ -219,9 +202,8 @@ class PositionSizer:
         return PositionSize(
             shares=0,
             entry_price=entry_price,
-            position_value=0.0,
-            position_value_gbp=0.0,
-            risk_amount_gbp=0.0,
+            position_value_usd=0.0,
+            risk_amount_usd=0.0,
             adjustments=[],
             is_valid=False,
             rejection_reason=reason,

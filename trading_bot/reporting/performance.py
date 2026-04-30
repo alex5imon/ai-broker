@@ -1,8 +1,7 @@
 """Performance metrics calculation from trade and summary data.
 
-All monetary values are in GBP (the account base currency) unless
-explicitly suffixed otherwise.  Dates are YYYY-MM-DD strings in
-US/Eastern.
+All monetary values are in USD (the Alpaca account base currency).
+Dates are YYYY-MM-DD strings in US/Eastern.
 """
 
 from __future__ import annotations
@@ -50,10 +49,10 @@ class PerformanceCalculator:
 
         Returns
         -------
-        dict with keys: total_trades, wins, losses, gross_pnl_gbp,
-        commissions_gbp, net_pnl_gbp, win_rate, avg_win, avg_loss,
+        dict with keys: total_trades, wins, losses, gross_pnl_usd,
+        commissions_usd, net_pnl_usd, win_rate, avg_win, avg_loss,
         profit_factor, max_drawdown_pct, lse_trades, us_trades,
-        commission_ratio, largest_win_gbp, largest_loss_gbp, expectancy,
+        commission_ratio, largest_win_usd, largest_loss_usd, expectancy,
         trades (list of per-trade dicts).
         """
         conn: sqlite3.Connection = self._connect()
@@ -73,32 +72,20 @@ class PerformanceCalculator:
             total_trades: int = len(trades)
             wins: int = 0
             losses: int = 0
-            gross_pnl_gbp: float = 0.0
-            commissions_gbp: float = 0.0
+            gross_pnl_usd: float = 0.0
+            commissions_usd: float = 0.0
             win_amounts: list[float] = []
             loss_amounts: list[float] = []
             us_trades: int = 0
 
             for t in trades:
-                pnl: float = t.get("pnl_gbp") or 0.0
+                pnl: float = t.get("pnl_usd") or 0.0
                 commission: float = t.get("commission") or 0.0
-                fx: float = t.get("fx_rate") or 1.0
-                currency: str = t.get("currency", "GBP")
 
-                # gross_pnl in trade currency -> convert to GBP
+                # Account is USD-only — gross/commission are already USD.
                 gross_trade: float = t.get("gross_pnl") or 0.0
-                if currency == "USD":
-                    gross_gbp: float = gross_trade / fx if fx else gross_trade
-                    comm_gbp: float = commission / fx if fx else commission
-                elif currency == "GBX":
-                    gross_gbp = gross_trade / 100.0
-                    comm_gbp = commission / 100.0
-                else:
-                    gross_gbp = gross_trade
-                    comm_gbp = commission
-
-                gross_pnl_gbp += gross_gbp
-                commissions_gbp += comm_gbp
+                gross_pnl_usd += gross_trade
+                commissions_usd += commission
 
                 if pnl > 0:
                     wins += 1
@@ -109,7 +96,7 @@ class PerformanceCalculator:
 
                 us_trades += 1
 
-            net_pnl_gbp: float = gross_pnl_gbp - commissions_gbp
+            net_pnl_usd: float = gross_pnl_usd - commissions_usd
             win_rate: float = (wins / total_trades) if total_trades > 0 else 0.0
             avg_win: float = (sum(win_amounts) / len(win_amounts)) if win_amounts else 0.0
             avg_loss: float = (sum(loss_amounts) / len(loss_amounts)) if loss_amounts else 0.0
@@ -129,8 +116,8 @@ class PerformanceCalculator:
             )
 
             commission_ratio: float = (
-                (commissions_gbp / gross_pnl_gbp)
-                if gross_pnl_gbp > 0
+                (commissions_usd / gross_pnl_usd)
+                if gross_pnl_usd > 0
                 else 0.0
             )
 
@@ -142,9 +129,9 @@ class PerformanceCalculator:
                 "total_trades": total_trades,
                 "wins": wins,
                 "losses": losses,
-                "gross_pnl_gbp": round(gross_pnl_gbp, 2),
-                "commissions_gbp": round(commissions_gbp, 2),
-                "net_pnl_gbp": round(net_pnl_gbp, 2),
+                "gross_pnl_usd": round(gross_pnl_usd, 2),
+                "commissions_usd": round(commissions_usd, 2),
+                "net_pnl_usd": round(net_pnl_usd, 2),
                 "win_rate": round(win_rate, 4),
                 "avg_win": round(avg_win, 2),
                 "avg_loss": round(avg_loss, 2),
@@ -152,8 +139,8 @@ class PerformanceCalculator:
                 "max_drawdown_pct": round(max_drawdown_pct, 4),
                 "us_trades": us_trades,
                 "commission_ratio": round(commission_ratio, 4),
-                "largest_win_gbp": round(largest_win, 2),
-                "largest_loss_gbp": round(largest_loss, 2),
+                "largest_win_usd": round(largest_win, 2),
+                "largest_loss_usd": round(largest_loss, 2),
                 "expectancy": round(expectancy, 2),
                 "trades": trades,
             }
@@ -171,7 +158,7 @@ class PerformanceCalculator:
         max_dd: float = 0.0
 
         for t in trades:
-            pnl: float = t.get("pnl_gbp") or 0.0
+            pnl: float = t.get("pnl_usd") or 0.0
             cumulative += pnl
             if cumulative > peak:
                 peak = cumulative
@@ -198,7 +185,7 @@ class PerformanceCalculator:
         Returns
         -------
         dict with keys: trading_days, total_trades, wins, losses,
-        gross_pnl_gbp, commissions_gbp, net_pnl_gbp, win_rate,
+        gross_pnl_usd, commissions_usd, net_pnl_usd, win_rate,
         avg_win, avg_loss, profit_factor, best_day, worst_day,
         daily_summaries.
         """
@@ -221,28 +208,28 @@ class PerformanceCalculator:
             total_trades: int = sum(s.get("total_trades", 0) for s in summaries)
             wins: int = sum(s.get("wins", 0) for s in summaries)
             losses: int = sum(s.get("losses", 0) for s in summaries)
-            gross_pnl_gbp: float = sum(s.get("gross_pnl_gbp", 0.0) for s in summaries)
-            commissions_gbp: float = sum(s.get("commissions_gbp", 0.0) for s in summaries)
-            net_pnl_gbp: float = sum(s.get("net_pnl_gbp", 0.0) for s in summaries)
+            gross_pnl_usd: float = sum(s.get("gross_pnl_usd", 0.0) for s in summaries)
+            commissions_usd: float = sum(s.get("commissions_usd", 0.0) for s in summaries)
+            net_pnl_usd: float = sum(s.get("net_pnl_usd", 0.0) for s in summaries)
 
             win_rate: float = (wins / total_trades) if total_trades > 0 else 0.0
 
             # Best / worst day by net P&L
-            best_day: dict[str, Any] = max(summaries, key=lambda s: s.get("net_pnl_gbp", 0.0))
-            worst_day: dict[str, Any] = min(summaries, key=lambda s: s.get("net_pnl_gbp", 0.0))
+            best_day: dict[str, Any] = max(summaries, key=lambda s: s.get("net_pnl_usd", 0.0))
+            worst_day: dict[str, Any] = min(summaries, key=lambda s: s.get("net_pnl_usd", 0.0))
 
             # Avg win / avg loss from per-trade data over the range
             trade_rows = conn.execute(
                 """
-                SELECT pnl_gbp FROM trades
+                SELECT pnl_usd FROM trades
                 WHERE date(exit_time) BETWEEN ? AND ?
-                  AND pnl_gbp IS NOT NULL
+                  AND pnl_usd IS NOT NULL
                 """,
                 (start_date, end_date),
             ).fetchall()
 
-            win_amounts: list[float] = [r["pnl_gbp"] for r in trade_rows if r["pnl_gbp"] > 0]
-            loss_amounts: list[float] = [r["pnl_gbp"] for r in trade_rows if r["pnl_gbp"] < 0]
+            win_amounts: list[float] = [r["pnl_usd"] for r in trade_rows if r["pnl_usd"] > 0]
+            loss_amounts: list[float] = [r["pnl_usd"] for r in trade_rows if r["pnl_usd"] < 0]
 
             avg_win: float = (sum(win_amounts) / len(win_amounts)) if win_amounts else 0.0
             avg_loss: float = (sum(loss_amounts) / len(loss_amounts)) if loss_amounts else 0.0
@@ -256,7 +243,7 @@ class PerformanceCalculator:
                 profit_factor = 0.0
 
             commission_ratio: float = (
-                (commissions_gbp / gross_pnl_gbp) if gross_pnl_gbp > 0 else 0.0
+                (commissions_usd / gross_pnl_usd) if gross_pnl_usd > 0 else 0.0
             )
 
             return {
@@ -266,16 +253,16 @@ class PerformanceCalculator:
                 "total_trades": total_trades,
                 "wins": wins,
                 "losses": losses,
-                "gross_pnl_gbp": round(gross_pnl_gbp, 2),
-                "commissions_gbp": round(commissions_gbp, 2),
-                "net_pnl_gbp": round(net_pnl_gbp, 2),
+                "gross_pnl_usd": round(gross_pnl_usd, 2),
+                "commissions_usd": round(commissions_usd, 2),
+                "net_pnl_usd": round(net_pnl_usd, 2),
                 "win_rate": round(win_rate, 4),
                 "avg_win": round(avg_win, 2),
                 "avg_loss": round(avg_loss, 2),
                 "profit_factor": round(profit_factor, 2) if profit_factor != float("inf") else 999.99,
                 "commission_ratio": round(commission_ratio, 4),
-                "best_day": {"date": best_day["date"], "net_pnl_gbp": best_day.get("net_pnl_gbp", 0.0)},
-                "worst_day": {"date": worst_day["date"], "net_pnl_gbp": worst_day.get("net_pnl_gbp", 0.0)},
+                "best_day": {"date": best_day["date"], "net_pnl_usd": best_day.get("net_pnl_usd", 0.0)},
+                "worst_day": {"date": worst_day["date"], "net_pnl_usd": worst_day.get("net_pnl_usd", 0.0)},
                 "daily_summaries": summaries,
             }
         finally:
@@ -290,16 +277,16 @@ class PerformanceCalculator:
             "total_trades": 0,
             "wins": 0,
             "losses": 0,
-            "gross_pnl_gbp": 0.0,
-            "commissions_gbp": 0.0,
-            "net_pnl_gbp": 0.0,
+            "gross_pnl_usd": 0.0,
+            "commissions_usd": 0.0,
+            "net_pnl_usd": 0.0,
             "win_rate": 0.0,
             "avg_win": 0.0,
             "avg_loss": 0.0,
             "profit_factor": 0.0,
             "commission_ratio": 0.0,
-            "best_day": {"date": start_date, "net_pnl_gbp": 0.0},
-            "worst_day": {"date": start_date, "net_pnl_gbp": 0.0},
+            "best_day": {"date": start_date, "net_pnl_usd": 0.0},
+            "worst_day": {"date": start_date, "net_pnl_usd": 0.0},
             "daily_summaries": [],
         }
 
@@ -351,14 +338,14 @@ class PerformanceCalculator:
 
         Returns
         -------
-        List of dicts with keys: date, account_equity_gbp, net_pnl_gbp,
-        cumulative_pnl_gbp.  Ordered oldest to newest.
+        List of dicts with keys: date, account_equity_usd, net_pnl_usd,
+        cumulative_pnl_usd.  Ordered oldest to newest.
         """
         conn: sqlite3.Connection = self._connect()
         try:
             rows = conn.execute(
                 """
-                SELECT date, account_equity_gbp, net_pnl_gbp
+                SELECT date, account_equity_usd, net_pnl_usd
                 FROM daily_summaries
                 ORDER BY date DESC
                 LIMIT ?
@@ -375,13 +362,13 @@ class PerformanceCalculator:
             cumulative: float = 0.0
             curve: list[dict[str, Any]] = []
             for s in summaries:
-                daily_pnl: float = s.get("net_pnl_gbp") or 0.0
+                daily_pnl: float = s.get("net_pnl_usd") or 0.0
                 cumulative += daily_pnl
                 curve.append({
                     "date": s["date"],
-                    "account_equity_gbp": s.get("account_equity_gbp", 0.0),
-                    "net_pnl_gbp": daily_pnl,
-                    "cumulative_pnl_gbp": round(cumulative, 2),
+                    "account_equity_usd": s.get("account_equity_usd", 0.0),
+                    "net_pnl_usd": daily_pnl,
+                    "cumulative_pnl_usd": round(cumulative, 2),
                 })
 
             return curve
@@ -404,7 +391,7 @@ class PerformanceCalculator:
         Returns
         -------
         List of dicts with keys: ticker, exchange, trade_count, wins,
-        losses, net_pnl_gbp, avg_pnl_gbp, win_rate.
+        losses, net_pnl_usd, avg_pnl_usd, win_rate.
         """
         conn: sqlite3.Connection = self._connect()
         try:
@@ -413,14 +400,14 @@ class PerformanceCalculator:
                     """
                     SELECT ticker, exchange,
                            COUNT(*) AS trade_count,
-                           SUM(CASE WHEN pnl_gbp > 0 THEN 1 ELSE 0 END) AS wins,
-                           SUM(CASE WHEN pnl_gbp < 0 THEN 1 ELSE 0 END) AS losses,
-                           COALESCE(SUM(pnl_gbp), 0.0) AS net_pnl_gbp,
-                           COALESCE(AVG(pnl_gbp), 0.0) AS avg_pnl_gbp
+                           SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) AS wins,
+                           SUM(CASE WHEN pnl_usd < 0 THEN 1 ELSE 0 END) AS losses,
+                           COALESCE(SUM(pnl_usd), 0.0) AS net_pnl_usd,
+                           COALESCE(AVG(pnl_usd), 0.0) AS avg_pnl_usd
                     FROM trades
-                    WHERE date(exit_time) = ? AND pnl_gbp IS NOT NULL
+                    WHERE date(exit_time) = ? AND pnl_usd IS NOT NULL
                     GROUP BY ticker
-                    ORDER BY net_pnl_gbp DESC
+                    ORDER BY net_pnl_usd DESC
                     """,
                     (date,),
                 ).fetchall()
@@ -429,14 +416,14 @@ class PerformanceCalculator:
                     """
                     SELECT ticker, exchange,
                            COUNT(*) AS trade_count,
-                           SUM(CASE WHEN pnl_gbp > 0 THEN 1 ELSE 0 END) AS wins,
-                           SUM(CASE WHEN pnl_gbp < 0 THEN 1 ELSE 0 END) AS losses,
-                           COALESCE(SUM(pnl_gbp), 0.0) AS net_pnl_gbp,
-                           COALESCE(AVG(pnl_gbp), 0.0) AS avg_pnl_gbp
+                           SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) AS wins,
+                           SUM(CASE WHEN pnl_usd < 0 THEN 1 ELSE 0 END) AS losses,
+                           COALESCE(SUM(pnl_usd), 0.0) AS net_pnl_usd,
+                           COALESCE(AVG(pnl_usd), 0.0) AS avg_pnl_usd
                     FROM trades
-                    WHERE pnl_gbp IS NOT NULL
+                    WHERE pnl_usd IS NOT NULL
                     GROUP BY ticker
-                    ORDER BY net_pnl_gbp DESC
+                    ORDER BY net_pnl_usd DESC
                     """
                 ).fetchall()
 
@@ -446,8 +433,8 @@ class PerformanceCalculator:
                 tc: int = d.get("trade_count", 0)
                 w: int = d.get("wins", 0)
                 d["win_rate"] = round(w / tc, 4) if tc > 0 else 0.0
-                d["net_pnl_gbp"] = round(d.get("net_pnl_gbp", 0.0), 2)
-                d["avg_pnl_gbp"] = round(d.get("avg_pnl_gbp", 0.0), 2)
+                d["net_pnl_usd"] = round(d.get("net_pnl_usd", 0.0), 2)
+                d["avg_pnl_usd"] = round(d.get("avg_pnl_usd", 0.0), 2)
                 results.append(d)
 
             return results
@@ -466,7 +453,7 @@ class PerformanceCalculator:
         Parameters
         ----------
         current_equity:
-            Current account equity in GBP.
+            Current account equity in USD.
         current_phase:
             Current phase number (0-3).
 
@@ -514,7 +501,7 @@ class PerformanceCalculator:
             # Estimate days remaining based on average daily P&L
             recent_rows = conn.execute(
                 """
-                SELECT net_pnl_gbp FROM daily_summaries
+                SELECT net_pnl_usd FROM daily_summaries
                 WHERE phase = ?
                 ORDER BY date DESC LIMIT 30
                 """,
@@ -522,7 +509,7 @@ class PerformanceCalculator:
             ).fetchall()
 
             daily_returns: list[float] = [
-                r["net_pnl_gbp"] for r in recent_rows if r["net_pnl_gbp"] is not None
+                r["net_pnl_usd"] for r in recent_rows if r["net_pnl_usd"] is not None
             ]
             avg_daily_pnl: float = (
                 (sum(daily_returns) / len(daily_returns)) if daily_returns else 0.0
@@ -536,13 +523,13 @@ class PerformanceCalculator:
             # Win rate from recent trades for display
             win_rate_rows = conn.execute(
                 """
-                SELECT pnl_gbp FROM trades
-                WHERE pnl_gbp IS NOT NULL AND phase = ?
+                SELECT pnl_usd FROM trades
+                WHERE pnl_usd IS NOT NULL AND phase = ?
                 ORDER BY exit_time DESC LIMIT 20
                 """,
                 (current_phase,),
             ).fetchall()
-            recent_wins: int = sum(1 for r in win_rate_rows if r["pnl_gbp"] > 0)
+            recent_wins: int = sum(1 for r in win_rate_rows if r["pnl_usd"] > 0)
             recent_total: int = len(win_rate_rows)
             recent_win_rate: float = (
                 (recent_wins / recent_total) if recent_total > 0 else 0.0
@@ -559,7 +546,7 @@ class PerformanceCalculator:
                 "trading_days_progress_pct": round(
                     min((trading_days / days_target) * 100.0, 100.0), 1
                 ) if days_target > 0 else 100.0,
-                "avg_daily_pnl_gbp": round(avg_daily_pnl, 2),
+                "avg_daily_pnl_usd": round(avg_daily_pnl, 2),
                 "estimated_days_remaining": estimated_days,
                 "recent_win_rate": round(recent_win_rate, 4),
                 "at_max_phase": current_phase >= 3,
@@ -580,9 +567,9 @@ class PerformanceCalculator:
         try:
             rows = conn.execute(
                 """
-                SELECT net_pnl_gbp, account_equity_gbp
+                SELECT net_pnl_usd, account_equity_usd
                 FROM daily_summaries
-                WHERE account_equity_gbp > 0
+                WHERE account_equity_usd > 0
                 ORDER BY date DESC
                 LIMIT ?
                 """,
@@ -591,8 +578,8 @@ class PerformanceCalculator:
 
             returns: list[float] = []
             for r in rows:
-                equity: float = r["account_equity_gbp"]
-                pnl: float = r["net_pnl_gbp"] or 0.0
+                equity: float = r["account_equity_usd"]
+                pnl: float = r["net_pnl_usd"] or 0.0
                 if equity > 0:
                     returns.append(pnl / equity)
 

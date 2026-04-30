@@ -187,21 +187,3 @@ def mock_earnings():
     return ec
 
 
-@pytest.fixture
-def mock_fx():
-    """Mock FXManager with GBP/USD = 1.25."""
-    fx = MagicMock()
-    fx.get_rate.return_value = 1.25
-    fx.rate = 1.25
-    fx.is_live = True
-    fx.to_gbp = lambda amount, currency: (
-        amount if currency.upper() == "GBP"
-        else (amount / 100.0 if currency.upper() == "GBX" else amount / 1.25)
-    )
-    fx.to_usd = lambda amount, currency: (
-        amount if currency.upper() == "USD"
-        else amount * 1.25
-    )
-    return fx
-
-

@@ -19,7 +19,6 @@ from trading_bot.constants import TZ_EASTERN
 
 if TYPE_CHECKING:
     from trading_bot.config import Config
-    from trading_bot.data.fx import FXManager
     from trading_bot.execution.risk_manager import RiskManager
     from trading_bot.gateway.connection import GatewayConnection
 
@@ -38,12 +37,10 @@ class HealthServer:
         config: Config,
         gateway: GatewayConnection,
         risk_manager: RiskManager | None = None,
-        fx: FXManager | None = None,
     ) -> None:
         self._config: Config = config
         self._gateway: GatewayConnection = gateway
         self._risk_manager: RiskManager | None = risk_manager
-        self._fx: FXManager | None = fx
 
         self._host: str = config.health_host
         self._port: int = config.health_port
@@ -112,9 +109,9 @@ class HealthServer:
             status = "running"
 
         # Account data
-        account_equity_gbp: float = 0.0
+        account_equity_usd: float = 0.0
         open_positions_count: int = 0
-        daily_pnl_gbp: float = 0.0
+        daily_pnl_usd: float = 0.0
         trades_today: int = 0
         phase: int = self._config.get_phase().value
 
@@ -142,20 +139,20 @@ class HealthServer:
                 # Daily P&L
                 row = conn.execute(
                     """
-                    SELECT COALESCE(SUM(pnl_gbp), 0.0) AS total
+                    SELECT COALESCE(SUM(pnl_usd), 0.0) AS total
                     FROM trades
-                    WHERE date(exit_time) = ? AND pnl_gbp IS NOT NULL
+                    WHERE date(exit_time) = ? AND pnl_usd IS NOT NULL
                     """,
                     (today_str,),
                 ).fetchone()
-                daily_pnl_gbp = float(row["total"]) if row else 0.0
+                daily_pnl_usd = float(row["total"]) if row else 0.0
 
                 # Latest equity from daily summaries
                 row = conn.execute(
-                    "SELECT account_equity_gbp FROM daily_summaries ORDER BY date DESC LIMIT 1"
+                    "SELECT account_equity_usd FROM daily_summaries ORDER BY date DESC LIMIT 1"
                 ).fetchone()
                 if row:
-                    account_equity_gbp = float(row["account_equity_gbp"])
+                    account_equity_usd = float(row["account_equity_usd"])
 
             finally:
                 conn.close()
@@ -165,7 +162,7 @@ class HealthServer:
 
         # Risk status
         risk_status: dict[str, Any] = self._get_risk_status(
-            account_equity_gbp, daily_pnl_gbp, trades_today
+            account_equity_usd, daily_pnl_usd, trades_today
         )
 
         body: dict[str, Any] = {
@@ -173,8 +170,8 @@ class HealthServer:
             "timestamp": now_et.isoformat(),
             "gateway_connected": gateway_connected,
             "phase": phase,
-            "account_equity_gbp": round(account_equity_gbp, 2),
-            "daily_pnl_gbp": round(daily_pnl_gbp, 2),
+            "account_equity_usd": round(account_equity_usd, 2),
+            "daily_pnl_usd": round(daily_pnl_usd, 2),
             "open_positions": open_positions_count,
             "trades_today": trades_today,
             "stale_symbols": list(self.stale_symbols),
@@ -192,14 +189,14 @@ class HealthServer:
 
     def _get_risk_status(
         self,
-        account_equity_gbp: float,
-        daily_pnl_gbp: float,
+        account_equity_usd: float,
+        daily_pnl_usd: float,
         trades_today: int,
     ) -> dict[str, Any]:
         """Build the risk status sub-object for the health response."""
         daily_loss_limit_pct: float = self._config.daily_loss_limit_pct
-        daily_loss_limit_gbp: float = account_equity_gbp * daily_loss_limit_pct
-        daily_loss_remaining: float = daily_loss_limit_gbp + daily_pnl_gbp  # pnl is negative when losing
+        daily_loss_limit_usd: float = account_equity_usd * daily_loss_limit_pct
+        daily_loss_remaining: float = daily_loss_limit_usd + daily_pnl_usd  # pnl is negative when losing
 
         max_daily_trades: int = self._config.get_max_daily_trades()
         trades_remaining: int = max(max_daily_trades - trades_today, 0)
@@ -210,9 +207,9 @@ class HealthServer:
             is_paused = getattr(self._risk_manager, "is_paused", False)
 
         return {
-            "daily_loss_remaining_gbp": round(max(daily_loss_remaining, 0.0), 2),
+            "daily_loss_remaining_usd": round(max(daily_loss_remaining, 0.0), 2),
             "trades_remaining": trades_remaining,
             "max_daily_trades": max_daily_trades,
-            "daily_loss_limit_gbp": round(daily_loss_limit_gbp, 2),
+            "daily_loss_limit_usd": round(daily_loss_limit_usd, 2),
             "is_paused": bool(is_paused),
         }

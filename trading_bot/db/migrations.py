@@ -316,6 +316,55 @@ def _migration_v9(conn: sqlite3.Connection) -> None:
     logger.info("Applied migration V9: dropped settlements table")
 
 
+def _migration_v10(conn: sqlite3.Connection) -> None:
+    """V10: rename ``_gbp`` columns to ``_usd``, drop ``trades.fx_rate``.
+
+    The bot has always been on Alpaca (USD) but the schema used GBP-suffixed
+    column names from a legacy multi-broker design. PR3 strips runtime FX
+    conversion and treats every value as USD; this migration aligns the
+    schema with that reality.
+
+    Numbers in the columns are NOT rescaled — historical GBP values stay as
+    they are, just labelled USD now (per PR3 option (b) — "leave the numbers,
+    accept they're now ~27% tighter"). Only the live paper account exists,
+    started fresh, so historical data is sparse.
+    """
+    renames: list[tuple[str, str, str]] = [
+        ("trades", "pnl_gbp", "pnl_usd"),
+        ("daily_summaries", "gross_pnl_gbp", "gross_pnl_usd"),
+        ("daily_summaries", "commissions_gbp", "commissions_usd"),
+        ("daily_summaries", "net_pnl_gbp", "net_pnl_usd"),
+        ("daily_summaries", "account_equity_gbp", "account_equity_usd"),
+        ("daily_summaries", "avg_win_gbp", "avg_win_usd"),
+        ("daily_summaries", "avg_loss_gbp", "avg_loss_usd"),
+        ("phase_transitions", "account_equity_gbp", "account_equity_usd"),
+        ("phase0_assessments", "current_value_gbp", "current_value_usd"),
+        ("phase0_assessments", "unrealized_pnl_gbp", "unrealized_pnl_usd"),
+    ]
+
+    def _has_column(table: str, column: str) -> bool:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(r[1] == column for r in rows)
+
+    for table, old, new in renames:
+        if _has_column(table, old) and not _has_column(table, new):
+            conn.execute(f"ALTER TABLE {table} RENAME COLUMN {old} TO {new}")
+        elif not _has_column(table, old) and _has_column(table, new):
+            # Already renamed (fresh install via _SCHEMA_SQL post-V10)
+            continue
+        # else: neither exists — table was created without the column, skip
+
+    # Drop trades.fx_rate (legacy FX-conversion metadata, no longer recorded)
+    if _has_column("trades", "fx_rate"):
+        conn.execute("ALTER TABLE trades DROP COLUMN fx_rate")
+
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_version (version, description) "
+        "VALUES (10, 'V10 schema - USD-only column rename')"
+    )
+    logger.info("Applied migration V10: USD-only column rename")
+
+
 _MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (4, "V4 schema - multi-market adaptive trading bot", _migration_v4),
     (5, "V5 schema - multi-strategy Alpaca trading bot", _migration_v5),
@@ -323,6 +372,7 @@ _MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (7, "V7 schema - tick_state + risk_circuit_state", _migration_v7),
     (8, "V8 schema - ENTRY_FAILED terminal status (data-only)", _migration_v8),
     (9, "V9 schema - settlements table removed", _migration_v9),
+    (10, "V10 schema - USD-only column rename", _migration_v10),
 ]
 
 

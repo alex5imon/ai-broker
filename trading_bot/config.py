@@ -43,7 +43,6 @@ class Config:
         "exit_intraday",
         "exit_swing",
         "notifications",
-        "fx",
         "phase0",
         "phases",
         "reporting",
@@ -125,15 +124,15 @@ class Config:
     # Phase detection
     # -----------------------------------------------------------------------
 
-    def get_phase(self, equity_gbp: float | None = None) -> Phase:
+    def get_phase(self, equity_usd: float | None = None) -> Phase:
         """Return the current operating phase.
 
         Resolution order:
         1. ``account.phase_override`` (if set to an integer 0-3)
-        2. Auto-detect from *equity_gbp* against phase thresholds
-        3. If *equity_gbp* is ``None`` and no override, default to ``Phase.MICRO``
+        2. Auto-detect from *equity_usd* against phase thresholds
+        3. If *equity_usd* is ``None`` and no override, default to ``Phase.MICRO``
         """
-        if self._phase is not None and equity_gbp is None:
+        if self._phase is not None and equity_usd is None:
             return self._phase
 
         override: int | None = self._get("account", "phase_override")
@@ -142,17 +141,17 @@ class Config:
             self._phase = phase
             return phase
 
-        if equity_gbp is None:
+        if equity_usd is None:
             # No equity supplied and no override -> conservative default
             self._phase = Phase.MICRO
             return Phase.MICRO
 
-        p2_threshold: float = float(self._require("phases", "phase1_to_phase2", "equity_gbp"))
-        p3_threshold: float = float(self._require("phases", "phase2_to_phase3", "equity_gbp"))
+        p2_threshold: float = float(self._require("phases", "phase1_to_phase2", "equity_usd"))
+        p3_threshold: float = float(self._require("phases", "phase2_to_phase3", "equity_usd"))
 
-        if equity_gbp >= p3_threshold:
+        if equity_usd >= p3_threshold:
             phase = Phase.FULL
-        elif equity_gbp >= p2_threshold:
+        elif equity_usd >= p2_threshold:
             phase = Phase.SMALL
         else:
             phase = Phase.MICRO
@@ -352,10 +351,6 @@ class Config:
         return int(self._require("sentiment", "cache_ttl_minutes"))
 
     @property
-    def fx_fallback_gbp_usd(self) -> float:
-        return float(self._get("fx", "fallback_gbp_usd", default=1.27))
-
-    @property
     def log_level(self) -> str:
         return str(self._get("logging", "level", default="INFO"))
 
@@ -493,8 +488,8 @@ class Config:
                 _check_positive(errors, section.get("take_profit_pct"), f"{section_name}.take_profit_pct")
 
         # Phase transition thresholds must be positive and ordered
-        p2_eq = self._get("phases", "phase1_to_phase2", "equity_gbp")
-        p3_eq = self._get("phases", "phase2_to_phase3", "equity_gbp")
+        p2_eq = self._get("phases", "phase1_to_phase2", "equity_usd")
+        p3_eq = self._get("phases", "phase2_to_phase3", "equity_usd")
         if p2_eq is not None and p3_eq is not None:
             if float(p3_eq) <= float(p2_eq):
                 errors.append(

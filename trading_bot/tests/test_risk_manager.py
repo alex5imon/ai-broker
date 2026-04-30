@@ -29,8 +29,8 @@ ET = ZoneInfo("US/Eastern")
 
 
 @pytest.fixture
-def risk_manager(config: Config, tmp_db_path: str, mock_fx, mock_notifier) -> RiskManager:
-    rm = RiskManager(config, tmp_db_path, mock_fx, mock_notifier)
+def risk_manager(config: Config, tmp_db_path: str, mock_notifier) -> RiskManager:
+    rm = RiskManager(config, tmp_db_path, mock_notifier)
     return rm
 
 
@@ -158,7 +158,7 @@ class TestDrawdownBreaker:
             d = (today - timedelta(days=i + 1)).isoformat()
             conn.execute(
                 """INSERT OR REPLACE INTO daily_summaries
-                   (date, account_equity_gbp, phase)
+                   (date, account_equity_usd, phase)
                    VALUES (?, ?, 1)""",
                 (d, 1000.0),
             )
@@ -183,7 +183,7 @@ class TestDrawdownBreaker:
         for i in range(5):
             d = (today - timedelta(days=i + 1)).isoformat()
             conn.execute(
-                "INSERT OR REPLACE INTO daily_summaries (date, account_equity_gbp, phase) VALUES (?,?,1)",
+                "INSERT OR REPLACE INTO daily_summaries (date, account_equity_usd, phase) VALUES (?,?,1)",
                 (d, 1000.0),
             )
         conn.commit()
@@ -299,7 +299,7 @@ class TestDailyReset:
 
         risk_manager.reset_daily()
 
-        assert risk_manager.daily_pnl_gbp == 0.0
+        assert risk_manager.daily_pnl_usd == 0.0
         assert risk_manager.trade_count == 0
         assert len(risk_manager._recent_rejections) == 0
         ok, _ = risk_manager.can_trade()
@@ -319,4 +319,4 @@ class TestDailyReset:
         risk_manager.record_trade(5.0, 1.0)
         risk_manager.record_trade(-3.0, 0.5)
         assert risk_manager.trade_count == 2
-        assert abs(risk_manager.daily_pnl_gbp - 2.0) < 0.01
+        assert abs(risk_manager.daily_pnl_usd - 2.0) < 0.01

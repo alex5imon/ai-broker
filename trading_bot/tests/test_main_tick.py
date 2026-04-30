@@ -48,12 +48,6 @@ def trading_bot(config, tmp_db_path, monkeypatch):
     bot._gateway.get_positions = AsyncMock(return_value=[])
     bot._gateway.get_open_orders = AsyncMock(return_value=[])
 
-    bot._fx = MagicMock()
-    bot._fx.refresh = AsyncMock()
-    bot._fx.get_rate = MagicMock(return_value=1.25)
-    bot._fx.to_gbp = MagicMock(side_effect=lambda amt, ccy: amt / 1.25)
-    bot._fx.to_usd = MagicMock(side_effect=lambda amt, ccy: amt * 1.25)
-
     bot._market_data = MagicMock()
     bot._market_data.refresh_quotes = AsyncMock()
     bot._market_data.get_latest_price = MagicMock(return_value=100.0)
@@ -156,8 +150,7 @@ async def test_tick_aborts_on_gateway_failure(trading_bot):
     _open_hours(trading_bot)
     trading_bot._gateway.connect = AsyncMock(return_value=False)
     await trading_bot.tick()
-    # FX refresh and state recovery should NOT have been called
-    trading_bot._fx.refresh.assert_not_called()
+    # State recovery should NOT have been called
     trading_bot._state_recovery.recover.assert_not_called()
 
 
@@ -179,7 +172,6 @@ async def test_tick_full_cycle_outside_market_window(trading_bot):
     await trading_bot.tick()
 
     trading_bot._gateway.connect.assert_called_once()
-    trading_bot._fx.refresh.assert_awaited()
     trading_bot._state_recovery.recover.assert_awaited()
     trading_bot._order_manager._check_order_statuses.assert_awaited()
     trading_bot._market_data.refresh_quotes.assert_awaited()
@@ -233,9 +225,11 @@ async def test_tick_runs_wind_down_within_window(trading_bot):
 async def test_tick_disconnects_in_finally_even_on_error(trading_bot):
     trading_bot._config.is_trading_day = MagicMock(return_value=True)
     _open_hours(trading_bot)
-    # Force fx.refresh to raise — the inner try/except should swallow it,
-    # but state_recovery should still run and finally should still disconnect.
-    trading_bot._fx.refresh = AsyncMock(side_effect=RuntimeError("boom"))
+    # Force state_recovery to raise — the outer try/finally should still
+    # disconnect cleanly even when an inner step blows up.
+    trading_bot._state_recovery.recover = AsyncMock(
+        side_effect=RuntimeError("boom")
+    )
     await trading_bot.tick()
     trading_bot._gateway.disconnect.assert_awaited()
     trading_bot._notifier.shutdown.assert_awaited()

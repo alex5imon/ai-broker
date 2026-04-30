@@ -7,6 +7,7 @@ import logging
 import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -31,12 +32,12 @@ def _seed_trade(
     *,
     ticker: str = "SPY",
     exit_time: str | None = None,
-    pnl_gbp: float = 1.0,
+    pnl_usd: float = 1.0,
     gross_pnl: float = 1.0,
     currency: str = "USD",
-    fx_rate: float = 1.25,
     side: str = "BUY",
     quantity: int = 10,
+    **_legacy: Any,
 ) -> None:
     if exit_time is None:
         exit_time = datetime.now(tz=ET).isoformat()
@@ -45,12 +46,12 @@ def _seed_trade(
             """INSERT INTO trades (
                 ticker, exchange, currency, side, entry_time, exit_time,
                 entry_price, exit_price, quantity, hold_type, phase,
-                signal_price, gross_pnl, pnl_gbp, fx_rate
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                signal_price, gross_pnl, pnl_usd
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 ticker, "US", currency, side,
                 exit_time, exit_time, 100.0, 101.0, quantity, "intraday", 1,
-                100.0, gross_pnl, pnl_gbp, fx_rate,
+                100.0, gross_pnl, pnl_usd,
             ),
         )
         conn.commit()
@@ -58,20 +59,20 @@ def _seed_trade(
 
 def _seed_daily_summary(
     db_path: str, *, date_str: str, total_trades: int = 1, wins: int = 1,
-    losses: int = 0, gross_pnl_gbp: float = 1.0, commissions_gbp: float = 0.0,
-    net_pnl_gbp: float = 1.0, account_equity_gbp: float = 1000.0,
+    losses: int = 0, gross_pnl_usd: float = 1.0, commissions_usd: float = 0.0,
+    net_pnl_usd: float = 1.0, account_equity_usd: float = 1000.0,
     phase: int = 1,
 ) -> None:
     with sqlite3.connect(db_path) as conn:
         conn.execute(
             """INSERT INTO daily_summaries (
-                date, total_trades, wins, losses, gross_pnl_gbp,
-                commissions_gbp, net_pnl_gbp, win_rate, account_equity_gbp, phase
+                date, total_trades, wins, losses, gross_pnl_usd,
+                commissions_usd, net_pnl_usd, win_rate, account_equity_usd, phase
             ) VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (
                 date_str, total_trades, wins, losses,
-                gross_pnl_gbp, commissions_gbp, net_pnl_gbp,
-                wins / max(total_trades, 1), account_equity_gbp, phase,
+                gross_pnl_usd, commissions_usd, net_pnl_usd,
+                wins / max(total_trades, 1), account_equity_usd, phase,
             ),
         )
         conn.commit()
@@ -91,50 +92,38 @@ def test_daily_metrics_with_wins_and_losses(tmp_db_path):
     today_str = date.today().isoformat()
     today_iso = datetime.now(tz=ET).isoformat()
     # Two wins, one loss
-    _seed_trade(tmp_db_path, ticker="A", exit_time=today_iso, pnl_gbp=10.0, gross_pnl=12.5)
-    _seed_trade(tmp_db_path, ticker="B", exit_time=today_iso, pnl_gbp=5.0, gross_pnl=6.25)
-    _seed_trade(tmp_db_path, ticker="C", exit_time=today_iso, pnl_gbp=-3.0, gross_pnl=-3.75)
+    _seed_trade(tmp_db_path, ticker="A", exit_time=today_iso, pnl_usd=10.0, gross_pnl=12.5)
+    _seed_trade(tmp_db_path, ticker="B", exit_time=today_iso, pnl_usd=5.0, gross_pnl=6.25)
+    _seed_trade(tmp_db_path, ticker="C", exit_time=today_iso, pnl_usd=-3.0, gross_pnl=-3.75)
     m = pc.calculate_daily_metrics(today_str)
     assert m["total_trades"] == 3
     assert m["wins"] == 2
     assert m["losses"] == 1
     assert m["win_rate"] == pytest.approx(2 / 3, rel=1e-3)
     assert m["profit_factor"] == pytest.approx(15.0 / 3.0, rel=1e-3)
-    assert m["largest_win_gbp"] == 10.0
-    assert m["largest_loss_gbp"] == -3.0
+    assert m["largest_win_usd"] == 10.0
+    assert m["largest_loss_usd"] == -3.0
 
 
-def test_daily_metrics_gbx_currency_conversion(tmp_db_path):
-    pc = PerformanceCalculator(tmp_db_path)
-    today_str = date.today().isoformat()
-    today_iso = datetime.now(tz=ET).isoformat()
-    # GBX trade: gross_pnl=1000 pence → 10 GBP
-    _seed_trade(
-        tmp_db_path, ticker="X", exit_time=today_iso,
-        pnl_gbp=10.0, gross_pnl=1000.0, currency="GBX",
-    )
-    m = pc.calculate_daily_metrics(today_str)
-    assert m["gross_pnl_gbp"] == 10.0
-
-
-def test_daily_metrics_gbp_passthrough(tmp_db_path):
+def test_daily_metrics_usd_passthrough(tmp_db_path):
+    """Account is USD-only — gross_pnl flows through unchanged."""
     pc = PerformanceCalculator(tmp_db_path)
     today_str = date.today().isoformat()
     today_iso = datetime.now(tz=ET).isoformat()
     _seed_trade(
         tmp_db_path, ticker="X", exit_time=today_iso,
-        pnl_gbp=10.0, gross_pnl=10.0, currency="GBP", fx_rate=1.0,
+        pnl_usd=10.0, gross_pnl=10.0, currency="USD",
     )
     m = pc.calculate_daily_metrics(today_str)
-    assert m["gross_pnl_gbp"] == 10.0
+    assert m["gross_pnl_usd"] == 10.0
 
 
 def test_intraday_drawdown():
     trades = [
-        {"pnl_gbp": 10.0},   # cumulative 10, peak 10
-        {"pnl_gbp": -5.0},   # cumulative 5, drawdown 5/10=50%
-        {"pnl_gbp": -2.0},   # cumulative 3, drawdown 7/10=70%
-        {"pnl_gbp": 100.0},  # cumulative 103, peak 103
+        {"pnl_usd": 10.0},   # cumulative 10, peak 10
+        {"pnl_usd": -5.0},   # cumulative 5, drawdown 5/10=50%
+        {"pnl_usd": -2.0},   # cumulative 3, drawdown 7/10=70%
+        {"pnl_usd": 100.0},  # cumulative 103, peak 103
     ]
     dd = PerformanceCalculator._calculate_intraday_drawdown(trades)
     assert dd == pytest.approx(0.7)
@@ -155,17 +144,17 @@ def test_period_metrics_aggregates(tmp_db_path):
     pc = PerformanceCalculator(tmp_db_path)
     _seed_daily_summary(
         tmp_db_path, date_str="2026-04-01", total_trades=3, wins=2, losses=1,
-        gross_pnl_gbp=12.0, net_pnl_gbp=11.50,
+        gross_pnl_usd=12.0, net_pnl_usd=11.50,
     )
     _seed_daily_summary(
         tmp_db_path, date_str="2026-04-02", total_trades=2, wins=1, losses=1,
-        gross_pnl_gbp=5.0, net_pnl_gbp=4.50,
+        gross_pnl_usd=5.0, net_pnl_usd=4.50,
     )
-    _seed_trade(tmp_db_path, ticker="A", exit_time="2026-04-01T10:00", pnl_gbp=10.0)
-    _seed_trade(tmp_db_path, ticker="B", exit_time="2026-04-01T11:00", pnl_gbp=2.0)
-    _seed_trade(tmp_db_path, ticker="C", exit_time="2026-04-01T12:00", pnl_gbp=-1.0)
-    _seed_trade(tmp_db_path, ticker="D", exit_time="2026-04-02T10:00", pnl_gbp=5.0)
-    _seed_trade(tmp_db_path, ticker="E", exit_time="2026-04-02T11:00", pnl_gbp=-1.0)
+    _seed_trade(tmp_db_path, ticker="A", exit_time="2026-04-01T10:00", pnl_usd=10.0)
+    _seed_trade(tmp_db_path, ticker="B", exit_time="2026-04-01T11:00", pnl_usd=2.0)
+    _seed_trade(tmp_db_path, ticker="C", exit_time="2026-04-01T12:00", pnl_usd=-1.0)
+    _seed_trade(tmp_db_path, ticker="D", exit_time="2026-04-02T10:00", pnl_usd=5.0)
+    _seed_trade(tmp_db_path, ticker="E", exit_time="2026-04-02T11:00", pnl_usd=-1.0)
 
     m = pc.calculate_period_metrics("2026-04-01", "2026-04-02")
     assert m["trading_days"] == 2
@@ -199,13 +188,13 @@ def test_get_equity_curve_empty(tmp_db_path):
 
 def test_get_equity_curve_chronological(tmp_db_path):
     pc = PerformanceCalculator(tmp_db_path)
-    _seed_daily_summary(tmp_db_path, date_str="2026-04-01", net_pnl_gbp=5.0)
-    _seed_daily_summary(tmp_db_path, date_str="2026-04-02", net_pnl_gbp=3.0)
+    _seed_daily_summary(tmp_db_path, date_str="2026-04-01", net_pnl_usd=5.0)
+    _seed_daily_summary(tmp_db_path, date_str="2026-04-02", net_pnl_usd=3.0)
     curve = pc.get_equity_curve(n_days=10)
     assert curve[0]["date"] == "2026-04-01"
     assert curve[-1]["date"] == "2026-04-02"
     # Cumulative should sum
-    assert curve[-1]["cumulative_pnl_gbp"] == pytest.approx(8.0)
+    assert curve[-1]["cumulative_pnl_usd"] == pytest.approx(8.0)
 
 
 # ===========================================================================
@@ -415,7 +404,7 @@ def test_health_get_risk_status_with_risk_manager(health_config):
     hs = HealthServer(health_config, gateway=MagicMock(), risk_manager=rm)
     status = hs._get_risk_status(1000.0, -10.0, 5)
     assert status["is_paused"] is True
-    assert "daily_loss_remaining_gbp" in status
+    assert "daily_loss_remaining_usd" in status
     assert "trades_remaining" in status
 
 
@@ -484,14 +473,14 @@ def test_save_daily_summary_writes_row(tmp_db_path):
         "total_trades": 3,
         "wins": 2,
         "losses": 1,
-        "gross_pnl_gbp": 12.5,
-        "commissions_gbp": 0.0,
-        "net_pnl_gbp": 12.5,
-        "account_equity_gbp": 100012.5,
+        "gross_pnl_usd": 12.5,
+        "commissions_usd": 0.0,
+        "net_pnl_usd": 12.5,
+        "account_equity_usd": 100012.5,
         "max_drawdown_pct": 0.005,
         "win_rate": 0.667,
-        "avg_win_gbp": 7.0,
-        "avg_loss_gbp": -1.5,
+        "avg_win_usd": 7.0,
+        "avg_loss_usd": -1.5,
         "profit_factor": 9.33,
         "phase": 1,
         "us_trades": 3,
@@ -502,7 +491,7 @@ def test_save_daily_summary_writes_row(tmp_db_path):
     try:
         repo.save_daily_summary(conn, summary)
         row = conn.execute(
-            "SELECT date, total_trades, net_pnl_gbp, phase, account_equity_gbp "
+            "SELECT date, total_trades, net_pnl_usd, phase, account_equity_usd "
             "FROM daily_summaries WHERE date = ?",
             ("2026-04-30",),
         ).fetchone()
@@ -525,10 +514,10 @@ def test_save_daily_summary_replaces_existing_row(tmp_db_path):
         "total_trades": 1,
         "wins": 1,
         "losses": 0,
-        "gross_pnl_gbp": 5.0,
-        "commissions_gbp": 0.0,
-        "net_pnl_gbp": 5.0,
-        "account_equity_gbp": 100005.0,
+        "gross_pnl_usd": 5.0,
+        "commissions_usd": 0.0,
+        "net_pnl_usd": 5.0,
+        "account_equity_usd": 100005.0,
         "phase": 1,
         "us_trades": 1,
     }
@@ -536,10 +525,10 @@ def test_save_daily_summary_replaces_existing_row(tmp_db_path):
     try:
         repo.save_daily_summary(conn, base)
         # End-of-day re-save with updated metrics.
-        updated = {**base, "total_trades": 5, "net_pnl_gbp": 25.0}
+        updated = {**base, "total_trades": 5, "net_pnl_usd": 25.0}
         repo.save_daily_summary(conn, updated)
         row = conn.execute(
-            "SELECT total_trades, net_pnl_gbp FROM daily_summaries WHERE date = ?",
+            "SELECT total_trades, net_pnl_usd FROM daily_summaries WHERE date = ?",
             ("2026-04-30",),
         ).fetchone()
     finally:
@@ -554,7 +543,7 @@ def test_save_daily_summary_ignores_dropped_lse_fields(tmp_db_path):
 
     summary = {
         "date": "2026-04-30",
-        "account_equity_gbp": 100000.0,
+        "account_equity_usd": 100000.0,
         "phase": 1,
         # Legacy keys that no longer exist in schema:
         "lse_trades": 0,

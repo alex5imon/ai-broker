@@ -18,7 +18,7 @@ from trading_bot.strategy.portfolio_assessor import PortfolioAssessor, PositionA
 
 def _make_assessor(
     config: Config,
-    mock_fx,
+    
     mock_notifier,
     market_data: Any = None,
     sentiment: Any = None,
@@ -32,7 +32,7 @@ def _make_assessor(
         sentiment = MagicMock()
         sentiment.get_sentiment = AsyncMock(return_value=0.2)
 
-    return PortfolioAssessor(config, market_data, sentiment, mock_fx, mock_notifier)
+    return PortfolioAssessor(config, market_data, sentiment, mock_notifier)
 
 
 def _pltr_position() -> dict[str, Any]:
@@ -68,23 +68,23 @@ def _penny_position() -> dict[str, Any]:
 
 class TestExchangeScoring:
     def test_nasdaq_gets_max_exchange_score(
-        self, config: Config, mock_fx, mock_notifier
+        self, config: Config, mock_notifier
     ) -> None:
-        assessor = _make_assessor(config, mock_fx, mock_notifier)
+        assessor = _make_assessor(config, mock_notifier)
         score = assessor._score_exchange("NASDAQ")
         assert score == assessor._w_exchange
 
     def test_nyse_gets_max_exchange_score(
-        self, config: Config, mock_fx, mock_notifier
+        self, config: Config, mock_notifier
     ) -> None:
-        assessor = _make_assessor(config, mock_fx, mock_notifier)
+        assessor = _make_assessor(config, mock_notifier)
         score = assessor._score_exchange("NYSE")
         assert score == assessor._w_exchange
 
     def test_unknown_exchange_gets_zero(
-        self, config: Config, mock_fx, mock_notifier
+        self, config: Config, mock_notifier
     ) -> None:
-        assessor = _make_assessor(config, mock_fx, mock_notifier)
+        assessor = _make_assessor(config, mock_notifier)
         score = assessor._score_exchange("UNKNOWN")
         assert score == 0
 
@@ -96,28 +96,28 @@ class TestExchangeScoring:
 
 class TestLossScoring:
     def test_profit_gets_max_loss_score(
-        self, config: Config, mock_fx, mock_notifier
+        self, config: Config, mock_notifier
     ) -> None:
-        assessor = _make_assessor(config, mock_fx, mock_notifier)
+        assessor = _make_assessor(config, mock_notifier)
         assert assessor._score_loss(0.05) == assessor._w_loss
 
     def test_small_loss_gets_max_loss_score(
-        self, config: Config, mock_fx, mock_notifier
+        self, config: Config, mock_notifier
     ) -> None:
-        assessor = _make_assessor(config, mock_fx, mock_notifier)
+        assessor = _make_assessor(config, mock_notifier)
         assert assessor._score_loss(-0.03) == assessor._w_loss
 
     def test_medium_loss_gets_partial_score(
-        self, config: Config, mock_fx, mock_notifier
+        self, config: Config, mock_notifier
     ) -> None:
-        assessor = _make_assessor(config, mock_fx, mock_notifier)
+        assessor = _make_assessor(config, mock_notifier)
         score = assessor._score_loss(-0.10)
         assert 0 < score < assessor._w_loss
 
     def test_deep_loss_gets_zero(
-        self, config: Config, mock_fx, mock_notifier
+        self, config: Config, mock_notifier
     ) -> None:
-        assessor = _make_assessor(config, mock_fx, mock_notifier)
+        assessor = _make_assessor(config, mock_notifier)
         score = assessor._score_loss(-0.35)
         assert score == 0
 
@@ -129,13 +129,13 @@ class TestLossScoring:
 
 class TestClassification:
     def _assess_with_score(
-        self, config: Config, mock_fx, mock_notifier, total_score: int
+        self, config: Config, mock_notifier, total_score: int
     ) -> PositionAssessment:
         return PositionAssessment(
             ticker="TEST",
             exchange="NYSE",
-            current_value_gbp=100.0,
-            unrealized_pnl_gbp=0.0,
+            current_value_usd=100.0,
+            unrealized_pnl_usd=0.0,
             score=total_score,
             classification=(
                 "HOLD" if total_score >= 60
@@ -145,39 +145,39 @@ class TestClassification:
         )
 
     def test_classification_hold(
-        self, config: Config, mock_fx, mock_notifier
+        self, config: Config, mock_notifier
     ) -> None:
-        a = self._assess_with_score(config, mock_fx, mock_notifier, 75)
+        a = self._assess_with_score(config, mock_notifier, 75)
         assert a.classification == "HOLD"
 
     def test_classification_sell(
-        self, config: Config, mock_fx, mock_notifier
+        self, config: Config, mock_notifier
     ) -> None:
-        a = self._assess_with_score(config, mock_fx, mock_notifier, 45)
+        a = self._assess_with_score(config, mock_notifier, 45)
         assert a.classification == "SELL"
 
     def test_classification_urgent_sell(
-        self, config: Config, mock_fx, mock_notifier
+        self, config: Config, mock_notifier
     ) -> None:
-        a = self._assess_with_score(config, mock_fx, mock_notifier, 20)
+        a = self._assess_with_score(config, mock_notifier, 20)
         assert a.classification == "URGENT_SELL"
 
     def test_boundary_at_60_is_hold(
-        self, config: Config, mock_fx, mock_notifier
+        self, config: Config, mock_notifier
     ) -> None:
-        a = self._assess_with_score(config, mock_fx, mock_notifier, 60)
+        a = self._assess_with_score(config, mock_notifier, 60)
         assert a.classification == "HOLD"
 
     def test_boundary_at_30_is_sell(
-        self, config: Config, mock_fx, mock_notifier
+        self, config: Config, mock_notifier
     ) -> None:
-        a = self._assess_with_score(config, mock_fx, mock_notifier, 30)
+        a = self._assess_with_score(config, mock_notifier, 30)
         assert a.classification == "SELL"
 
     def test_below_30_is_urgent_sell(
-        self, config: Config, mock_fx, mock_notifier
+        self, config: Config, mock_notifier
     ) -> None:
-        a = self._assess_with_score(config, mock_fx, mock_notifier, 29)
+        a = self._assess_with_score(config, mock_notifier, 29)
         assert a.classification == "URGENT_SELL"
 
 
@@ -189,7 +189,7 @@ class TestClassification:
 class TestScorePosition:
     @pytest.mark.asyncio
     async def test_pltr_scores_high(
-        self, config: Config, mock_fx, mock_notifier
+        self, config: Config, mock_notifier
     ) -> None:
         """PLTR (NASDAQ, positive P&L) should classify as HOLD."""
         bar = MagicMock()
@@ -207,7 +207,7 @@ class TestScorePosition:
         sentiment = MagicMock()
         sentiment.get_sentiment = AsyncMock(return_value=0.3)
 
-        assessor = _make_assessor(config, mock_fx, mock_notifier,
+        assessor = _make_assessor(config, mock_notifier,
                                   market_data=md, sentiment=sentiment)
         result = await assessor.score_position(_pltr_position())
         assert result.classification == "HOLD"
@@ -215,7 +215,7 @@ class TestScorePosition:
 
     @pytest.mark.asyncio
     async def test_penny_scores_low(
-        self, config: Config, mock_fx, mock_notifier
+        self, config: Config, mock_notifier
     ) -> None:
         """Penny stock (deep loss, low volume) should be URGENT_SELL."""
         bar = MagicMock()
@@ -231,7 +231,7 @@ class TestScorePosition:
         sentiment = MagicMock()
         sentiment.get_sentiment = AsyncMock(return_value=-0.4)
 
-        assessor = _make_assessor(config, mock_fx, mock_notifier,
+        assessor = _make_assessor(config, mock_notifier,
                                   market_data=md, sentiment=sentiment)
         result = await assessor.score_position(_penny_position())
         assert result.classification == "URGENT_SELL"
@@ -239,7 +239,7 @@ class TestScorePosition:
 
     @pytest.mark.asyncio
     async def test_trailing_stop_set_for_holds(
-        self, config: Config, mock_fx, mock_notifier
+        self, config: Config, mock_notifier
     ) -> None:
         """HOLD positions get trailing_stop_price = current_price * 0.95."""
         bar = MagicMock()
@@ -255,7 +255,7 @@ class TestScorePosition:
         sentiment = MagicMock()
         sentiment.get_sentiment = AsyncMock(return_value=0.3)
 
-        assessor = _make_assessor(config, mock_fx, mock_notifier,
+        assessor = _make_assessor(config, mock_notifier,
                                   market_data=md, sentiment=sentiment)
         result = await assessor.score_position(_pltr_position())
         if result.classification == "HOLD":

@@ -27,7 +27,6 @@ from trading_bot.constants import (
     TZ_EASTERN,
 )
 from trading_bot.data.earnings import EarningsCalendar
-from trading_bot.data.fx import FXManager
 from trading_bot.data.market_data import MarketDataManager
 from trading_bot.data.sentiment import SentimentAnalyzer
 from trading_bot.db import repository as repo
@@ -53,7 +52,7 @@ class EntryDecision:
     direction: str | None  # 'long' or 'short'
     signal_price: float | None
     position_size: int | None  # Number of shares
-    position_value_gbp: float | None
+    position_value_usd: float | None
     stop_price: float | None
     target_price: float | None
     hold_type: HoldType | None
@@ -82,7 +81,6 @@ class EntryEvaluator:
         sentiment: SentimentAnalyzer,
         earnings: EarningsCalendar,
         market_data: MarketDataManager,
-        fx: FXManager,
         db_path: str,
     ) -> None:
         self._config: Config = config
@@ -90,7 +88,6 @@ class EntryEvaluator:
         self._sentiment: SentimentAnalyzer = sentiment
         self._earnings: EarningsCalendar = earnings
         self._market_data: MarketDataManager = market_data
-        self._fx: FXManager = fx
         self._db_path: str = db_path
 
         # Entry config
@@ -135,7 +132,7 @@ class EntryEvaluator:
         exchange: str,
         df_5min: pd.DataFrame,
         df_daily: pd.DataFrame,
-        account_equity_gbp: float,
+        account_equity_usd: float,
     ) -> EntryDecision:
         """Full entry evaluation for a ticker.
 
@@ -240,14 +237,13 @@ class EntryEvaluator:
             exchange=exchange,
             signal_price=signal_price,
             stop_loss_pct=stop_loss_pct,
-            account_equity_gbp=account_equity_gbp,
+            account_equity_usd=account_equity_usd,
             atr_rank=atr_rank,
             sentiment_size_mult=sentiment_size_mult,
             phase=phase,
         )
 
-        # Convert to GBP for limit checks
-        position_value_gbp: float = self._fx.to_gbp(position_value_local, "USD")
+        position_value_usd: float = position_value_local
 
         if position_size <= 0:
             rejections.append("Computed position size is zero shares")
@@ -288,12 +284,12 @@ class EntryEvaluator:
             )
 
         # -- 16. Daily P&L limit ---------------------------------------------
-        daily_loss_limit: float = account_equity_gbp * self._config.daily_loss_limit_pct
-        daily_pnl: float = self._get_daily_pnl_gbp()
+        daily_loss_limit: float = account_equity_usd * self._config.daily_loss_limit_pct
+        daily_pnl: float = self._get_daily_pnl_usd()
         if daily_pnl < 0 and abs(daily_pnl) >= daily_loss_limit:
             rejections.append(
-                f"Daily loss limit hit: {daily_pnl:.2f} GBP "
-                f"(limit -{daily_loss_limit:.2f} GBP)"
+                f"Daily loss limit hit: {daily_pnl:.2f} USD "
+                f"(limit -{daily_loss_limit:.2f} USD)"
             )
 
         # -- Decision ---------------------------------------------------------
@@ -327,7 +323,7 @@ class EntryEvaluator:
             direction=direction,
             signal_price=signal_price,
             position_size=position_size,
-            position_value_gbp=position_value_gbp,
+            position_value_usd=position_value_usd,
             stop_price=stop_price,
             target_price=target_price,
             hold_type=hold_type,
@@ -358,7 +354,7 @@ class EntryEvaluator:
             direction=None,
             signal_price=None,
             position_size=None,
-            position_value_gbp=None,
+            position_value_usd=None,
             stop_price=None,
             target_price=None,
             hold_type=None,
@@ -385,7 +381,7 @@ class EntryEvaluator:
         exchange: str,
         signal_price: float,
         stop_loss_pct: float,
-        account_equity_gbp: float,
+        account_equity_usd: float,
         atr_rank: float,
         sentiment_size_mult: float,
         phase: Phase,
@@ -410,11 +406,8 @@ class EntryEvaluator:
         if signal_price <= 0 or stop_loss_pct <= 0:
             return 0, 0.0
 
-        # Convert equity to USD for comparisons
-        equity_local: float = self._fx.to_usd(account_equity_gbp, "GBP")
-
         risk_per_trade: float = self._config.get_risk_per_trade()
-        max_risk_amount: float = equity_local * risk_per_trade
+        max_risk_amount: float = account_equity_usd * risk_per_trade
 
         stop_distance: float = signal_price * stop_loss_pct
         if stop_distance <= 0:
@@ -424,7 +417,7 @@ class EntryEvaluator:
 
         # Constraint 1: max position percentage
         max_position_pct: float = self._config.get_max_position_pct()
-        max_position_value: float = equity_local * max_position_pct
+        max_position_value: float = account_equity_usd * max_position_pct
         if shares * signal_price > max_position_value:
             shares = math.floor(max_position_value / signal_price)
 
@@ -576,12 +569,12 @@ class EntryEvaluator:
             logger.exception("Error fetching daily trade count")
             return 0
 
-    def _get_daily_pnl_gbp(self) -> float:
-        """Get today's realised P&L in GBP from the DB."""
+    def _get_daily_pnl_usd(self) -> float:
+        """Get today's realised P&L in USD from the DB."""
         try:
             conn: sqlite3.Connection = sqlite3.connect(self._db_path)
             conn.row_factory = sqlite3.Row
-            pnl: float = repo.get_daily_pnl_gbp(conn)
+            pnl: float = repo.get_daily_pnl_usd(conn)
             conn.close()
             return pnl
         except sqlite3.Error:

@@ -28,7 +28,7 @@ def _build_config() -> Config:
 
 def _insert_summary(conn, d: str) -> None:
     conn.execute(
-        "INSERT INTO daily_summaries (date, account_equity_gbp, phase) VALUES (?, 1000, 1)",
+        "INSERT INTO daily_summaries (date, account_equity_usd, phase) VALUES (?, 1000, 1)",
         (d,),
     )
 
@@ -119,7 +119,7 @@ def test_skips_holidays(tmp_path):
     conn = sqlite3.connect(db)
     conn.execute(
         "CREATE TABLE daily_summaries (date TEXT PRIMARY KEY, "
-        "account_equity_gbp REAL, phase INTEGER)"
+        "account_equity_usd REAL, phase INTEGER)"
     )
     conn.commit()
     conn.close()

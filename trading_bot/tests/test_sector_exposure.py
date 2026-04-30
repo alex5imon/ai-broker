@@ -31,9 +31,9 @@ def _sector_position(sector: str) -> dict[str, Any]:
 
 class TestPhase1SectorExposure:
     @pytest.fixture
-    def rm(self, config: Config, tmp_db_path: str, mock_fx, mock_notifier):
+    def rm(self, config: Config, tmp_db_path: str, mock_notifier):
         config._phase = Phase.MICRO
-        return RiskManager(config, tmp_db_path, mock_fx, mock_notifier)
+        return RiskManager(config, tmp_db_path, mock_notifier)
 
     def test_phase1_allows_first_per_sector(self, rm: RiskManager) -> None:
         assert rm.check_sector_exposure("Financials", []) is False
@@ -70,12 +70,12 @@ class TestPhase1SectorExposure:
 
 class TestPhase2SectorExposure:
     @pytest.fixture
-    def rm(self, raw_config: dict[str, Any], tmp_db_path: str, mock_fx, mock_notifier):
+    def rm(self, raw_config: dict[str, Any], tmp_db_path: str, mock_notifier):
         raw = dict(raw_config)
         raw["account"] = dict(raw["account"])
         raw["account"]["phase_override"] = 2
         cfg = Config(raw)
-        return RiskManager(cfg, tmp_db_path, mock_fx, mock_notifier)
+        return RiskManager(cfg, tmp_db_path, mock_notifier)
 
     def test_phase2_allows_two_per_sector(self, rm: RiskManager) -> None:
         positions = [_position("SOFI")]
