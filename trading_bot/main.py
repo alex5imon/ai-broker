@@ -555,7 +555,13 @@ class TradingBot:
             # broader rename that also touches the daily_summaries DB
             # column. Pass through as USD here for the new
             # StrategyManager API.
-            account_equity_usd: float = await self._get_account_equity_usd()
+            account_equity_usd: float | None = await self._get_account_equity_usd()
+            if account_equity_usd is None:
+                logger.warning(
+                    "Skipping entry scan for %s — equity unavailable",
+                    market.value,
+                )
+                return
             await self._strategy_manager.scan_for_entries(
                 watchlist=watchlist,
                 get_5min_bars=self._get_5min_bars,
@@ -577,7 +583,14 @@ class TradingBot:
         if not watchlist:
             return
 
-        account_equity_usd: float = await self._get_account_equity_usd()
+        account_equity_usd_opt: float | None = await self._get_account_equity_usd()
+        if account_equity_usd_opt is None:
+            logger.warning(
+                "Skipping entry scan for %s — equity unavailable",
+                market.value,
+            )
+            return
+        account_equity_usd: float = account_equity_usd_opt
 
         # Update risk manager with today's P&L
         self._risk_manager.check_daily_loss_limit(
@@ -1365,8 +1378,8 @@ class TradingBot:
         if now_et.time() < check_after:
             return
 
-        equity: float = await self._get_account_equity_usd()
-        if equity > 0:
+        equity: float | None = await self._get_account_equity_usd()
+        if equity is not None and equity > 0:
             await self._check_phase_transition(equity)
         flags["phase_check_done"] = True
         self._save_day_flags(today, flags)
@@ -1398,7 +1411,17 @@ class TradingBot:
     async def _save_daily_summary(self, today: date) -> bool:
         """Compute and persist daily metrics, then send a summary notification."""
         today_str: str = today.isoformat()
-        equity: float = await self._get_account_equity_usd()
+        equity: float | None = await self._get_account_equity_usd()
+        if equity is None:
+            # Don't pollute daily_summaries with a 0.0 equity row when
+            # Alpaca is briefly unreachable.  The flag stays False so the
+            # next tick retries.  daily_summaries.account_equity_usd is
+            # NOT NULL — there is no good sentinel for "unknown".
+            logger.warning(
+                "Skipping daily_summary save for %s — equity unavailable; "
+                "will retry next tick", today_str,
+            )
+            return False
 
         try:
             metrics: dict[str, Any] = self._performance.calculate_daily_metrics(today_str)
@@ -1461,16 +1484,25 @@ class TradingBot:
     # Utility helpers
     # ------------------------------------------------------------------
 
-    async def _get_account_equity_usd(self) -> float:
-        """Return account NetLiquidation in USD; 0.0 on failure."""
+    async def _get_account_equity_usd(self) -> float | None:
+        """Return account NetLiquidation in USD, or ``None`` on failure.
+
+        Pre-fix returned ``0.0`` on failure, which silently polluted the
+        ``daily_summaries`` write (the column is NOT NULL, so a transient
+        Alpaca outage at end-of-day stamped a 0.0 equity row).  Callers
+        must now guard explicitly: skip the work, retry next tick.
+        """
         try:
             summary: dict[str, Any] = await self._gateway.get_account_summary()
             equity_str: str | None = summary.get("NetLiquidation")
             if equity_str:
                 return float(equity_str)
+            logger.warning(
+                "get_account_summary returned no NetLiquidation field"
+            )
         except Exception:
             logger.warning("get_account_equity_usd failed", exc_info=True)
-        return 0.0
+        return None
 
     async def _refresh_phase_from_equity(self) -> None:
         """Re-resolve the operating phase using the broker's live equity.
@@ -1480,8 +1512,8 @@ class TradingBot:
         always pinned MICRO. We reset the cache and re-resolve with
         live equity so per-tick phase-aware accessors match reality.
         """
-        equity_usd: float = await self._get_account_equity_usd()
-        if equity_usd <= 0:
+        equity_usd: float | None = await self._get_account_equity_usd()
+        if equity_usd is None or equity_usd <= 0:
             return
 
         prior: Phase | None = getattr(self._config, "_phase", None)

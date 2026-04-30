@@ -233,6 +233,18 @@ class TestOrderRejections:
         paused = risk_manager.check_order_rejections()
         assert paused is False
 
+    def test_order_rejection_pauses_at_threshold_exactly(
+        self, risk_manager: RiskManager
+    ) -> None:
+        """Regression: pre-fix used `len > max_count` (=4), so 3
+        rejections did not trip despite `max_count=3` config naming.
+        The rule is now `len >= max_count`."""
+        for i in range(3):
+            risk_manager.record_rejection("PLTR", f"r{i}")
+        with patch("asyncio.ensure_future", _noop_ensure_future):
+            paused = risk_manager.check_order_rejections()
+        assert paused is True
+
     def test_rejection_count_increments(
         self, risk_manager: RiskManager
     ) -> None:
@@ -320,3 +332,17 @@ class TestDailyReset:
         risk_manager.record_trade(-3.0, 0.5)
         assert risk_manager.trade_count == 2
         assert abs(risk_manager.daily_pnl_usd - 2.0) < 0.01
+
+    def test_record_trade_gross_pnl_excludes_losses(
+        self, risk_manager: RiskManager
+    ) -> None:
+        """Regression: ``_daily_gross_pnl_usd`` is the denominator in
+        ``commissions / gross_pnl``. Pre-fix it was ``abs(pnl) + comm``,
+        which counted losses (and double-counted commissions), inflating
+        the denominator and making the commission stop fire late or
+        never. Should be the sum of WINNING trade gross profits only."""
+        risk_manager.record_trade(10.0, 0.0)   # winner +10
+        risk_manager.record_trade(-5.0, 0.0)   # loser -5 — must NOT contribute
+        risk_manager.record_trade(3.0, 0.0)    # winner +3
+        # Expected gross profit = 10 + 3 = 13 (losses excluded)
+        assert abs(risk_manager._daily_gross_pnl_usd - 13.0) < 0.01
