@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -596,6 +596,74 @@ class Config:
                 f"Drain will attempt to flatten on the next tick — verify "
                 f"Alpaca state matches expectations."
             )
+        return warnings
+
+    def detect_missing_daily_summaries(
+        self,
+        db_path: str,
+        *,
+        lookback_days: int = 5,
+        today: date | None = None,
+    ) -> list[str]:
+        """Return warnings for past trading days with no daily_summary row.
+
+        ``_save_daily_summary`` retries on every tick until it succeeds
+        and only sets the persistent flag on success. The remaining
+        failure mode is "no tick happened after wind-down ended" — e.g.
+        a GHA outage, a cancelled cron, or the bot crashing during
+        wind-down. This check catches that pattern by sampling the last
+        ``lookback_days`` calendar days, filtering to trading days, and
+        asserting each has a row.
+
+        ``today`` is excluded — the bot won't have written today's
+        summary until after wind-down + 10 min. Pass an explicit ``today``
+        for tests; defaults to the current ET calendar date.
+
+        Read-only. Returns empty list (with warning log) on DB failure
+        rather than crashing bot startup.
+        """
+        import sqlite3
+        from trading_bot.constants import TZ_EASTERN
+
+        today_d = today or datetime.now(tz=TZ_EASTERN).date()
+        candidates: list[date] = []
+        for offset in range(1, lookback_days + 1):
+            d = today_d - timedelta(days=offset)
+            if self.is_trading_day(d, Market.US):
+                candidates.append(d)
+
+        if not candidates:
+            return []
+
+        date_strs = [d.isoformat() for d in candidates]
+        try:
+            conn = sqlite3.connect(db_path)
+            try:
+                placeholders = ",".join("?" * len(date_strs))
+                rows = conn.execute(
+                    f"SELECT date FROM daily_summaries WHERE date IN ({placeholders})",
+                    date_strs,
+                ).fetchall()
+            finally:
+                conn.close()
+        except Exception:
+            logger.warning(
+                "detect_missing_daily_summaries: DB read failed (db_path=%s); "
+                "skipping check", db_path,
+                exc_info=True,
+            )
+            return []
+
+        present: set[str] = {row[0] for row in rows}
+        warnings: list[str] = []
+        for d_str in date_strs:
+            if d_str not in present:
+                warnings.append(
+                    f"No daily_summaries row for trading day {d_str}. "
+                    f"Bot likely did not tick after wind-down completed "
+                    f"that day, or _save_daily_summary kept failing. "
+                    f"Postmortem reports for that day will be empty."
+                )
         return warnings
 
     # Repr
