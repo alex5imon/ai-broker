@@ -165,7 +165,9 @@ class StateRecovery:
         conn: sqlite3.Connection = sqlite3.connect(self._db_path)
         conn.row_factory = sqlite3.Row
         try:
-            cursor = conn.execute("SELECT * FROM positions WHERE status != 'CLOSED'")
+            cursor = conn.execute(
+                "SELECT * FROM positions WHERE status NOT IN ('CLOSED', 'ENTRY_FAILED')"
+            )
             rows: list[dict[str, Any]] = [dict(row) for row in cursor.fetchall()]
             logger.debug("Loaded %d open positions from DB", len(rows))
             return rows
@@ -404,7 +406,7 @@ class StateRecovery:
         try:
             cursor = conn.execute(
                 "SELECT ticker FROM positions "
-                "WHERE status != 'CLOSED' AND hold_type = 'intraday'"
+                "WHERE status NOT IN ('CLOSED', 'ENTRY_FAILED') AND hold_type = 'intraday'"
             )
             return {row[0] for row in cursor.fetchall()}
         except sqlite3.OperationalError:
