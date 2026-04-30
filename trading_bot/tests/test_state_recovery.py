@@ -344,25 +344,3 @@ class TestStateRecovery:
         result = await recovery.recover()
 
         assert not result.eod_flatten_orders
-
-    @pytest.mark.asyncio
-    async def test_settlements_updated_on_recovery(
-        self, tmp_db_path: str, mock_notifier
-    ) -> None:
-        """update_settlements is called during recovery."""
-        from datetime import date
-
-        conn = sqlite3.connect(tmp_db_path)
-        today = date.today().isoformat()
-        conn.execute(
-            """INSERT INTO settlements (ticker, amount, currency, amount_gbp,
-               sell_date, settle_date, settled) VALUES (?,?,?,?,?,?,0)""",
-            ("PLTR", 100.0, "USD", 80.0, today, today),
-        )
-        conn.commit()
-        conn.close()
-
-        gw = self._make_gateway()
-        recovery = _make_recovery(gw, tmp_db_path, mock_notifier)
-        result = await recovery.recover()
-        assert result.settlements_updated >= 1

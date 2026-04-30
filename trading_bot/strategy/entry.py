@@ -31,7 +31,6 @@ from trading_bot.data.fx import FXManager
 from trading_bot.data.market_data import MarketDataManager
 from trading_bot.data.sentiment import SentimentAnalyzer
 from trading_bot.db import repository as repo
-from trading_bot.execution.settlement_tracker import SettlementTracker
 from trading_bot.strategy.technical import TechnicalAnalyzer
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -84,7 +83,6 @@ class EntryEvaluator:
         earnings: EarningsCalendar,
         market_data: MarketDataManager,
         fx: FXManager,
-        settlement: SettlementTracker,
         db_path: str,
     ) -> None:
         self._config: Config = config
@@ -93,7 +91,6 @@ class EntryEvaluator:
         self._earnings: EarningsCalendar = earnings
         self._market_data: MarketDataManager = market_data
         self._fx: FXManager = fx
-        self._settlement: SettlementTracker = settlement
         self._db_path: str = db_path
 
         # Entry config
@@ -255,17 +252,7 @@ class EntryEvaluator:
         if position_size <= 0:
             rejections.append("Computed position size is zero shares")
 
-        # -- 10. Settled cash check ------------------------------------------
-        pending_gbp: float = self._settlement.get_pending_total_gbp()
-        # Approximate available settled cash: equity minus pending unsettled
-        available_gbp: float = account_equity_gbp - pending_gbp
-        if position_value_gbp > available_gbp:
-            rejections.append(
-                f"Insufficient settled cash: need {position_value_gbp:.2f} GBP, "
-                f"available {available_gbp:.2f} GBP"
-            )
-
-        # -- 12. Max positions check -----------------------------------------
+        # -- 10. Max positions check -----------------------------------------
         max_positions: int = self._config.get_max_positions()
         open_count: int = self._get_open_position_count()
         if open_count >= max_positions:
@@ -441,16 +428,7 @@ class EntryEvaluator:
         if shares * signal_price > max_position_value:
             shares = math.floor(max_position_value / signal_price)
 
-        # Constraint 2: settled cash
-        pending_gbp: float = self._settlement.get_pending_total_gbp()
-        available_gbp: float = account_equity_gbp - pending_gbp
-        available_local: float = self._fx.to_usd(available_gbp, "GBP")
-        if shares * signal_price > available_local:
-            shares = math.floor(available_local / signal_price)
-
-        # Constraint 3: already floored above
-
-        # Constraint 5: ATR high-vol reduction
+        # Constraint 2: ATR high-vol reduction
         if atr_rank >= self._atr_high:
             shares = math.floor(shares * self._atr_high_reduction)
             logger.info(
@@ -461,7 +439,7 @@ class EntryEvaluator:
                 (1.0 - self._atr_high_reduction) * 100,
             )
 
-        # Constraint 6: sentiment no-data reduction
+        # Constraint 3: sentiment no-data reduction
         if sentiment_size_mult < 1.0:
             shares = math.floor(shares * sentiment_size_mult)
 

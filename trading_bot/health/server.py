@@ -114,7 +114,6 @@ class HealthServer:
         # Account data
         account_equity_gbp: float = 0.0
         open_positions_count: int = 0
-        settled_cash_gbp: float = 0.0
         daily_pnl_gbp: float = 0.0
         trades_today: int = 0
         phase: int = self._config.get_phase().value
@@ -151,24 +150,12 @@ class HealthServer:
                 ).fetchone()
                 daily_pnl_gbp = float(row["total"]) if row else 0.0
 
-                # Settled cash
-                row = conn.execute(
-                    """
-                    SELECT COALESCE(SUM(amount_gbp), 0.0) AS total
-                    FROM settlements
-                    WHERE settled = 0
-                    """,
-                ).fetchone()
-                unsettled_gbp: float = float(row["total"]) if row else 0.0
-
                 # Latest equity from daily summaries
                 row = conn.execute(
                     "SELECT account_equity_gbp FROM daily_summaries ORDER BY date DESC LIMIT 1"
                 ).fetchone()
                 if row:
                     account_equity_gbp = float(row["account_equity_gbp"])
-
-                settled_cash_gbp = max(account_equity_gbp - unsettled_gbp, 0.0)
 
             finally:
                 conn.close()
@@ -190,7 +177,6 @@ class HealthServer:
             "daily_pnl_gbp": round(daily_pnl_gbp, 2),
             "open_positions": open_positions_count,
             "trades_today": trades_today,
-            "settled_cash_gbp": round(settled_cash_gbp, 2),
             "stale_symbols": list(self.stale_symbols),
             "uptime_seconds": round(uptime_seconds, 0),
             "markets": dict(self.market_status),

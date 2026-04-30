@@ -142,7 +142,6 @@ Every tick performs reconciliation:
    - SQLite position not in Alpaca: mark CLOSED with reason `reconciliation_mismatch`.
    - Quantity mismatch: trust Alpaca, update SQLite, log discrepancy.
 4. Verify protective orders (stop / target / trailing) exist for each open position; replace any that are missing.
-5. Update T+1 settlement state for sells whose settle date has passed.
 
 Corporate actions (splits, dividends) — Alpaca adjusts positions automatically. Reconciliation logs INFO if notional value is roughly unchanged.
 
@@ -290,12 +289,11 @@ Applied on top of each sleeve before any entry is executed:
 2. **ATR percentile gate**: skip entry when ATR rank > 85th percentile; reduce size by 25% when ATR rank > 70th.
 3. **Earnings blackout** (48 hours either side) — applies to Phase 2/3 single-stock additions.
 4. **Per-ticker cooldown** (30 min post-exit).
-5. **Settled-cash check** (T+1 tracking).
-6. **Spread check** (< 0.05%).
-7. **Market hours check** (execution window only).
-8. **Max positions** (per strategy AND aggregate phase limit).
-9. **Sector exposure** (portfolio-level).
-10. **Overnight gap filter** (daily mode): skip entries when the overnight gap exceeds a configured threshold.
+5. **Spread check** (< 0.05%).
+6. **Market hours check** (execution window only).
+7. **Max positions** (per strategy AND aggregate phase limit).
+8. **Sector exposure** (portfolio-level).
+9. **Overnight gap filter** (daily mode): skip entries when the overnight gap exceeds a configured threshold.
 
 ### Portfolio-Level Position Sizing (Phase 1)
 
@@ -417,13 +415,6 @@ Before entering position B while holding position A:
 - Calculate 30-day daily-return correlation between A and B.
 - Block entry if correlation > 0.85.
 
-### Settlement Tracking (T+1)
-
-- Track every sell in the `settlements` table.
-- Before every entry, compute `available = settled_cash - reserved_for_open_orders`.
-- Never commit more than available settled cash. Alpaca will reject otherwise; pre-checking avoids rejection logs and wasted API calls.
-- Each tick's reconciliation marks settlements that should have cleared based on date.
-
 ### Kill Switch
 
 - Bot subscribes to a dedicated ntfy topic (the value of `NTFY_KILL_TOPIC`).
@@ -525,7 +516,6 @@ All data lives in `trading_bot/data/trading_bot.db`. Key tables:
 - **trades** — completed trade records (ticker, side, entry/exit price+time, P&L, signals JSON, exit reason, hold type, phase).
 - **positions** — currently open positions and their order state machine fields (stop, target, trailing flags, Alpaca order IDs).
 - **daily_summaries** — one row per trading day (counts, P&L, win rate, profit factor, phase).
-- **settlements** — T+1 tracking (sell date, settle date, settled flag).
 - **sentiment_cache** — per-ticker normalized sentiment with TTL.
 - **earnings_calendar** — upcoming earnings dates for blackout management.
 - **cooldowns** — per-ticker post-exit cooldown timers.
@@ -554,7 +544,6 @@ Contents:
 - Sector breakdown
 - Equity curve (last 30 days, inline SVG)
 - Phase progress
-- Pending settlements
 - Open swing positions
 
 ### Weekly / Monthly Reports
@@ -639,7 +628,6 @@ Top-level sections:
 - `exit_intraday` / `exit_swing` / `exit_intraday_phase2` / `exit_intraday_phase3` — fixed-percent exit fallbacks
 - `exit_spread_protection` — defer-on-wide-spread parameters
 - `notifications` — ntfy topic, priorities, retry behavior
-- `settlement` — T+1 days
 - `fx` — informational FX rate API + fallback
 - `phases` — promotion / demotion thresholds
 - `reporting` — output dir, daily/weekly/monthly toggles, equity curve window
@@ -746,7 +734,6 @@ trading_bot/
 │   ├── risk_manager.py             # Daily P&L, sector exposure, correlation,
 │   │                               # max positions/trades, drawdown breaker,
 │   │                               # kill switch
-│   ├── settlement_tracker.py       # T+1 settlement
 │   └── virtual_portfolio.py        # Per-strategy virtual sub-portfolios
 │
 ├── notifications/
@@ -864,7 +851,6 @@ For each bar:
 5. Model slippage (default 2 bps/side). No commission.
 
 Sentiment: cached values when available; neutral otherwise (flagged as simulated).
-Settlement: T+1 tracked to reproduce the cash-account constraint.
 
 ### Output
 

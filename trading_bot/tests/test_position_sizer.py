@@ -17,10 +17,9 @@ from trading_bot.execution.position_sizer import PositionSize, PositionSizer
 
 
 @pytest.fixture
-def sizer(config: Config, mock_fx, mock_settlement) -> PositionSizer:
-    """PositionSizer with GBP/USD=1.25 and no pending settlements."""
-    mock_settlement.get_pending_total_gbp.return_value = 0.0
-    return PositionSizer(config, mock_fx, mock_settlement)
+def sizer(config: Config, mock_fx) -> PositionSizer:
+    """PositionSizer with GBP/USD=1.25."""
+    return PositionSizer(config, mock_fx)
 
 
 # ---------------------------------------------------------------------------
@@ -143,21 +142,6 @@ class TestAdjustments:
         if base.is_valid and reduced.is_valid and base.shares > 10:
             ratio = reduced.shares / base.shares
             assert 0.40 <= ratio <= 0.70
-
-    def test_settlement_cap_applied(
-        self, config: Config, mock_fx, mock_settlement
-    ) -> None:
-        """Pending settlements eat into available cash — shares reduced."""
-        mock_settlement.get_pending_total_gbp.return_value = 800.0
-        sizer = PositionSizer(config, mock_fx, mock_settlement)
-        result = sizer.calculate(
-            ticker="PLTR", exchange="NASDAQ",
-            entry_price=10.0, stop_price=9.8,
-            account_equity_gbp=1000.0,
-            sentiment_score=0.2, atr_rank=50.0,
-        )
-        if result.is_valid:
-            assert result.position_value_gbp <= 200.0 + 5.0
 
     def test_adjustment_descriptions_in_result(
         self, sizer: PositionSizer

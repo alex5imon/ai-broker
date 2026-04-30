@@ -44,7 +44,6 @@ from trading_bot.execution.loss_cooldown import LossCooldownConfig, LossCooldown
 from trading_bot.execution.order_manager import EntryDecision as OMEntryDecision
 from trading_bot.execution.order_manager import OrderManager
 from trading_bot.execution.risk_manager import RiskManager
-from trading_bot.execution.settlement_tracker import SettlementTracker
 from trading_bot.gateway.connection import GatewayConnection
 from trading_bot.gateway.recovery import StateRecovery
 from trading_bot.notifications.notifier import Notifier
@@ -110,7 +109,6 @@ class TradingBot:
         )
         self._sentiment: SentimentAnalyzer = SentimentAnalyzer(raw, db_path)
         self._earnings: EarningsCalendar = EarningsCalendar(raw, db_path)
-        self._settlement: SettlementTracker = SettlementTracker(raw, db_path)
 
         # --- Strategy layer ---
         self._technical: TechnicalAnalyzer = TechnicalAnalyzer(config)
@@ -121,7 +119,6 @@ class TradingBot:
             earnings=self._earnings,
             market_data=self._market_data,
             fx=self._fx,
-            settlement=self._settlement,
             db_path=db_path,
         )
         self._exit_manager: ExitManager = ExitManager(config, self._market_data, self._fx)

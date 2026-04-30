@@ -241,13 +241,13 @@ def test_v8_count_matches_phase1_query_pattern(db_at_v7: Path) -> None:
 
 def test_run_migrations_applies_v8_on_existing_v7_db(tmp_path) -> None:
     db = tmp_path / "round_trip.db"
-    run_migrations(str(db))  # creates fresh DB at SCHEMA_VERSION (now 8)
+    run_migrations(str(db))  # creates fresh DB at SCHEMA_VERSION
     conn = sqlite3.connect(str(db))
     try:
         version = conn.execute(
             "SELECT MAX(version) FROM schema_version"
         ).fetchone()[0]
-        assert version == SCHEMA_VERSION == 8
+        assert version == SCHEMA_VERSION
     finally:
         conn.close()
 
@@ -255,14 +255,14 @@ def test_run_migrations_applies_v8_on_existing_v7_db(tmp_path) -> None:
 def test_run_migrations_is_noop_when_already_at_v8(tmp_path) -> None:
     db = tmp_path / "noop.db"
     run_migrations(str(db))
-    # Run again — must complete without error and version stays at 8.
+    # Run again — must complete without error and version stays at SCHEMA_VERSION.
     run_migrations(str(db))
     conn = sqlite3.connect(str(db))
     try:
         version = conn.execute(
             "SELECT MAX(version) FROM schema_version"
         ).fetchone()[0]
-        assert version == 8
+        assert version == SCHEMA_VERSION
     finally:
         conn.close()
 

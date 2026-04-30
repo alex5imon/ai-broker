@@ -1,9 +1,9 @@
-"""Phase-aware position sizing with settlement awareness.
+"""Phase-aware position sizing.
 
-Calculates position sizes respecting risk limits, settlement constraints,
-and phase-specific parameters.  All monetary values are converted to GBP
-(the account base currency) for risk calculations, then converted back to
-USD for order placement.
+Calculates position sizes respecting risk limits and phase-specific
+parameters.  All monetary values are converted to GBP (the account base
+currency) for risk calculations, then converted back to USD for order
+placement.
 
 Alpaca is commission-free, so no commission checks are needed.
 """
@@ -22,7 +22,6 @@ from trading_bot.constants import (
 if TYPE_CHECKING:
     from trading_bot.config import Config
     from trading_bot.data.fx import FXManager
-    from trading_bot.execution.settlement_tracker import SettlementTracker
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -55,22 +54,19 @@ class PositionSizer:
     Constraints applied in order (per SPEC Section 6):
       1. Risk-based: max ``risk_per_trade_pct`` of equity at risk
       2. Max position: ``max_position_pct`` of equity
-      3. Settlement: do not exceed settled cash
-      4. ATR adjustment: reduce 25% if ATR rank > 70
-      5. Sentiment adjustment: 75% if no sentiment data
-      6. Round down to whole shares
-      7. Min position: check against phase minimum
+      3. ATR adjustment: reduce 25% if ATR rank > 70
+      4. Sentiment adjustment: 75% if no sentiment data
+      5. Round down to whole shares
+      6. Min position: check against phase minimum
     """
 
     def __init__(
         self,
         config: Config,
         fx: FXManager,
-        settlement: SettlementTracker,
     ) -> None:
         self._config: Config = config
         self._fx: FXManager = fx
-        self._settlement: SettlementTracker = settlement
 
     # ------------------------------------------------------------------
     # Main calculation
@@ -150,27 +146,10 @@ class PositionSizer:
             )
             shares = max_shares_from_pos
 
-        # ---- step 3: settlement constraint ----
-        pending_gbp: float = self._settlement.get_pending_total_gbp()
-        settled_cash_gbp: float = account_equity_gbp - pending_gbp
-        if settled_cash_gbp < 0:
-            settled_cash_gbp = 0.0
-
         position_value_usd: float = shares * entry_price
         position_value_gbp: float = position_value_usd * fx_to_gbp
-        total_cost_gbp: float = position_value_usd * fx_to_gbp
 
-        if total_cost_gbp > settled_cash_gbp and settled_cash_gbp > 0:
-            available_usd: float = (settled_cash_gbp / fx_to_gbp) if fx_to_gbp > 0 else 0.0
-            new_shares: int = math.floor(available_usd / entry_price) if entry_price > 0 else 0
-            if new_shares < shares:
-                adjustments.append(
-                    f"Settlement cap: {shares} -> {new_shares} "
-                    f"(settled cash GBP{settled_cash_gbp:.2f})"
-                )
-                shares = new_shares
-
-        # ---- step 4: ATR adjustment ----
+        # ---- step 3: ATR adjustment ----
         atr_high_pct: float = float(
             self._config._get("strategy", "atr", "high_percentile", default=70)
         )
@@ -186,7 +165,7 @@ class PositionSizer:
                 f"x{atr_reduction})"
             )
 
-        # ---- step 5: sentiment adjustment ----
+        # ---- step 4: sentiment adjustment ----
         no_data_mult: float = float(
             self._config._get("entry", "no_data_size_multiplier", default=0.75)
         )
@@ -198,7 +177,7 @@ class PositionSizer:
                 f"(x{no_data_mult})"
             )
 
-        # ---- step 6: round to whole shares (already int, but enforce) ----
+        # ---- step 5: round to whole shares (already int, but enforce) ----
         shares = max(shares, 0)
 
         # ---- recalculate final values ----
@@ -206,7 +185,7 @@ class PositionSizer:
         position_value_gbp = position_value_usd * fx_to_gbp
         risk_amount_gbp: float = shares * stop_distance_gbp
 
-        # ---- step 7: minimum position value ----
+        # ---- step 6: minimum position value ----
         min_value: float = self._config.get_min_position_value(Market.US)
         if position_value_usd < min_value and shares > 0:
             return self._reject(

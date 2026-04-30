@@ -11,7 +11,7 @@ import asyncio
 import logging
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta
+from datetime import datetime, time, timedelta
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -43,7 +43,6 @@ class RecoveryResult:
     positions_closed_mismatch: list[str] = field(default_factory=list)
     quantities_updated: list[str] = field(default_factory=list)
     stops_placed: list[str] = field(default_factory=list)
-    settlements_updated: int = 0
     stale_orders_cancelled: list[str] = field(default_factory=list)
     eod_flatten_orders: list[str] = field(default_factory=list)
 
@@ -86,8 +85,6 @@ class RecoveryResult:
                 f"EOD flatten — closing intraday positions: "
                 f"{', '.join(self.eod_flatten_orders)}"
             )
-        if self.settlements_updated:
-            lines.append(f"Settlements marked settled: {self.settlements_updated}")
         if not self.has_discrepancies:
             lines.append("No discrepancies found - state is clean.")
         return "\n".join(lines)
@@ -148,10 +145,7 @@ class StateRecovery:
         #    cron tick lands after the configured cutoff (default 15:55 ET).
         await self._eod_intraday_flatten(alpaca_positions, result)
 
-        # 9. Update settlements
-        result.settlements_updated = self._update_settlements()
-
-        # 10. Log and alert
+        # 9. Log and alert
         logger.info("State recovery complete:\n%s", result.summary())
         if result.has_discrepancies:
             await self._notifier.gateway_alert(
@@ -409,25 +403,6 @@ class StateRecovery:
             return {row[0] for row in cursor.fetchall()}
         except sqlite3.OperationalError:
             return set()
-        finally:
-            conn.close()
-
-    def _update_settlements(self) -> int:
-        today_str: str = date.today().isoformat()
-        conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-        try:
-            cursor = conn.execute(
-                "UPDATE settlements SET settled = 1 WHERE settled = 0 AND settle_date <= ?",
-                (today_str,),
-            )
-            count: int = cursor.rowcount
-            conn.commit()
-            if count:
-                logger.info("Marked %d settlements as settled", count)
-            return count
-        except sqlite3.OperationalError:
-            logger.warning("settlements table not found - skipping update")
-            return 0
         finally:
             conn.close()
 

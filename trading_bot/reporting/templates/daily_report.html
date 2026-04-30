@@ -565,37 +565,6 @@
   {% endif %}
 </section>
 
-<!-- SETTLEMENTS -->
-{% if settlements %}
-<section>
-  <h2>Pending Settlements</h2>
-  <table>
-    <thead>
-      <tr>
-        <th>Ticker</th>
-        <th>Amount</th>
-        <th>Currency</th>
-        <th>Amount (GBP)</th>
-        <th>Sell Date</th>
-        <th>Settle Date</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for s in settlements %}
-      <tr>
-        <td>{{ s.ticker }}</td>
-        <td>{{ "%.2f"|format(s.amount) }}</td>
-        <td>{{ s.currency }}</td>
-        <td>&pound;{{ "%.2f"|format(s.amount_gbp) }}</td>
-        <td>{{ s.sell_date }}</td>
-        <td>{{ s.settle_date }}</td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-</section>
-{% endif %}
-
 <!-- OPEN POSITIONS -->
 {% if open_positions %}
 <section>

@@ -98,24 +98,6 @@ CREATE TABLE IF NOT EXISTS daily_summaries (
     notes           TEXT
 );
 
--- Settlement tracking: T+1 for equities
-CREATE TABLE IF NOT EXISTS settlements (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    trade_id        INTEGER,
-    ticker          TEXT NOT NULL,
-    amount          REAL NOT NULL,
-    currency        TEXT NOT NULL,
-    amount_gbp      REAL NOT NULL,
-    sell_date       TEXT NOT NULL,
-    settle_date     TEXT NOT NULL,
-    settled         INTEGER NOT NULL DEFAULT 0,
-    strategy_id     TEXT,
-    FOREIGN KEY (trade_id) REFERENCES trades(id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_settlements_settled ON settlements(settled);
-CREATE INDEX IF NOT EXISTS idx_settlements_settle_date ON settlements(settle_date);
-
 -- Sentiment cache: avoid redundant API calls
 CREATE TABLE IF NOT EXISTS sentiment_cache (
     ticker          TEXT NOT NULL,
@@ -245,7 +227,6 @@ CREATE TABLE IF NOT EXISTS strategy_portfolios (
 
 CREATE INDEX IF NOT EXISTS idx_positions_strategy ON positions(strategy_id);
 CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy_id);
-CREATE INDEX IF NOT EXISTS idx_settlements_strategy ON settlements(strategy_id);
 
 -- Tick model state: per-strategy state carried across stateless GHA cron runs.
 -- Replaces in-memory coordinator state that previously lived only in the
@@ -281,7 +262,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 
 _SEED_VERSION_SQL: str = (
     "INSERT OR IGNORE INTO schema_version (version, description) "
-    "VALUES (?, 'V8 schema - ENTRY_FAILED terminal status (data-only)');"
+    "VALUES (?, 'V9 schema - settlements table removed');"
 )
 
 # Expected tables — used for quick health check
@@ -290,7 +271,6 @@ _EXPECTED_TABLES: frozenset[str] = frozenset(
         "trades",
         "positions",
         "daily_summaries",
-        "settlements",
         "sentiment_cache",
         "earnings_calendar",
         "cooldowns",

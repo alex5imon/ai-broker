@@ -52,14 +52,25 @@ def _migration_v5(conn: sqlite3.Connection) -> None:
         ("ib_trail_order_id", "alpaca_trail_order_id"),
     )
 
+    def _has_table(table: str) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        return row is not None
+
     def _has_column(table: str, column: str) -> bool:
         if table not in _ALLOWED_TABLES:
             raise ValueError(f"Unexpected table name: {table!r}")
         rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
         return any(r[1] == column for r in rows)
 
-    # Add strategy_id columns if they don't exist
+    # Add strategy_id columns if they don't exist. settlements is gated on
+    # table existence: V9 drops the table on existing databases, and fresh
+    # installs (post-V9) skip its creation entirely.
     for table in ("trades", "positions", "settlements"):
+        if table == "settlements" and not _has_table(table):
+            continue
         if not _has_column(table, "strategy_id"):
             conn.execute(f"ALTER TABLE {table} ADD COLUMN strategy_id TEXT")
 
@@ -87,9 +98,13 @@ def _migration_v5(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_positions_strategy ON positions(strategy_id);
         CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy_id);
-        CREATE INDEX IF NOT EXISTS idx_settlements_strategy ON settlements(strategy_id);
         """
     )
+    if _has_table("settlements"):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_settlements_strategy "
+            "ON settlements(strategy_id)"
+        )
     conn.execute(
         "INSERT OR REPLACE INTO schema_version (version, description) "
         "VALUES (5, 'V5 schema - multi-strategy Alpaca trading bot')"
@@ -281,12 +296,33 @@ def _migration_v8(conn: sqlite3.Connection) -> None:
     logger.info("Applied migration V8: ENTRY_FAILED terminal status")
 
 
+def _migration_v9(conn: sqlite3.Connection) -> None:
+    """V9: drop the unused ``settlements`` table and its indexes.
+
+    The settlement-tracking subsystem was instantiated but never wired:
+    ``SettlementTracker.record_sale`` had zero production callers, so the
+    table was always empty and every reader returned 0. Removing it
+    eliminates dead schema, dead code paths, and the misleading
+    "T+1 settlement tracking" claim previously documented in CLAUDE.md.
+    """
+    conn.execute("DROP INDEX IF EXISTS idx_settlements_settled")
+    conn.execute("DROP INDEX IF EXISTS idx_settlements_settle_date")
+    conn.execute("DROP INDEX IF EXISTS idx_settlements_strategy")
+    conn.execute("DROP TABLE IF EXISTS settlements")
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_version (version, description) "
+        "VALUES (9, 'V9 schema - settlements table removed')"
+    )
+    logger.info("Applied migration V9: dropped settlements table")
+
+
 _MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (4, "V4 schema - multi-market adaptive trading bot", _migration_v4),
     (5, "V5 schema - multi-strategy Alpaca trading bot", _migration_v5),
     (6, "V6 schema - positions.strategy_id NOT NULL", _migration_v6),
     (7, "V7 schema - tick_state + risk_circuit_state", _migration_v7),
     (8, "V8 schema - ENTRY_FAILED terminal status (data-only)", _migration_v8),
+    (9, "V9 schema - settlements table removed", _migration_v9),
 ]
 
 

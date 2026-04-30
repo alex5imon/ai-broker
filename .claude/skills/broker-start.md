@@ -82,27 +82,7 @@ Both markets could be independently open or closed. Determine the status of each
 
 If both markets are closed today, inform the user and stop.
 
-## Step 6: Check Settled Cash
-
-Query the account for settled cash availability:
-
-```bash
-cd <project-root>
-python3 -c "
-import sqlite3
-conn = sqlite3.connect('trading_bot/data/trading_bot.db')
-try:
-    cursor = conn.execute('SELECT * FROM settlements ORDER BY date DESC LIMIT 5')
-    for row in cursor: print(row)
-except Exception as e:
-    print(f'Settlements not available: {e}')
-conn.close()
-"
-```
-
-Report settled vs. unsettled cash (T+1 for all equities). If settled cash is very low, warn the user.
-
-## Step 7: Phase 0 Detection
+## Step 6: Phase 0 Detection
 
 Check if this is first run or if there are existing positions that have not been assessed:
 
@@ -128,7 +108,7 @@ conn.close()
 
 If unassessed positions exist, inform the user that Phase 0 cleanup will run first to evaluate existing holdings before normal trading begins.
 
-## Step 8: Determine Startup Mode
+## Step 7: Determine Startup Mode
 
 Based on current times in both timezones, determine which markets are active:
 
@@ -145,7 +125,7 @@ Note: The LSE/US overlap window is approximately 14:30-16:30 London / 09:30-11:3
 
 If Phase 0 is required (from Step 7), append `--phase0` to the flags.
 
-## Step 9: Start the Bot
+## Step 8: Start the Bot
 
 Navigate to the project directory and start the bot:
 
