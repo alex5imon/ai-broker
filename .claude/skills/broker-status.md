@@ -174,27 +174,7 @@ Report:
 - Progress toward next phase threshold
 - Today's trade count vs. daily limit
 
-## Step 8: Settled vs. Unsettled Cash
-
-Report the breakdown of settled and unsettled cash:
-- All equity trades settle T+1 (US moved to T+1 in May 2024)
-- Show how much buying power is actually available
-
-```bash
-cd <project-root>
-python3 -c "
-import sqlite3
-conn = sqlite3.connect('trading_bot/data/trading_bot.db')
-cursor = conn.execute('''
-    SELECT SUM(amount) as pending FROM settlements WHERE settled = 0
-''')
-unsettled = cursor.fetchone()[0] or 0
-print(f'Unsettled cash: £{unsettled:.2f}')
-conn.close()
-"
-```
-
-## Step 9: Errors and Warnings
+## Step 8: Errors and Warnings
 
 Search today's log for errors and warnings:
 

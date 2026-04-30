@@ -43,7 +43,6 @@ class Config:
         "exit_intraday",
         "exit_swing",
         "notifications",
-        "settlement",
         "fx",
         "phase0",
         "phases",
@@ -351,10 +350,6 @@ class Config:
     @property
     def sentiment_cache_ttl(self) -> int:
         return int(self._require("sentiment", "cache_ttl_minutes"))
-
-    @property
-    def settlement_t_plus_days(self) -> int:
-        return int(self._get("settlement", "t_plus_days", default=1))
 
     @property
     def fx_fallback_gbp_usd(self) -> float:

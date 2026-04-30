@@ -147,7 +147,6 @@ Historical datasets for offline backtesting live outside the package:
 
 - **Commission-free** — Alpaca charges no commissions on US equities, but still double-check order logic, sizing, and risk limits.
 - **Fractional shares supported** — Alpaca allows fractional down to 1/1000000. The backtester's `_size_by_risk()` accepts a `fractional=True` parameter (default true for intraday modes).
-- **Cash account settlement** — T+1 for US equities. Track settled vs. unsettled cash to avoid free-riding violations.
 - **Compound growth target** — 0.3-0.5% net per trading day. Conservative, consistent returns over aggressive plays.
 - **Environment variables (GHA):** `ALPACA_PAPER_KEY_ID` / `ALPACA_PAPER_SECRET` and `ALPACA_LIVE_KEY_ID` / `ALPACA_LIVE_SECRET`, selected by `ALPACA_ENV` (defaults to `paper`). The internal code also reads `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` if set directly, so a local `.env` can use either pair.
 - **Validated strategy** — Mean Reversion on SPY 5-min bars (2008-2021): 60.8% win rate, +76.09% total, -11.9% max DD, PF 1.54 across 102 trades (post let-winners-run + VIX-adaptive RSI). See `multi_strategy_backtest.py` and the `tune_history` memory for details.

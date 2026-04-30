@@ -51,10 +51,8 @@ class VirtualPortfolio:
 
     @property
     def available_cash(self) -> float:
-        """Current cash minus unsettled amounts for this strategy."""
-        cash: float = self.current_cash
-        pending: float = self._get_pending_settlements()
-        return max(cash - pending, 0.0)
+        """Current cash for this strategy."""
+        return max(self.current_cash, 0.0)
 
     def record_entry(self, shares: float, price: float) -> None:
         """Deduct ``shares × price`` from this strategy's virtual cash.
@@ -144,18 +142,6 @@ class VirtualPortfolio:
             return d
         finally:
             conn.close()
-
-    def _get_pending_settlements(self) -> float:
-        conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-        try:
-            row = conn.execute(
-                "SELECT COALESCE(SUM(amount), 0) FROM settlements WHERE strategy_id = ? AND settled = 0",
-                (self.strategy_id,),
-            ).fetchone()
-            return float(row[0]) if row else 0.0
-        finally:
-            conn.close()
-
 
 class PortfolioManager:
     """Manages all virtual portfolios across strategies."""

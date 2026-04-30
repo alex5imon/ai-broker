@@ -64,7 +64,7 @@ def tmp_db():
 @pytest.fixture
 def tmp_db_path(tmp_path):
     """Path to a temp file-based DB with full schema.  Used by classes that open
-    their own connections (SettlementTracker, RiskManager, etc.)."""
+    their own connections (RiskManager, etc.)."""
     db_file = tmp_path / "test_bot.db"
     conn = sqlite3.connect(str(db_file))
     _apply_schema(conn)
@@ -205,10 +205,3 @@ def mock_fx():
     return fx
 
 
-@pytest.fixture
-def mock_settlement():
-    """Mock SettlementTracker with no pending settlements."""
-    st = MagicMock()
-    st.get_pending_total_gbp.return_value = 0.0
-    st.get_available_cash_gbp.return_value = 0.0
-    return st

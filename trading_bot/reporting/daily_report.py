@@ -105,9 +105,6 @@ class ReportGenerator:
         daily_returns: list[float] = self._performance.get_daily_returns(60)
         sharpe_ratio: float = self._performance.calculate_sharpe_ratio(daily_returns)
 
-        # Pending settlements
-        settlements: list[dict[str, Any]] = self._get_pending_settlements()
-
         # Open positions
         open_positions: list[dict[str, Any]] = self._get_open_positions()
 
@@ -120,7 +117,6 @@ class ReportGenerator:
             "equity_curve": equity_curve,
             "phase_progress": phase_progress,
             "sharpe_ratio": round(sharpe_ratio, 2),
-            "settlements": settlements,
             "open_positions": open_positions,
             "account_equity_gbp": current_equity,
             "generated_at": datetime.now(TZ_EASTERN).strftime("%Y-%m-%d %H:%M:%S ET"),
@@ -342,23 +338,6 @@ class ReportGenerator:
     # ------------------------------------------------------------------
     # Data helpers (read from DB for context enrichment)
     # ------------------------------------------------------------------
-
-    def _get_pending_settlements(self) -> list[dict[str, Any]]:
-        """Fetch pending settlements from the database."""
-        import sqlite3
-
-        conn: sqlite3.Connection = sqlite3.connect(self._config.db_path)
-        conn.row_factory = sqlite3.Row
-        try:
-            rows = conn.execute(
-                "SELECT * FROM settlements WHERE settled = 0 ORDER BY settle_date"
-            ).fetchall()
-            return [dict(r) for r in rows]
-        except sqlite3.OperationalError:
-            logger.warning("Could not query settlements table")
-            return []
-        finally:
-            conn.close()
 
     def _get_open_positions(self) -> list[dict[str, Any]]:
         """Fetch open positions from the database."""
