@@ -140,6 +140,13 @@ def base_order_manager():
     om = MagicMock()
     om.place_entry = AsyncMock(return_value=42)
     om.place_exit = AsyncMock(return_value="alpaca-exit-1")
+    # Default Alpaca state for drain checks: position IS held same-side as
+    # whatever the test seeds. Tests that want NOT_HELD or OPPOSITE_SIDE
+    # override this attribute.
+    om._gw = MagicMock()
+    pos = MagicMock()
+    pos.qty = "1.0"
+    om._gw.client.get_open_position = MagicMock(return_value=pos)
     return om
 
 
@@ -861,6 +868,189 @@ class TestDrainDisabledSleeves:
         n = await sm.drain_disabled_sleeves()
         assert n == 0
         base_order_manager.place_exit.assert_not_awaited()
+
+    # -----------------------------------------------------------------
+    # Alpaca-side checks (2026-04-30 incident — drain submitted SELLs
+    # against an already-flat sleeve and built an unbounded short on
+    # the paper account every time the bot ticked).
+    # -----------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_drain_skips_when_alpaca_holds_zero(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        tmp_db_path,
+    ):
+        """DB says +1 SPY but Alpaca already holds 0 → don't submit a
+        drain SELL (it would open a new short). Mark DB CLOSED instead."""
+        import sqlite3
+        from alpaca.common.exceptions import APIError
+
+        conn = sqlite3.connect(tmp_db_path)
+        conn.execute(
+            """
+            INSERT INTO positions (
+                id, ticker, exchange, currency, quantity, entry_price,
+                entry_time, status, hold_type, phase, strategy_id
+            ) VALUES (99, 'SPY', 'US', 'USD', 1.0, 100.0,
+                      '2026-04-27T15:40:00-04:00',
+                      'STOP_AND_TARGET_ACTIVE', 'swing', 1, 'breakout')
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        # Alpaca says "no position". alpaca-py raises APIError; our
+        # broad except in _check_alpaca_position catches it.
+        base_order_manager._gw.client.get_open_position.side_effect = (
+            APIError({"code": 40410000, "message": "position does not exist"})
+        )
+
+        sm = StrategyManager(
+            strategies=[_StubStrategy(decision=_make_decision())],
+            portfolio_manager=base_portfolio_manager,
+            market_data=base_market_data,
+            order_manager=base_order_manager,
+            risk_manager=base_risk_manager,
+            sentiment=base_sentiment,
+            earnings=base_earnings,
+            config=base_config,
+            db_path=tmp_db_path,
+        )
+
+        n = await sm.drain_disabled_sleeves()
+        assert n == 0, "should not count a skipped drain as drained"
+        base_order_manager.place_exit.assert_not_awaited()
+
+        # DB row is now CLOSED so we don't retry on every subsequent tick.
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            row = conn.execute(
+                "SELECT status FROM positions WHERE id = 99"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None
+        assert row[0] == "CLOSED"
+
+    @pytest.mark.asyncio
+    async def test_drain_refuses_when_alpaca_holds_opposite_side(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        tmp_db_path,
+    ):
+        """DB says +1 SPY, Alpaca says -1 SPY → REFUSE. Submitting a drain
+        SELL here would deepen the short to -2. Position stays in DB so
+        the operator can investigate (no auto-CLOSE)."""
+        import sqlite3
+
+        conn = sqlite3.connect(tmp_db_path)
+        conn.execute(
+            """
+            INSERT INTO positions (
+                id, ticker, exchange, currency, quantity, entry_price,
+                entry_time, status, hold_type, phase, strategy_id
+            ) VALUES (77, 'SPY', 'US', 'USD', 1.0, 100.0,
+                      '2026-04-27T15:40:00-04:00',
+                      'STOP_AND_TARGET_ACTIVE', 'swing', 1, 'breakout')
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        # Alpaca holds OPPOSITE side: -1
+        opposite_pos = MagicMock()
+        opposite_pos.qty = "-1.0"
+        base_order_manager._gw.client.get_open_position.return_value = opposite_pos
+
+        sm = StrategyManager(
+            strategies=[_StubStrategy(decision=_make_decision())],
+            portfolio_manager=base_portfolio_manager,
+            market_data=base_market_data,
+            order_manager=base_order_manager,
+            risk_manager=base_risk_manager,
+            sentiment=base_sentiment,
+            earnings=base_earnings,
+            config=base_config,
+            db_path=tmp_db_path,
+        )
+
+        n = await sm.drain_disabled_sleeves()
+        assert n == 0
+        base_order_manager.place_exit.assert_not_awaited()
+
+        # Position NOT marked CLOSED — opposite-side drift needs human eyes.
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            row = conn.execute(
+                "SELECT status FROM positions WHERE id = 77"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row[0] == "STOP_AND_TARGET_ACTIVE"
+
+    @pytest.mark.asyncio
+    async def test_drain_proceeds_when_alpaca_confirms_same_side(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        tmp_db_path,
+    ):
+        """DB says +5 SPY, Alpaca confirms +5 → drain SELL proceeds.
+        Same as the original drain test but with the Alpaca check now
+        explicitly verified."""
+        import sqlite3
+
+        conn = sqlite3.connect(tmp_db_path)
+        conn.execute(
+            """
+            INSERT INTO positions (
+                ticker, exchange, currency, quantity, entry_price,
+                entry_time, status, hold_type, phase, strategy_id
+            ) VALUES ('SPY', 'US', 'USD', 5.0, 100.0,
+                      '2026-04-27T15:40:00-04:00',
+                      'STOP_AND_TARGET_ACTIVE', 'swing', 1, 'breakout')
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        same_side = MagicMock()
+        same_side.qty = "5.0"
+        base_order_manager._gw.client.get_open_position.return_value = same_side
+
+        sm = StrategyManager(
+            strategies=[_StubStrategy(decision=_make_decision())],
+            portfolio_manager=base_portfolio_manager,
+            market_data=base_market_data,
+            order_manager=base_order_manager,
+            risk_manager=base_risk_manager,
+            sentiment=base_sentiment,
+            earnings=base_earnings,
+            config=base_config,
+            db_path=tmp_db_path,
+        )
+
+        n = await sm.drain_disabled_sleeves()
+        assert n == 1
+        base_order_manager.place_exit.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

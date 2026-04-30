@@ -208,6 +208,63 @@ miniature.
 - An orphan-handling code path exists for the case where a strategy
   goes missing from `STRATEGY_REGISTRY` (config rename, code deletion).
 
+## Bug B6 — drain_disabled_sleeves submitted blind SELLs (2026-04-30)
+
+### Symptom
+
+Each `bot.yml` tick re-shorted the orphan positions on Alpaca. After we
+flattened SPY/XLRE manually via `flatten_orphans --execute`, the next
+bot run submitted SELLs against an already-flat sleeve, building a new
+short. Repeated triggers compounded the short — unbounded short exposure
+on a long-only paper account.
+
+### Evidence (run 25182271744)
+
+```
+18:25:36 [recovery]        DB has position SPY not in Alpaca - marking CLOSED
+18:25:36 [recovery]        DB has position XLRE not in Alpaca - marking CLOSED
+18:25:41 [main]            State recovery: Alpaca positions: 0, DB open positions: 6
+18:26:04 [strategy_manager] Draining orphan position: ticker=SPY  strategy=breakout         qty=1.0000
+18:26:04 [order_manager]    Strategy exit submitted: SELL 1.0  SPY  @ MARKET (reason=orphan_sleeve_drain:breakout)
+18:26:04 [strategy_manager] Draining orphan position: ticker=XLRE strategy=trend_following  qty=20.0000
+18:26:04 [order_manager]    Strategy exit submitted: SELL 20.0 XLRE @ MARKET (reason=orphan_sleeve_drain:trend_following)
+```
+
+The DB's `quantity` column for these rows still held the original LONG
+qty (+1, +20) from the 04-27/04-28 entries — never updated when those
+positions were reduced or flattened by other paths. The drain read the
+DB qty and submitted a SELL "to close the long", but Alpaca had 0
+shares, so the SELL OPENED a new SHORT.
+
+### Fix
+
+Resolved on branch `claude/fix-drain-checks-alpaca`. `drain_disabled_sleeves`
+now calls `_check_alpaca_position(ticker, db_qty)` before submitting any
+exit. Three outcomes:
+
+- **NOT_HELD** — Alpaca holds 0. Skip the order, mark the DB row CLOSED
+  (so subsequent ticks don't keep retrying).
+- **OPPOSITE_SIDE** — DB qty has the opposite sign of Alpaca. Refuse
+  the order with a CRITICAL log and leave the DB row alone for human
+  investigation. Submitting a SELL here would deepen the short.
+- **OK** — Alpaca confirms a same-sign position. Drain proceeds.
+
+Three regression tests pin each branch.
+
+### Lesson for future drain-style code paths
+
+The DB and Alpaca can drift for many reasons:
+
+- Manual flatten (this incident)
+- Broker-side stop fill not yet recorded by the bot
+- State-recovery race (recovery marks DB CLOSED in one transaction;
+  drain reads pre-recovery snapshot in another)
+- Reconcile cycles between bot ticks
+
+Any code path that submits orders based on DB position state MUST
+verify the broker side first. The DB is the bot's intent, not the
+broker's truth.
+
 ## Files referenced
 
 - [trading_bot/execution/order_manager.py](../trading_bot/execution/order_manager.py)

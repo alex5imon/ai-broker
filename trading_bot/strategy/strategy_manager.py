@@ -396,6 +396,35 @@ class StrategyManager:
             if qty <= 0:
                 continue
 
+            # Verify the position is actually held on Alpaca before
+            # submitting a SELL. The DB qty can drift from broker truth
+            # (manual flatten, broker-side stop fill not yet recorded,
+            # state-recovery race). Submitting blind opens a NEW position
+            # in the OPPOSITE direction — exactly the
+            # 2026-04-30 incident where a SELL drained against an
+            # already-flat sleeve and built an unbounded short.
+            position_id: int | None = pos.get("id")
+            check = self._check_alpaca_position(ticker, db_qty=qty)
+            if check == "NOT_HELD":
+                logger.warning(
+                    "Drain skip: %s strategy=%s DB qty=%+.4f but Alpaca "
+                    "holds 0 — DB drift; marking position CLOSED instead "
+                    "of submitting drain order",
+                    ticker, sid or "<none>", qty,
+                )
+                if position_id is not None:
+                    self._mark_position_closed(position_id)
+                continue
+            if check == "OPPOSITE_SIDE":
+                logger.critical(
+                    "Drain REFUSING %s strategy=%s: DB qty=%+.4f but Alpaca "
+                    "holds the opposite side. Will not submit a drain order "
+                    "that would deepen the position. Manual reconcile needed.",
+                    ticker, sid or "<none>", qty,
+                )
+                continue
+            # check == "OK" — Alpaca confirms a same-side position.
+
             logger.warning(
                 "Draining orphan position: ticker=%s strategy=%s qty=%.4f",
                 ticker, sid or "<none>", qty,
@@ -423,6 +452,53 @@ class StrategyManager:
             closed += 1
 
         return closed
+
+    def _check_alpaca_position(self, ticker: str, *, db_qty: float) -> str:
+        """Probe Alpaca for the current position on ``ticker``.
+
+        Returns one of:
+          - ``"NOT_HELD"`` — Alpaca holds 0 (or query failed in a way that
+            looks like "no position"). Caller should NOT submit a drain
+            order; should mark DB CLOSED.
+          - ``"OPPOSITE_SIDE"`` — Alpaca holds a position on the opposite
+            sign of ``db_qty``. A drain SELL on an already-short position
+            would deepen the short. Caller should REFUSE.
+          - ``"OK"`` — Alpaca holds a same-sign position. Drain may proceed.
+        """
+        try:
+            client = self._order_manager._gw.client
+            alpaca_pos = client.get_open_position(ticker)
+            alpaca_qty = float(getattr(alpaca_pos, "qty", 0) or 0)
+        except Exception:
+            # alpaca-py raises APIError on "position does not exist".
+            # Treat any lookup failure as not-held; the caller will mark
+            # the DB row CLOSED so we don't retry on every tick.
+            return "NOT_HELD"
+
+        if alpaca_qty == 0:
+            return "NOT_HELD"
+        if (db_qty > 0) != (alpaca_qty > 0):
+            return "OPPOSITE_SIDE"
+        return "OK"
+
+    def _mark_position_closed(self, position_id: int) -> None:
+        """Update positions.status = 'CLOSED' for a single row."""
+        now_str: str = datetime.now(tz=ET).isoformat()
+        try:
+            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
+            try:
+                conn.execute(
+                    "UPDATE positions SET status = 'CLOSED', updated_at = ? "
+                    "WHERE id = ? AND status NOT IN ('CLOSED', 'ENTRY_FAILED')",
+                    (now_str, position_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            logger.exception(
+                "Drain: failed to mark positions.id=%d as CLOSED", position_id,
+            )
 
     def _build_om_decision(self, decision: StrategyDecision) -> OMEntryDecision:
         sector: str = GICS_SECTOR.get(decision.ticker, "Unknown")
