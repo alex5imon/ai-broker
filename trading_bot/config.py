@@ -538,6 +538,66 @@ class Config:
         strategies: dict[str, Any] = self.get_strategy_configs()
         return dict(strategies.get(strategy_id, {}))
 
+    def detect_disabled_strategy_orphans(self, db_path: str) -> list[str]:
+        """Find open positions tagged with a strategy that's now disabled.
+
+        This is the failure pattern from the 2026-04-28 regime rebalance:
+        the operator flips a sleeve to ``enabled: false`` while it still
+        has live positions, leaving them outside the bot's per-tick
+        management loop. Drain (``StrategyManager.drain_disabled_sleeves``,
+        with the B6 Alpaca-position guard from PR #20) handles this
+        safely going forward, but we still want to surface the mismatch
+        loudly so the operator knows their config edit produced
+        unmanaged exposure.
+
+        Returns one human-readable warning string per disabled-strategy /
+        ticker / qty mismatch. Empty list = no inconsistency. Caller
+        should log each warning at CRITICAL and (if wired) fire an
+        ntfy alert.
+
+        Read-only — never mutates the DB. Safe to call any time after
+        ``Config.load()``. Returns empty list (with a warning log) if
+        the DB is unavailable; this routine should never crash the bot.
+        """
+        import sqlite3
+
+        enabled_ids: set[str] = {
+            sid for sid, cfg in self.get_strategy_configs().items()
+            if cfg.get("enabled", True)
+        }
+
+        try:
+            conn = sqlite3.connect(db_path)
+            try:
+                rows = conn.execute(
+                    "SELECT strategy_id, ticker, quantity, status FROM positions "
+                    "WHERE status NOT IN ('CLOSED', 'ENTRY_FAILED') "
+                    "  AND strategy_id IS NOT NULL "
+                    "  AND strategy_id != 'unknown' "
+                    "ORDER BY strategy_id, ticker"
+                ).fetchall()
+            finally:
+                conn.close()
+        except Exception:
+            logger.warning(
+                "detect_disabled_strategy_orphans: DB read failed "
+                "(db_path=%s); skipping check", db_path,
+                exc_info=True,
+            )
+            return []
+
+        warnings: list[str] = []
+        for sid, ticker, qty, status in rows:
+            if sid in enabled_ids:
+                continue
+            warnings.append(
+                f"Strategy '{sid}' is disabled in config but holds an open "
+                f"position: ticker={ticker} qty={qty} status={status}. "
+                f"Drain will attempt to flatten on the next tick — verify "
+                f"Alpaca state matches expectations."
+            )
+        return warnings
+
     # Repr
     # -----------------------------------------------------------------------
 

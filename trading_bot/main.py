@@ -288,6 +288,24 @@ class TradingBot:
             except Exception:
                 logger.exception("State recovery failed (non-fatal)")
 
+            # --- 5a. Disabled-strategy consistency check ---
+            # Surface the case where config sets enabled=false on a
+            # sleeve that still has live positions. Drain will safely
+            # flatten on the next tick (guarded by PR #20's Alpaca
+            # check), but the operator should know their config edit
+            # produced unmanaged exposure.
+            try:
+                inconsistencies = self._config.detect_disabled_strategy_orphans(
+                    self._db_path,
+                )
+                for warning in inconsistencies:
+                    logger.critical("Disabled-strategy orphan: %s", warning)
+            except Exception:
+                logger.warning(
+                    "Disabled-strategy consistency check failed (non-fatal)",
+                    exc_info=True,
+                )
+
             # --- 5b. Anchor phase to live equity ---
             # ``__init__`` logs the cached default phase (MICRO) because
             # equity isn't known yet at construction time. After Alpaca
