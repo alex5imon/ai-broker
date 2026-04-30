@@ -3,7 +3,8 @@
 Order submission and Alpaca round-trips are intentionally not exercised
 here — those run only behind --execute and require a paper account.
 We verify: long/short side derivation, DB child-order discovery,
-status filter (don't touch already-CLOSED rows), idempotency.
+status filter (don't touch already-CLOSED rows), idempotency,
+and TIF selection from clock state.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import pytest
 
 from trading_bot.self_improve.flatten_orphans import (
     _build_plan,
+    _choose_tif,
     _find_db_position,
 )
 
@@ -150,3 +152,23 @@ def test_find_db_position_skips_entry_failed(tmp_db):
     pos_id, child_ids = _find_db_position(tmp_db, "SPY")
     assert pos_id is None
     assert child_ids == []
+
+
+# ---------------------------------------------------------------------------
+# _choose_tif — clock-aware TimeInForce selection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_choose_tif_market_open_returns_day():
+    from alpaca.trading.enums import TimeInForce
+    assert _choose_tif(is_market_open=True) == TimeInForce.DAY
+
+
+@pytest.mark.unit
+def test_choose_tif_market_closed_returns_opg():
+    """OPG queues for the opening auction and bypasses the held_for_orders
+    check that would block a DAY order while stop-cancellations are stuck
+    in PENDING_CANCEL pre-market."""
+    from alpaca.trading.enums import TimeInForce
+    assert _choose_tif(is_market_open=False) == TimeInForce.OPG
