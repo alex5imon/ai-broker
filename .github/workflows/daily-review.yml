@@ -100,7 +100,11 @@ jobs:
           git config user.name "ai-broker-bot"
           git config user.email "ai-broker-bot@users.noreply.github.com"
           git checkout -b "$BRANCH"
-          git add "$REPORT"
+          # -f required: trading_bot/docs/self_improve_reports/ is in
+          # .gitignore (prevents ad-hoc local runs from polluting the
+          # repo), but the workflow's purpose is to commit the report
+          # as a PR.
+          git add -f "$REPORT"
           if git diff --cached --quiet; then
             echo "Report file unchanged — no PR needed."
             exit 0
