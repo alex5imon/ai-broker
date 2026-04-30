@@ -608,3 +608,108 @@ def test_active_count_and_getters(config, tmp_db_path: str, mock_notifier):
     assert om.active_count == 0
     assert om.get_active_orders() == {}
     assert om.get_active_order(99) is None
+
+
+# ---------------------------------------------------------------------------
+# place_limit_exit — prevents double-exit by transitioning state before tick
+# ---------------------------------------------------------------------------
+
+
+class TestPlaceLimitExit:
+    """The exit-path regression test for the double-submit bug.
+
+    Pre-fix, ``check_exits`` and ``wind_down`` called
+    ``self._gateway.client.submit_order`` directly: the order id was
+    discarded and the position row stayed at ``POSITION_OPEN``, so the
+    next stateless tick re-evaluated the same exit condition and
+    re-submitted.  Routing through ``OrderManager.place_limit_exit``
+    fixes both: the order_id is mapped back to the trade and the
+    position transitions to ``CLOSING`` synchronously.
+    """
+
+    @pytest.mark.asyncio
+    async def test_transitions_position_to_closing_before_returning(
+        self, config, tmp_db_path: str, mock_notifier
+    ):
+        om = _make_om(config, tmp_db_path, mock_notifier)
+
+        # Seed an open position so the OrderManager has something to match.
+        conn = sqlite3.connect(tmp_db_path)
+        conn.execute(
+            """INSERT INTO positions
+               (ticker, exchange, currency, sector, quantity, entry_price,
+                entry_time, status, hold_type, phase, strategy_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "SPY", "NASDAQ", "USD", "Information Technology",
+                10, 100.0, datetime.now(tz=ET).isoformat(),
+                "POSITION_OPEN", "intraday", 1, "mean_reversion",
+            ),
+        )
+        trade_id = conn.execute(
+            "SELECT id FROM positions WHERE ticker = 'SPY'"
+        ).fetchone()[0]
+        conn.commit()
+        conn.close()
+
+        om._active_orders[trade_id] = _ActiveOrder(
+            trade_id=trade_id,
+            ticker="SPY",
+            exchange="NASDAQ",
+            alpaca_entry_order_id="entry-1",
+            status=PositionStatus.POSITION_OPEN,
+            entry_shares=10,
+            filled_shares=10,
+            entry_price=100.0,
+            stop_price=98.0,
+            target_price=104.0,
+            hold_type="intraday",
+        )
+
+        # Stub Alpaca — limit submit returns an order id.
+        submitted = _alpaca_order("limit-exit-1", status="new")
+        om._gw.client.submit_order = MagicMock(return_value=submitted)
+
+        order_id = await om.place_limit_exit(
+            ticker="SPY", qty=10, limit_price=100.5, reason="take_profit",
+        )
+
+        assert order_id == "limit-exit-1"
+
+        # CRITICAL: position must be CLOSING in the DB before the next tick.
+        conn = sqlite3.connect(tmp_db_path)
+        row = conn.execute(
+            "SELECT status FROM positions WHERE id = ?", (trade_id,),
+        ).fetchone()
+        conn.close()
+        assert row[0] == PositionStatus.CLOSING.value, (
+            f"position must transition to CLOSING before returning, got {row[0]}"
+        )
+
+        # And the order_id must be pinned back to the trade so a subsequent
+        # fill notification routes to the right position.
+        assert om._alpaca_to_trade["limit-exit-1"] == trade_id
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_alpaca_error(
+        self, config, tmp_db_path: str, mock_notifier
+    ):
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        om._gw.client.submit_order = MagicMock(side_effect=RuntimeError("boom"))
+
+        order_id = await om.place_limit_exit(
+            ticker="SPY", qty=10, limit_price=100.0, reason="time_stop",
+        )
+
+        # Caller is expected to fall back to emergency_flatten when None.
+        assert order_id is None
+
+    @pytest.mark.asyncio
+    async def test_rejects_non_positive_qty(
+        self, config, tmp_db_path: str, mock_notifier
+    ):
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        order_id = await om.place_limit_exit(
+            ticker="SPY", qty=0, limit_price=100.0, reason="bug",
+        )
+        assert order_id is None

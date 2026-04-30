@@ -89,7 +89,7 @@ def test_daily_metrics_no_trades(tmp_db_path):
 
 def test_daily_metrics_with_wins_and_losses(tmp_db_path):
     pc = PerformanceCalculator(tmp_db_path)
-    today_str = date.today().isoformat()
+    today_str = datetime.now(tz=ET).date().isoformat()
     today_iso = datetime.now(tz=ET).isoformat()
     # Two wins, one loss
     _seed_trade(tmp_db_path, ticker="A", exit_time=today_iso, pnl_usd=10.0, gross_pnl=12.5)
@@ -108,7 +108,7 @@ def test_daily_metrics_with_wins_and_losses(tmp_db_path):
 def test_daily_metrics_usd_passthrough(tmp_db_path):
     """Account is USD-only — gross_pnl flows through unchanged."""
     pc = PerformanceCalculator(tmp_db_path)
-    today_str = date.today().isoformat()
+    today_str = datetime.now(tz=ET).date().isoformat()
     today_iso = datetime.now(tz=ET).isoformat()
     _seed_trade(
         tmp_db_path, ticker="X", exit_time=today_iso,
