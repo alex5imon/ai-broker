@@ -9,15 +9,16 @@ name: daily-review
 # self_improve_reports/. Humans review and apply patches by hand.
 
 on:
-  # NOTE: scheduled cron deliberately disabled until the data layer is
-  # fixed. The agent's postmortem reads from the `trades` table, but the
-  # live bot is not currently persisting closed trades correctly (see
-  # docs/self_improve_followups.md tasks #2 and #3). Running on cron
-  # would just open empty draft PRs every weekday. Re-enable the schedule
-  # below once those tasks are resolved and a real trade history exists.
   workflow_dispatch: {}
-  # schedule:
-  #   - cron: "30 21 * * 1-5"
+  schedule:
+    # 21:30 UTC = 17:30 ET (standard) / 16:30 ET (DST). Either way, after
+    # the 16:00 close. Weekdays only.
+    #
+    # Originally deferred until the data-layer bugs (followups doc tasks
+    # #2/#3 + bug B6) were fixed — those landed in PRs #16 / #19 / #20.
+    # Re-enabled 2026-04-30 once the live bot was confirmed writing
+    # complete trade rows and the drain path was verified safe.
+    - cron: "30 21 * * 1-5"
 
 concurrency:
   group: daily-review
