@@ -677,6 +677,92 @@ class OrderManager:
                 )
             return None
 
+    async def place_limit_exit(
+        self,
+        ticker: str,
+        qty: float,
+        limit_price: float,
+        reason: str,
+    ) -> str | None:
+        """Submit a strategy-driven limit-sell exit.
+
+        Mirrors :meth:`place_exit` but uses a DAY limit order instead of
+        a market order, and — critically — transitions the matching
+        position to ``CLOSING`` and persists the exit order_id BEFORE
+        returning. This prevents the next stateless tick from
+        re-evaluating the same exit condition and double-submitting.
+
+        Returns the Alpaca order id on submission, or ``None`` on
+        failure. On failure the caller should fall back to
+        :meth:`emergency_flatten`.
+        """
+        if qty <= 0:
+            logger.warning(
+                "place_limit_exit called with non-positive qty for %s: %s",
+                ticker, qty,
+            )
+            return None
+
+        # Find the matching active order so we can cancel bracket legs
+        # and pin the exit order_id back to the trade.
+        matching_trade_id: int | None = None
+        matching_active: _ActiveOrder | None = None
+        for tid, active in self._active_orders.items():
+            if active.ticker == ticker and active.status not in (
+                PositionStatus.CLOSED,
+                PositionStatus.ENTRY_FAILED,
+            ):
+                matching_trade_id = tid
+                matching_active = active
+                break
+
+        if matching_active is not None:
+            for oid in (
+                matching_active.alpaca_stop_order_id,
+                matching_active.alpaca_target_order_id,
+                matching_active.alpaca_trail_order_id,
+            ):
+                if oid is not None:
+                    await self.cancel_order(oid)
+        else:
+            await self.cancel_all_for_ticker(ticker)
+
+        client: TradingClient = self._gw.client
+        try:
+            request = LimitOrderRequest(
+                symbol=ticker,
+                qty=qty,
+                side=OrderSide.SELL,
+                type=OrderType.LIMIT,
+                time_in_force=TimeInForce.DAY,
+                limit_price=round(limit_price, 2),
+            )
+            order: AlpacaOrder = await asyncio.to_thread(
+                client.submit_order, order_data=request,
+            )
+            order_id: str = str(order.id)
+            logger.info(
+                "Limit exit submitted: SELL %s %s @ %.2f (reason=%s, alpaca_id=%s)",
+                qty, ticker, limit_price, reason, order_id,
+            )
+
+            # Pin order_id → trade_id and transition position state so
+            # the next tick doesn't re-fire the same exit. The fill
+            # detection in _check_order_statuses will move CLOSING ->
+            # CLOSED once the fill confirms.
+            if matching_trade_id is not None:
+                self._alpaca_to_trade[order_id] = matching_trade_id
+                self._update_position_status(
+                    matching_trade_id, PositionStatus.CLOSING,
+                )
+            return order_id
+        except Exception:
+            logger.exception(
+                "Failed to place limit exit for %s (qty=%s, reason=%s)",
+                ticker, qty, reason,
+            )
+            return None
+
     async def flatten_all(self) -> None:
         """Flatten all positions with market orders (kill switch)."""
         try:

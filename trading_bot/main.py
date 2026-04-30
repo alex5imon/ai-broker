@@ -868,7 +868,12 @@ class TradingBot:
                 await self._order_manager.emergency_flatten(ticker, qty, exchange)
                 self._clear_spread_defer(ticker)
             else:
-                # Limit sell at mid-price
+                # Limit sell at mid-price.  Routed through OrderManager so
+                # the position transitions to CLOSING and the exit order_id
+                # is persisted BEFORE the next tick — without that step, a
+                # slow Alpaca fill leaves the row at POSITION_OPEN and the
+                # next tick re-evaluates the exit condition, risking a
+                # double-submit.
                 bid_ask = self._market_data.get_bid_ask(ticker)
                 limit_price: float
                 if bid_ask is not None:
@@ -876,30 +881,18 @@ class TradingBot:
                 else:
                     limit_price = current_price
 
-                try:
-                    from alpaca.trading.requests import LimitOrderRequest
-                    from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
-
-                    request = LimitOrderRequest(
-                        symbol=ticker,
-                        qty=qty,
-                        side=OrderSide.SELL,
-                        type=OrderType.LIMIT,
-                        time_in_force=TimeInForce.DAY,
-                        limit_price=round(limit_price, 2),
-                    )
-                    self._gateway.client.submit_order(order_data=request)
-                    logger.info(
-                        "Exit limit order: SELL %d %s @ %.2f (reason=%s)",
-                        qty, ticker, limit_price, exit_decision.reason,
-                    )
-                except Exception:
-                    logger.exception(
-                        "Limit exit failed for %s — falling back to market", ticker
+                order_id: str | None = await self._order_manager.place_limit_exit(
+                    ticker=ticker,
+                    qty=qty,
+                    limit_price=limit_price,
+                    reason=exit_decision.reason,
+                )
+                if order_id is None:
+                    logger.warning(
+                        "Limit exit failed for %s — falling back to market", ticker,
                     )
                     await self._order_manager.emergency_flatten(ticker, qty, exchange)
-                else:
-                    self._clear_spread_defer(ticker)
+                self._clear_spread_defer(ticker)
 
     # ------------------------------------------------------------------
     # Spread defer tracking (per-ticker tick_state rows)
@@ -1039,30 +1032,21 @@ class TradingBot:
                 await self._order_manager.emergency_flatten(ticker, qty, exchange)
                 continue
 
-            # Tick-model wind-down: place a DAY limit sell and exit.  Alpaca
-            # auto-cancels the DAY order at close, so any unfilled portion
-            # becomes a market-on-close candidate for the next wind-down tick
-            # (or for the exit-check logic driving emergency_flatten).
-            try:
-                from alpaca.trading.requests import LimitOrderRequest
-                from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
-
-                request = LimitOrderRequest(
-                    symbol=ticker,
-                    qty=qty,
-                    side=OrderSide.SELL,
-                    type=OrderType.LIMIT,
-                    time_in_force=TimeInForce.DAY,
-                    limit_price=round(limit_price, 2),
-                )
-                order = self._gateway.client.submit_order(order_data=request)
-                logger.info(
-                    "Wind-down limit placed: SELL %d %s @ %.2f (order_id=%s)",
-                    qty, ticker, limit_price, str(order.id),
-                )
-            except Exception:
-                logger.exception(
-                    "Wind-down order error for %s — trying market flatten", ticker
+            # Tick-model wind-down: place a DAY limit sell via OrderManager
+            # so the position transitions to CLOSING and the exit order_id
+            # is persisted before the next tick.  Alpaca auto-cancels the
+            # DAY order at close, so any unfilled portion gets picked up by
+            # the exit-check logic on the next tick (driving emergency_flatten).
+            order_id: str | None = await self._order_manager.place_limit_exit(
+                ticker=ticker,
+                qty=qty,
+                limit_price=limit_price,
+                reason="wind_down",
+            )
+            if order_id is None:
+                logger.warning(
+                    "Wind-down limit failed for %s — falling back to market",
+                    ticker,
                 )
                 await self._order_manager.emergency_flatten(ticker, qty, exchange)
 
