@@ -54,5 +54,18 @@ def resolve_alpaca_env() -> tuple[str, str, bool]:
     if key and secret:
         os.environ["ALPACA_API_KEY"] = key
         os.environ["ALPACA_SECRET_KEY"] = secret
+    else:
+        # Surface the misconfiguration explicitly. The previous behavior
+        # silently returned empty strings, making downstream Alpaca
+        # connection failures hard to root-cause. CI runs and live trading
+        # MUST have these set — only offline backtests can legitimately
+        # proceed without them.
+        suffix: str = "PAPER" if is_paper else "LIVE"
+        logger.error(
+            "Alpaca credentials missing for env=%s — bot will fail to connect. "
+            "Set ALPACA_%s_KEY_ID + ALPACA_%s_SECRET (or ALPACA_API_KEY + "
+            "ALPACA_SECRET_KEY directly).",
+            env, suffix, suffix,
+        )
 
     return key, secret, is_paper

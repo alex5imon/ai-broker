@@ -447,7 +447,7 @@ class RiskManager:
         while self._recent_rejections and self._recent_rejections[0] < cutoff:
             self._recent_rejections.popleft()
 
-        if len(self._recent_rejections) > max_count:
+        if len(self._recent_rejections) >= max_count:
             # Already triggered, check if pause has expired
             if self._pause_until is not None:
                 if datetime.now(tz=ET) >= self._pause_until:
@@ -564,10 +564,19 @@ class RiskManager:
     # ------------------------------------------------------------------
 
     def record_trade(self, pnl_usd: float, commission_usd: float) -> None:
-        """Record a completed trade for daily tracking."""
+        """Record a completed trade for daily tracking.
+
+        ``_daily_gross_pnl_usd`` is the sum of WINNING trade gross profits
+        only — used as the denominator in the commission-budget ratio
+        (commissions / gross_profits). The previous formula
+        ``abs(pnl) + commission`` inflated the denominator by counting
+        losses and commissions, making the commission stop fire late or
+        never. Dormant on Alpaca today (commission_usd is always 0) but
+        wrong for any future non-zero commission environment.
+        """
         self._trade_count += 1
         self._daily_pnl_usd += pnl_usd
-        self._daily_gross_pnl_usd += abs(pnl_usd) + commission_usd
+        self._daily_gross_pnl_usd += max(pnl_usd, 0.0)
         self._daily_commissions_usd += commission_usd
 
         logger.info(

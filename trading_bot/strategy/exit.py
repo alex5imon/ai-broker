@@ -226,8 +226,18 @@ class ExitManager:
         else:
             return False
 
-        # Ensure timezone-aware
+        # Ensure timezone-aware. The bot's writers always stamp ET via
+        # ``datetime.now(tz=ET).isoformat()`` so naive strings are
+        # exceptional — fixtures, manual DB inserts, or legacy rows.
+        # Stamp them as ET (the writer's convention) and warn loudly so
+        # the source can be fixed; treating a UTC-naive string as ET
+        # would skew the time-stop by 4–5 hours.
         if entry_time.tzinfo is None:
+            logger.warning(
+                "Position has naive entry_time (%s) — stamping as ET. "
+                "Investigate the writer; this row may have legacy data.",
+                entry_time_raw,
+            )
             entry_time = entry_time.replace(tzinfo=ET)
         if current_time.tzinfo is None:
             current_time = current_time.replace(tzinfo=ET)
