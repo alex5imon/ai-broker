@@ -97,6 +97,15 @@ jobs:
           fi
 
           BRANCH="${{ steps.dates.outputs.branch }}"
+
+          # Idempotent: if the branch already exists on origin, an earlier run
+          # today already opened a PR. Don't push a competing tip (would fail
+          # non-fast-forward) or force-push over the existing PR.
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "Branch $BRANCH already exists on origin — earlier run today already opened a PR. Skipping."
+            exit 0
+          fi
+
           git config user.name "ai-broker-bot"
           git config user.email "ai-broker-bot@users.noreply.github.com"
           git checkout -b "$BRANCH"
