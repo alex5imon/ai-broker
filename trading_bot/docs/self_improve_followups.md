@@ -10,6 +10,16 @@ says "exercise extreme care with all order logic."
 - **#39 — Replace bracket entry with plain-limit + standalone-stop** (must land before `$1k` live).
   Whole-share floor in PR #38 is a Monday-morning unblocker; backtests show it
   drops ~50% of mean_reversion signals at $1k account size.
+- **#40 — `PerformanceCalculator` not surfacing closed trades.** Two pre-existing
+  test failures reproduce the same pattern as the live `daily_summaries` showing
+  0/0/0 wins/losses despite closed entries. Probably the load-bearing reason
+  daily-review reports keep coming back empty.
+- **#41 — Verify PR #20 drain logic.** The verify-before-SELL guard merged after
+  the churn it was meant to prevent; needs unit + integration coverage before
+  the next sleeve-disable event proves it the hard way.
+
+The legacy "Task #2 / #3 / Bug B6" sections below are kept for the audit trail
+but their resolved status is summarized at the top of each.
 
 ## How they were found
 
@@ -24,6 +34,13 @@ says "exercise extreme care with all order logic."
   empty.
 
 ## Task #2 — Live bot is not persisting exit data
+
+> **Status (2026-05-02):** Largely resolved. PR #16 added `strategy_id` capture
+> at insert time and PR #38 closes the trades row at `exit_reason='entry_failed'`
+> when Alpaca rejects the submit, so the NULL-everything pattern below is gone.
+> What remains is downstream: `PerformanceCalculator.calculate_daily_metrics`
+> returns 0 even when closed trades exist (reproduces in unit tests on `main`).
+> Tracked as **issue #40**.
 
 ### Symptom
 
@@ -128,6 +145,13 @@ should stay a working set.
 
 ## Task #3 — Orphaned positions on disabled strategies
 
+> **Status (2026-05-02):** Resolved. `Config.detect_disabled_strategy_orphans`
+> ([config.py:531](../config.py)) surfaces a CRITICAL warning when an enabled
+> sleeve is flipped off while it still holds positions. `StrategyManager.drain_disabled_sleeves`
+> handles the tick-time orphan exit, with the broker-side qty guard from PR #20.
+> The 2 STOP_AND_TARGET_ACTIVE + 1 POSITION_OPEN rows from 2026-04-29 were
+> drained 2026-04-30 and Alpaca currently holds 0 positions on disabled sleeves.
+
 ### Symptom
 
 ```sql
@@ -215,6 +239,12 @@ miniature.
   goes missing from `STRATEGY_REGISTRY` (config rename, code deletion).
 
 ## Bug B6 — drain_disabled_sleeves submitted blind SELLs (2026-04-30)
+
+> **Status (2026-05-02):** Code fix shipped in PR #20 (verify-Alpaca-position-before-SELL).
+> Verification on a real drain event is still pending — PR #20 merged *after*
+> the 04-30 churn that motivated it, and no sleeve has been disabled since.
+> Tracked as **issue #41** with a unit + integration test plan that doesn't
+> require waiting for an organic disable event.
 
 ### Symptom
 
