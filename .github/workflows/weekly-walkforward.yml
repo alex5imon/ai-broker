@@ -1,0 +1,141 @@
+name: weekly-walkforward
+
+# Weekly statistical-significance check for the active strategy stack.
+# Runs the multi-strategy walkforward backtest with bootstrap CIs over
+# the last ~3 years of intraday bars (the regime the live bot trades in)
+# and gates on the synthetic _portfolio strategy's PF CI lower bound.
+#
+# Healthy run → upload report as artifact only.
+# Degraded run (CI lower bound < 1.0) → also open a draft PR with the
+# report so it lands in front of a human.
+#
+# This is a deterministic statistical check (no Claude agent involved):
+# the per-trade bootstrap is run inside the existing walkforward harness,
+# the threshold check lives in scripts/walkforward_health_check.py.
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Sunday 22:00 UTC = pre-Monday-open analysis window. Weekend run
+    # avoids contention with bot.yml's 5-min weekday cron.
+    - cron: "0 22 * * 0"
+
+concurrency:
+  group: weekly-walkforward
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  walkforward:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Compute date window
+        id: dates
+        run: |
+          # Last ~3 calendar years ending yesterday. Aligns with the
+          # regime-matched walkforward methodology in
+          # memory/feedback_regime_matched_walkforward.md.
+          BT_TO=$(date -u -d "yesterday" +%Y-%m-%d)
+          BT_FROM=$(date -u -d "3 years ago" +%Y-%m-%d)
+          REPORT_DATE=$(date -u +%Y-%m-%d)
+          echo "bt_from=${BT_FROM}" >> "$GITHUB_OUTPUT"
+          echo "bt_to=${BT_TO}" >> "$GITHUB_OUTPUT"
+          echo "report_date=${REPORT_DATE}" >> "$GITHUB_OUTPUT"
+          echo "branch=weekly-walkforward/${REPORT_DATE}" >> "$GITHUB_OUTPUT"
+
+      - name: Download intraday bars
+        env:
+          ALPACA_ENV: ${{ vars.ALPACA_ENV || 'paper' }}
+          ALPACA_PAPER_KEY_ID: ${{ secrets.ALPACA_PAPER_KEY_ID }}
+          ALPACA_PAPER_SECRET: ${{ secrets.ALPACA_PAPER_SECRET }}
+          ALPACA_LIVE_KEY_ID: ${{ secrets.ALPACA_LIVE_KEY_ID }}
+          ALPACA_LIVE_SECRET: ${{ secrets.ALPACA_LIVE_SECRET }}
+        run: |
+          # Cache miss is OK — the downloader skips dates already cached.
+          python -m trading_bot.data.alpaca_downloader \
+            --from "${{ steps.dates.outputs.bt_from }}" \
+            --to "${{ steps.dates.outputs.bt_to }}" \
+            --tickers SPY QQQ XLF XLK XLE XLV XLI XLY XLP XLU XLB XLRE XLC
+
+      - name: Run walkforward
+        env:
+          ALPACA_ENV: ${{ vars.ALPACA_ENV || 'paper' }}
+          ALPACA_PAPER_KEY_ID: ${{ secrets.ALPACA_PAPER_KEY_ID }}
+          ALPACA_PAPER_SECRET: ${{ secrets.ALPACA_PAPER_SECRET }}
+          ALPACA_LIVE_KEY_ID: ${{ secrets.ALPACA_LIVE_KEY_ID }}
+          ALPACA_LIVE_SECRET: ${{ secrets.ALPACA_LIVE_SECRET }}
+        run: |
+          python -m trading_bot.multi_strategy_backtest \
+            --from "${{ steps.dates.outputs.bt_from }}" \
+            --to "${{ steps.dates.outputs.bt_to }}" \
+            --multi-intraday \
+            --tickers SPY,QQQ,XLF,XLK,XLE,XLV,XLI,XLY,XLP,XLU,XLB,XLRE,XLC \
+            --walkforward --wf-window 90 --wf-step 90 --wf-bootstrap 1000
+
+      - name: Health check + report
+        id: health
+        # Sets exit code 1 when the synthetic _portfolio PF CI lower
+        # bound falls below 1.0. We capture the result without failing
+        # the job so the artifact + alert path can run.
+        run: |
+          set +e
+          python scripts/walkforward_health_check.py \
+            --out walkforward_health.md \
+            --min-pf-lower 1.0
+          echo "alert_exit=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Open draft PR on degradation
+        if: steps.health.outputs.alert_exit == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="${{ steps.dates.outputs.branch }}"
+          REPORT_PATH="trading_bot/docs/walkforward_reports/${{ steps.dates.outputs.report_date }}.md"
+          mkdir -p "$(dirname "$REPORT_PATH")"
+          mv walkforward_health.md "$REPORT_PATH"
+
+          git config user.name "ai-broker-bot"
+          git config user.email "ai-broker-bot@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add -f "$REPORT_PATH"
+          if git diff --cached --quiet; then
+            echo "No diff — skipping PR."
+            exit 0
+          fi
+          git commit -m "weekly-walkforward: portfolio CI degraded ${{ steps.dates.outputs.report_date }}"
+          git push -u origin "$BRANCH"
+
+          gh pr create \
+            --draft \
+            --base main \
+            --head "$BRANCH" \
+            --title "⚠️ weekly-walkforward: portfolio CI degraded ${{ steps.dates.outputs.report_date }}" \
+            --body "Automated weekly walkforward detected the synthetic \`_portfolio\` PF CI lower bound has dropped below 1.0. Review \`$REPORT_PATH\` and the [Return improvement TODOs](../../trading_bot/docs)."
+
+      - name: Upload report + JSON artifact
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: weekly-walkforward-${{ steps.dates.outputs.report_date }}
+          path: |
+            walkforward_health.md
+            backtest_results/walkforward_*.json
+          retention-days: 90
+          if-no-files-found: ignore
