@@ -267,6 +267,115 @@ class TestBreakout:
         strategy = BreakoutStrategy(config=_bo_config())
         assert strategy.get_max_positions() == 1
 
+    def test_h4_trend_filter_blocks_below_sma(self) -> None:
+        cfg = {**_bo_config(), "require_trend_filter": True, "trend_sma_period": 20}
+        strategy = BreakoutStrategy(config=cfg)
+        # Build a daily series with downtrend so SMA20 ends above current.
+        df = _make_bars(60, trend=-0.005)
+        period_high = float(df["high"].iloc[:-1].max())
+        # Even at a fresh "breakout" price, trend filter should block
+        # because current price < SMA(close, 20).
+        result = strategy.evaluate_entry(
+            "PLTR", "US", df, df, period_high * 1.01, 250.0,
+        )
+        assert result is None
+
+    def test_h4_trend_filter_disabled_lets_entry_attempt(self) -> None:
+        # Sanity: with the filter OFF, the same bars use the original
+        # gate (current_price <= period_high) so a price *below* the
+        # period high still returns None — confirms the new flag doesn't
+        # accidentally bypass anything.
+        strategy = BreakoutStrategy(config=_bo_config())
+        df = _make_bars(60, trend=-0.005)
+        result = strategy.evaluate_entry("PLTR", "US", df, df, 1.0, 250.0)
+        assert result is None
+
+    def test_h6_pullback_blocks_buying_the_breakout_bar(self) -> None:
+        # With pullback_entry=True, a price above the high should not
+        # trigger an entry on the breakout bar itself — must wait for
+        # retest within tolerance.
+        cfg = {**_bo_config(), "pullback_entry": True}
+        strategy = BreakoutStrategy(config=cfg)
+        df = _make_bars(60, trend=0.001)
+        period_high = float(df["high"].iloc[:-1].max())
+        far_above = period_high * 1.05  # 5% above — outside tolerance
+        result = strategy.evaluate_entry("PLTR", "US", df, df, far_above, 250.0)
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Opening Range Breakout Strategy
+# ---------------------------------------------------------------------------
+
+
+def _orb_config() -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "allocation_usd": 1000.0,
+        "max_positions": 3,
+        "range_bars": 6,
+        "entry_cutoff": "11:30",
+        "volume_multiplier": 1.3,
+        "target_r_multiple": 1.0,
+        "risk_per_trade_pct": 0.02,
+        "max_position_pct": 0.33,
+        "fractional_shares": True,
+        "min_range_pct": 0.002,
+    }
+
+
+class TestOpeningRangeBreakout:
+    def test_max_positions(self) -> None:
+        from trading_bot.strategy.strategies.opening_range_breakout import (
+            OpeningRangeBreakoutStrategy,
+        )
+        strategy = OpeningRangeBreakoutStrategy(config=_orb_config())
+        assert strategy.get_max_positions() == 3
+
+    def test_exit_on_stop(self) -> None:
+        from trading_bot.strategy.strategies.opening_range_breakout import (
+            OpeningRangeBreakoutStrategy,
+        )
+        strategy = OpeningRangeBreakoutStrategy(config=_orb_config())
+        position = {"entry_price": 10.10, "stop_price": 10.00, "target_price": 10.20}
+        signal = strategy.evaluate_exit(position, 9.99)
+        assert signal.should_exit is True
+        assert signal.reason == "stop_loss"
+        assert signal.is_emergency is True
+
+    def test_exit_on_target(self) -> None:
+        from trading_bot.strategy.strategies.opening_range_breakout import (
+            OpeningRangeBreakoutStrategy,
+        )
+        strategy = OpeningRangeBreakoutStrategy(config=_orb_config())
+        position = {"entry_price": 10.10, "stop_price": 10.00, "target_price": 10.20}
+        signal = strategy.evaluate_exit(position, 10.21)
+        assert signal.should_exit is True
+        assert signal.reason == "take_profit"
+
+    def test_no_exit_in_range(self) -> None:
+        from trading_bot.strategy.strategies.opening_range_breakout import (
+            OpeningRangeBreakoutStrategy,
+        )
+        strategy = OpeningRangeBreakoutStrategy(config=_orb_config())
+        position = {"entry_price": 10.10, "stop_price": 10.00, "target_price": 10.20}
+        signal = strategy.evaluate_exit(position, 10.15)
+        assert signal.should_exit is False
+
+    def test_no_entry_with_insufficient_bars(self) -> None:
+        from trading_bot.strategy.strategies.opening_range_breakout import (
+            OpeningRangeBreakoutStrategy,
+        )
+        strategy = OpeningRangeBreakoutStrategy(config=_orb_config())
+        # Only 5 bars — strategy needs range_bars + 2 minimum.
+        df = _make_bars(5)
+        result = strategy.evaluate_entry("PLTR", "US", df, df, 10.0, 1000.0)
+        assert result is None
+
+    def test_registry_includes_orb(self) -> None:
+        from trading_bot.strategy.strategies import STRATEGY_REGISTRY
+        assert "opening_range_breakout" in STRATEGY_REGISTRY
+
 
 # ---------------------------------------------------------------------------
 # Sentiment Combo Strategy

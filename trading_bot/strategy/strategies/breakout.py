@@ -37,6 +37,17 @@ class BreakoutStrategy(StrategyBase):
         self._use_atr_stops: bool = bool(config.get("use_atr_stops", False))
         self._atr_period: int = int(config.get("atr_period", 14))
         self._atr_stop_mult: float = float(config.get("atr_stop_mult", 1.5))
+        # H4 — per-ticker trend filter (price must be above its own SMA)
+        self._require_trend_filter: bool = bool(config.get("require_trend_filter", False))
+        self._trend_sma_period: int = int(config.get("trend_sma_period", 50))
+        # H5 — ATR expansion filter (only enter when current ATR > avg ATR × mult)
+        self._require_atr_expansion: bool = bool(config.get("require_atr_expansion", False))
+        self._atr_expansion_lookback: int = int(config.get("atr_expansion_lookback", 20))
+        self._atr_expansion_mult: float = float(config.get("atr_expansion_mult", 1.2))
+        # H6 — pullback entry: don't buy the breakout bar; wait for retest of level
+        self._pullback_entry: bool = bool(config.get("pullback_entry", False))
+        self._pullback_window_bars: int = int(config.get("pullback_window_bars", 12))
+        self._pullback_tolerance_pct: float = float(config.get("pullback_tolerance_pct", 0.005))
 
     def evaluate_entry(
         self,
@@ -56,19 +67,74 @@ class BreakoutStrategy(StrategyBase):
             df_daily.iloc[:-1] if len(df_daily) > self._breakout_period else df_daily,
             self._breakout_period,
         )
-        if current_price <= period_high:
-            return None
 
-        # Volume confirmation on 5-min bars
+        # Volume confirmation on 5-min bars (computed up-front; used by both
+        # immediate-entry and pullback-entry paths).
         if len(df_5min) < 21:
             return None
-        # ``rename`` returns a new lightweight wrapper (no row copy) — the
-        # caller's DataFrame is untouched, but we avoid a per-tick deep copy.
         df_e: pd.DataFrame = df_5min.rename(columns=str.lower)
         vol_avg: float = float(df_e["volume"].rolling(20).mean().iloc[-1])
         current_vol: float = float(df_e["volume"].iloc[-1])
         if vol_avg <= 0 or current_vol < self._volume_multiplier * vol_avg:
             return None
+
+        # H6 — Pullback entry: wait for a retest of the breakout level
+        # rather than buying the breakout bar itself. Diagnostic on
+        # 2020-2026 13-ETF showed buying the breakout bar = top-ticking.
+        if self._pullback_entry:
+            window: int = max(self._pullback_window_bars, 2)
+            if len(df_e) < window + 1:
+                return None
+            recent: pd.DataFrame = df_e.iloc[-window:]
+            # 1) Did the high get broken in the last `window` bars?
+            if float(recent["high"].max()) <= period_high:
+                return None
+            # 2) Has price pulled back to the breakout level?
+            tol: float = self._pullback_tolerance_pct
+            if current_price > period_high * (1.0 + tol):
+                return None  # still extended, no pullback yet
+            if current_price < period_high * (1.0 - tol):
+                return None  # broke down through the level — failed breakout
+            # 3) Current bar must show strength (close >= open)
+            last_bar = df_e.iloc[-1]
+            if float(last_bar["close"]) < float(last_bar["open"]):
+                return None
+        else:
+            # Original logic: enter on the breakout bar itself.
+            if current_price <= period_high:
+                return None
+
+        # H4 — Per-ticker trend filter: price must be above its own
+        # SMA at the most recent fully-closed daily bar.
+        if self._require_trend_filter:
+            n: int = self._trend_sma_period
+            if len(df_daily) < n + 1:
+                return None
+            sma: float = float(df_daily["close"].iloc[-(n + 1):-1].mean())
+            if current_price <= sma:
+                return None
+
+        # H5 — ATR expansion filter: current ATR must be >= mult × the
+        # mean ATR over the lookback window. Filters stale-range pops.
+        if self._require_atr_expansion:
+            current_atr: float | None = self._compute_atr(df_daily, self._atr_period)
+            if current_atr is None:
+                return None
+            lookback: int = self._atr_expansion_lookback
+            if len(df_daily) < self._atr_period + lookback + 1:
+                return None
+            atrs: list[float] = []
+            for i in range(lookback):
+                end: int = len(df_daily) - 1 - i
+                window_df: pd.DataFrame = df_daily.iloc[max(0, end - self._atr_period):end]
+                a: float | None = self._compute_atr(window_df, self._atr_period)
+                if a is not None:
+                    atrs.append(a)
+            if len(atrs) < lookback // 2:
+                return None
+            avg_atr: float = float(sum(atrs) / len(atrs))
+            if current_atr < self._atr_expansion_mult * avg_atr:
+                return None
 
         if self._use_atr_stops:
             atr: float | None = self._compute_atr(df_daily, self._atr_period)
