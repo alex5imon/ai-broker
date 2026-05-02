@@ -597,6 +597,89 @@ class TestPlaceEntryFailure:
         assert "insufficient buying power" in reason
         assert reason.startswith("alpaca_submit_error")
 
+    @pytest.mark.asyncio
+    async def test_entry_failure_marks_trades_row_entry_failed(
+        self, config, tmp_db_path: str, mock_notifier
+    ):
+        """2026-05-01 incident: every fractional+bracket entry was rejected by
+        Alpaca, but the trades row inserted by _create_position_record was left
+        with no exit_time/exit_reason, polluting daily_summaries (60 phantom
+        'closed' rows in 2026-04-30 with NULL net_pnl). The exception handler
+        must close the trades row at exit_reason='entry_failed', net_pnl=0."""
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        om._gw.client.submit_order = MagicMock(side_effect=RuntimeError("boom"))
+
+        await om.place_entry(_entry(ticker="XLF", shares=10, price=51.0))
+
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            row = conn.execute(
+                "SELECT exit_time, exit_price, exit_reason, gross_pnl, net_pnl, pnl_usd "
+                "FROM trades ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        assert row is not None, "trades row missing"
+        exit_time, exit_price, exit_reason, gross_pnl, net_pnl, pnl_usd = row
+        assert exit_time is not None, "trades.exit_time still NULL — phantom row"
+        assert abs(float(exit_price) - 51.0) < 1e-6
+        assert exit_reason == "entry_failed"
+        assert float(gross_pnl) == 0.0
+        assert float(net_pnl) == 0.0
+        assert float(pnl_usd) == 0.0
+
+
+class TestFractionalShareFloor:
+    """2026-05-01 incident: Alpaca rejects fractional+bracket combos (code
+    42210000). Floor to whole shares so the bracket path is legal. Until the
+    standalone-stop refactor lands, this is the gate that keeps live trading
+    from no-op'ing every signal."""
+
+    @pytest.mark.asyncio
+    async def test_fractional_shares_floored_before_submit(
+        self, config, tmp_db_path: str, mock_notifier
+    ):
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        captured: list = []
+
+        def _capture(order_data):
+            captured.append(order_data)
+            return _alpaca_order("entry-1", "new")
+
+        om._gw.client.submit_order = MagicMock(side_effect=_capture)
+
+        decision = _entry(ticker="XLF", shares=10, price=51.0)
+        decision.shares = 2.7  # type: ignore[assignment]
+        trade_id = await om.place_entry(decision)
+
+        assert trade_id is not None
+        assert len(captured) == 1
+        assert int(captured[0].qty) == 2, f"expected qty=2, got {captured[0].qty}"
+
+    @pytest.mark.asyncio
+    async def test_zero_share_floor_skips_without_db_insert(
+        self, config, tmp_db_path: str, mock_notifier
+    ):
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        om._gw.client.submit_order = MagicMock()
+
+        decision = _entry(ticker="SPY", shares=10, price=700.0)
+        decision.shares = 0.43  # type: ignore[assignment]
+        trade_id = await om.place_entry(decision)
+
+        assert trade_id is None
+        om._gw.client.submit_order.assert_not_called()
+        # No DB pollution — neither a position nor a trades row.
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            n_pos = conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0]
+            n_trades = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+        finally:
+            conn.close()
+        assert n_pos == 0
+        assert n_trades == 0
+
 
 # ---------------------------------------------------------------------------
 # get_active_orders helpers
