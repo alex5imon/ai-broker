@@ -350,6 +350,22 @@ class OrderManager:
 
     async def place_entry(self, decision: EntryDecision) -> int | None:
         """Place an entry limit order.  Returns the internal trade_id on success."""
+        # Alpaca rejects fractional+bracket combos with code 42210000
+        # ("fractional orders must be simple orders"), and we always submit
+        # bracketed entries so stop+target attach atomically. Floor to whole
+        # shares so the bracket path is legal. The proper fix — plain entry +
+        # standalone stop on fill — is required before live deployment because
+        # this floor drops ~50% of signals on a $1k account; tracked separately.
+        whole_shares: int = int(decision.shares)
+        if whole_shares <= 0:
+            logger.info(
+                "[%s] Entry skipped: whole-share floor produces 0 shares (raw=%.4f, price=%.2f)",
+                decision.ticker, decision.shares, decision.limit_price,
+            )
+            return None
+        if whole_shares != decision.shares:
+            decision.shares = whole_shares
+
         trade_id: int | None = self._create_position_record(decision)
         if trade_id is None:
             logger.error("Failed to create position record for %s", decision.ticker)
@@ -416,9 +432,13 @@ class OrderManager:
             # submit so no order ever existed. CLOSED implies a real
             # round-trip and pollutes every postmortem report.
             self._update_position_status(trade_id, PositionStatus.ENTRY_FAILED)
-            # Drop the unused mapping so it can't leak into a stale
-            # _ActiveOrder if the same positions.id is later rehydrated.
-            self._pending_db_trade_ids.pop(trade_id, None)
+            # Mark the trades row as entry_failed so daily_summaries and the
+            # self-improvement postmortem don't see a permanently-open ghost.
+            # UPDATE rather than DELETE so the audit trail (rejection reason
+            # via _log_rejection below) remains pinned to a real trades.id.
+            db_trade_id: int | None = self._pending_db_trade_ids.pop(trade_id, None)
+            if db_trade_id is not None:
+                self._mark_trade_entry_failed(db_trade_id, decision.limit_price)
             self._log_rejection(
                 ticker=decision.ticker,
                 exchange=decision.exchange,
@@ -1071,6 +1091,48 @@ class OrderManager:
 
     def _update_position_status(self, trade_id: int, status: PositionStatus) -> None:
         self._update_position_field(trade_id, "status", status.value)
+
+    def _mark_trade_entry_failed(self, db_trade_id: int, entry_price: float) -> None:
+        """Mark a trades row as entry_failed when Alpaca rejected the submit.
+
+        Closes the row at the original entry price with zero P&L so it is
+        excluded from win/loss aggregations but remains visible to the
+        reconciler under exit_reason='entry_failed'.
+        """
+        now_str: str = datetime.now(tz=ET).isoformat()
+        try:
+            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
+            try:
+                cursor = conn.execute(
+                    """
+                    UPDATE trades
+                       SET exit_time   = ?,
+                           exit_price  = ?,
+                           exit_reason = 'entry_failed',
+                           gross_pnl   = 0,
+                           net_pnl     = 0,
+                           pnl_usd     = 0
+                     WHERE id = ?
+                    """,
+                    (now_str, entry_price, db_trade_id),
+                )
+                conn.commit()
+                rows_affected: int = cursor.rowcount
+            finally:
+                conn.close()
+        except Exception:
+            logger.exception(
+                "Failed to mark trade entry_failed for db_trade_id=%d",
+                db_trade_id,
+            )
+            return
+
+        if rows_affected != 1:
+            logger.warning(
+                "trades UPDATE entry_failed db_trade_id=%d rows_affected=%d "
+                "(expected 1) — silent write-back failure",
+                db_trade_id, rows_affected,
+            )
 
     # Pre-built UPDATE statements per allowed column. The column name is
     # part of the static SQL; misuse of this helper (e.g. attacker- or

@@ -5,6 +5,12 @@ These are real problems uncovered while building the daily-review agent
 out of that PR because they touch live order logic and your CLAUDE.md
 says "exercise extreme care with all order logic."
 
+## Active tracking
+
+- **#39 — Replace bracket entry with plain-limit + standalone-stop** (must land before `$1k` live).
+  Whole-share floor in PR #38 is a Monday-morning unblocker; backtests show it
+  drops ~50% of mean_reversion signals at $1k account size.
+
 ## How they were found
 
 - **Date:** 2026-04-30
