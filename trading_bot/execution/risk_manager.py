@@ -19,6 +19,7 @@ from trading_bot.constants import (
     GICS_SECTOR,
     TZ_EASTERN,
 )
+from trading_bot.utils.time import trading_today
 
 if TYPE_CHECKING:
     from trading_bot.config import Config
@@ -352,7 +353,7 @@ class RiskManager:
             conn: sqlite3.Connection = sqlite3.connect(self._db_path)
             try:
                 cutoff: str = (
-                    datetime.now(tz=ET).date() - timedelta(days=rolling_days)
+                    trading_today() - timedelta(days=rolling_days)
                 ).isoformat()
                 rows = conn.execute(
                     "SELECT account_equity_usd FROM daily_summaries "

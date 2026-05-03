@@ -13,6 +13,8 @@ from trading_bot.config import Config
 from trading_bot.constants import ExitReason, HoldType
 from trading_bot.strategy.exit import ExitDecision, ExitManager
 
+pytestmark = pytest.mark.critical
+
 ET = ZoneInfo("US/Eastern")
 
 

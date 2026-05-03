@@ -19,7 +19,6 @@ from __future__ import annotations
 import logging
 from datetime import date, datetime, time
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 

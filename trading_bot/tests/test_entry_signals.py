@@ -15,6 +15,8 @@ import pytest
 from trading_bot.config import Config
 from trading_bot.strategy.technical import TechnicalAnalyzer
 
+pytestmark = pytest.mark.critical
+
 ET = ZoneInfo("US/Eastern")
 
 

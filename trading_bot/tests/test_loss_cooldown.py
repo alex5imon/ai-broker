@@ -7,12 +7,16 @@ from datetime import datetime, timedelta
 from typing import Callable
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from trading_bot.constants import TZ_EASTERN
 from trading_bot.db import repository as repo
 from trading_bot.execution.loss_cooldown import (
     LossCooldownConfig,
     LossCooldownTracker,
 )
+
+pytestmark = pytest.mark.critical
 
 ET: ZoneInfo = TZ_EASTERN
 

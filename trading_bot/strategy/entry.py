@@ -51,7 +51,7 @@ class EntryDecision:
     should_enter: bool
     direction: str | None  # 'long' or 'short'
     signal_price: float | None
-    position_size: int | None  # Number of shares
+    position_size: float | None  # Number of shares (float to support fractional)
     position_value_usd: float | None
     stop_price: float | None
     target_price: float | None
@@ -305,7 +305,7 @@ class EntryEvaluator:
             )
 
         logger.info(
-            "%s: Entry APPROVED -- %s %d shares @ %.4f, "
+            "%s: Entry APPROVED -- %s %.6f shares @ %.4f, "
             "stop=%.4f, target=%.4f, hold=%s",
             ticker,
             direction,
@@ -385,7 +385,7 @@ class EntryEvaluator:
         atr_rank: float,
         sentiment_size_mult: float,
         phase: Phase,
-    ) -> tuple[int, float]:
+    ) -> tuple[float, float]:
         """Compute number of shares and position value in local currency.
 
         Implements the sizing formula from SPEC Section 6:
@@ -526,7 +526,6 @@ class EntryEvaluator:
         sectors as a proxy.  Full return-correlation requires historical
         data and will be implemented for Phase 2+.
         """
-        threshold: float = self._config.correlation_threshold
         sector: str = GICS_SECTOR.get(ticker, "Unknown")
 
         try:
