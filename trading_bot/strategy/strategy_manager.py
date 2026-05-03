@@ -14,7 +14,10 @@ import pandas as pd
 
 from trading_bot.constants import GICS_SECTOR, TZ_EASTERN
 from trading_bot.data.event_calendar import fomc_size_multiplier
+from trading_bot.data.fomc_calendar import get_fomc_dates
+from trading_bot.data.holiday_calendar import HolidayCalendar
 from trading_bot.db import repository as repo
+from trading_bot.strategy import calendar_overlay
 from trading_bot.execution.loss_cooldown import LossCooldownTracker
 from trading_bot.execution.order_manager import EntryDecision as OMEntryDecision
 from trading_bot.execution.virtual_portfolio import PortfolioManager, VirtualPortfolio
@@ -218,6 +221,13 @@ class StrategyManager:
                     decision = self._scale_decision_shares(decision, event_mult)
                     if decision is None:
                         continue
+
+                # Calendar-effect overlay (turn-of-month, FOMC drift, OPEX,
+                # pre-long-weekend block). No-op when calendar_overlay.enabled
+                # is false (default).
+                decision = self._apply_calendar_overlay(decision)
+                if decision is None:
+                    continue
 
                 # Per-symbol allocation cap across the global multi-strategy book.
                 decision = self._enforce_symbol_cap(decision)
@@ -577,6 +587,41 @@ class StrategyManager:
         except Exception:
             logger.warning("FOMC size multiplier lookup failed", exc_info=True)
             return 1.0
+
+    def _apply_calendar_overlay(
+        self, decision: StrategyDecision,
+    ) -> StrategyDecision | None:
+        """Run *decision* through the calendar-effect overlay.
+
+        Returns a new decision (possibly with scaled shares), or
+        ``None`` if the overlay blocks the entry. No-op when
+        ``calendar_overlay.enabled`` is false.
+        """
+        raw: dict[str, Any] = {}
+        section_fn = getattr(self._config, "raw_section", None)
+        if callable(section_fn):
+            try:
+                raw = section_fn()
+            except Exception:
+                raw = {}
+        if not raw:
+            legacy = getattr(self._config, "_raw", None)
+            if isinstance(legacy, dict):
+                raw = legacy
+        try:
+            return calendar_overlay.apply_overlay(
+                decision,
+                datetime.now(tz=ET),
+                raw,
+                holiday_calendar=HolidayCalendar(raw),
+                fomc_dates=get_fomc_dates(),
+            )
+        except Exception:
+            logger.warning(
+                "Calendar overlay failed for %s/%s — passing through",
+                decision.strategy_id, decision.ticker, exc_info=True,
+            )
+            return decision
 
     @staticmethod
     def _scale_decision_shares(

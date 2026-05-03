@@ -37,9 +37,12 @@ from trading_bot.constants import (
     TICKER_EXCHANGE,
     TZ_EASTERN,
 )
+from trading_bot.data.fomc_calendar import get_fomc_dates
+from trading_bot.data.holiday_calendar import HolidayCalendar
 from trading_bot.data_cache import load_cached
 from trading_bot.execution.vol_target import vol_target_multiplier
-from trading_bot.strategy.base import ExitSignal, StrategyBase
+from trading_bot.strategy import calendar_overlay
+from trading_bot.strategy.base import ExitSignal, StrategyBase, StrategyDecision
 from trading_bot.strategy.strategies import create_strategies
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -155,8 +158,15 @@ class MultiStrategyBacktester:
         "NIO": 3.0,     # Less liquid, wider spread
     }
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, calendar_overlay_enabled: bool = True) -> None:
         self._config = config
+        # When False, the overlay is bypassed entirely (clean A/B baseline).
+        # The default keeps live and backtest in sync — the overlay reads
+        # config.calendar_overlay.enabled, which ships False, so this flag
+        # only matters when the operator has flipped overlays on.
+        self._calendar_overlay_enabled: bool = calendar_overlay_enabled
+        self._holiday_calendar: HolidayCalendar = HolidayCalendar(config._raw)
+        self._fomc_dates: list[date] = get_fomc_dates()
         self._strategies: list[StrategyBase] = create_strategies(
             config.get_strategy_configs()
         )
@@ -254,6 +264,51 @@ class MultiStrategyBacktester:
         bps = self._get_slippage_bps(ticker)
         slippage = price * (bps / 10_000.0)
         return price + slippage if side == "buy" else price - slippage
+
+    def _calendar_overlay_blocks(
+        self,
+        decision: StrategyDecision,
+        bar_dt: datetime,
+    ) -> bool:
+        """Return True when the overlay vetoes *decision* outright."""
+        if not self._calendar_overlay_enabled:
+            return False
+        try:
+            return calendar_overlay.should_block_entry(
+                decision,
+                bar_dt,
+                self._config._raw,
+                holiday_calendar=self._holiday_calendar,
+            )
+        except Exception:
+            logger.warning(
+                "Calendar overlay block-check failed for %s/%s — passing through",
+                decision.strategy_id, decision.ticker, exc_info=True,
+            )
+            return False
+
+    def _calendar_overlay_multiplier(
+        self,
+        decision: StrategyDecision,
+        bar_dt: datetime,
+    ) -> float:
+        """Return the composed sizing multiplier (1.0 when overlay disabled)."""
+        if not self._calendar_overlay_enabled:
+            return 1.0
+        try:
+            return calendar_overlay.compute_size_multiplier(
+                decision,
+                bar_dt,
+                self._config._raw,
+                holiday_calendar=self._holiday_calendar,
+                fomc_dates=self._fomc_dates,
+            )
+        except Exception:
+            logger.warning(
+                "Calendar overlay multiplier lookup failed for %s/%s — using 1.0",
+                decision.strategy_id, decision.ticker, exc_info=True,
+            )
+            return 1.0
 
     @staticmethod
     def _compute_sentiment_proxy(df_daily: pd.DataFrame) -> float | None:
@@ -537,6 +592,20 @@ class MultiStrategyBacktester:
                             sentiment_score=sentiment,
                         )
                         if decision is not None and decision.shares > 0:
+                            if self._calendar_overlay_blocks(decision, current_time):
+                                continue
+                            ovl_mult = self._calendar_overlay_multiplier(
+                                decision, current_time,
+                            )
+                            if ovl_mult <= 0.0:
+                                continue
+                            if ovl_mult != 1.0:
+                                scaled = max(int(decision.shares * ovl_mult), 0)
+                                if scaled < 1:
+                                    continue
+                                decision = decision.__class__(
+                                    **{**decision.__dict__, "shares": scaled}
+                                )
                             fill_price = self._simulate_fill(
                                 bar_close, "buy", ticker,
                             )
@@ -1017,6 +1086,13 @@ class MultiStrategyBacktester:
                         sentiment_score=sentiment,
                     )
                     if decision is not None and decision.shares > 0:
+                        if self._calendar_overlay_blocks(decision, current_time):
+                            continue
+                        ovl_mult = self._calendar_overlay_multiplier(
+                            decision, current_time,
+                        )
+                        if ovl_mult <= 0.0:
+                            continue
                         fill_price = self._simulate_fill(
                             bar_close, "buy", ticker,
                         )
@@ -1038,6 +1114,8 @@ class MultiStrategyBacktester:
                             fractional=False,
                             vol_multiplier=vt.multiplier,
                         )
+                        if ovl_mult != 1.0:
+                            shares = float(int(shares * ovl_mult))
                         if shares < 1:
                             continue
 
@@ -1348,6 +1426,11 @@ class MultiStrategyBacktester:
                     sentiment_score=sentiment,
                 )
                 if decision is not None and decision.shares > 0:
+                    if self._calendar_overlay_blocks(decision, bar_dt):
+                        continue
+                    ovl_mult = self._calendar_overlay_multiplier(decision, bar_dt)
+                    if ovl_mult <= 0.0:
+                        continue
                     fill_price = self._simulate_fill(bar_close, "buy", ticker)
 
                     # Use 5-min ATR for intraday stop/target sizing
@@ -1378,6 +1461,8 @@ class MultiStrategyBacktester:
                         fractional=True,
                         vol_multiplier=vt.multiplier,
                     )
+                    if ovl_mult != 1.0:
+                        shares = round(shares * ovl_mult, 4)
                     if shares <= 0.001:
                         continue
 
@@ -1665,6 +1750,12 @@ class MultiStrategyBacktester:
                     if decision is None or decision.shares <= 0:
                         continue
 
+                    if self._calendar_overlay_blocks(decision, bar_dt):
+                        continue
+                    ovl_mult = self._calendar_overlay_multiplier(decision, bar_dt)
+                    if ovl_mult <= 0.0:
+                        continue
+
                     fill_price = self._simulate_fill(bar_close, "buy", ticker)
                     atr_stop, atr_target, atr_trail, atr_activation = self._atr_adjusted_stops(
                         fill_price, df_slice, strat.strategy_id,
@@ -1691,6 +1782,8 @@ class MultiStrategyBacktester:
                         fractional=True,
                         vol_multiplier=vt.multiplier,
                     )
+                    if ovl_mult != 1.0:
+                        shares = round(shares * ovl_mult, 4)
                     if shares <= 0.001:
                         continue
                     cost = fill_price * shares
@@ -2024,6 +2117,12 @@ async def main() -> None:
         help="Disable market regime filter (daily mode)",
     )
     parser.add_argument(
+        "--no-calendar-overlay", action="store_true",
+        help="Bypass calendar-effect overlay (clean A/B baseline). Live + "
+             "backtest read calendar_overlay.enabled from config; this flag "
+             "forces it off in backtest regardless.",
+    )
+    parser.add_argument(
         "--spy", action="store_true",
         help="Use SPY 1-min intraday CSV data (resampled to 5-min)",
     )
@@ -2094,7 +2193,10 @@ async def main() -> None:
     async def _run_window(d1: date, d2: date) -> MultiStrategyResult:
         # Each window needs a fresh engine so per-strategy state
         # (cash, peak equity, cooldowns) doesn't leak across windows.
-        window_engine = MultiStrategyBacktester(config)
+        window_engine = MultiStrategyBacktester(
+            config,
+            calendar_overlay_enabled=not args.no_calendar_overlay,
+        )
         if args.strategies:
             selected = set(s.strip() for s in args.strategies.split(","))
             window_engine._strategies = [

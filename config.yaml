@@ -180,6 +180,39 @@ event_gate:
     - "2026-12-16"
 
 # -----------------------------------------------------------------------------
+# Calendar-Effect Overlay (research, ai-broker#47)
+# -----------------------------------------------------------------------------
+# Sizing multipliers and entry blocks based on persistent calendar
+# anomalies (turn-of-month, FOMC drift, OPEX, pre-long-weekend). All
+# overlays ship DISABLED — flip on individually after passing the per-
+# overlay A/B acceptance bar in the issue. Multipliers compose
+# multiplicatively and clamp to [0.0, 2.0].
+calendar_overlay:
+  enabled: false                      # master switch
+  turn_of_month:
+    enabled: false
+    days_before_month_end: 4
+    days_after_month_start: 3
+    long_multiplier: 1.2
+    short_multiplier: 0.8
+    applies_to: ["mean_reversion", "overnight_drift"]
+  fomc_drift:
+    enabled: false
+    hours_before_announcement: 24
+    long_multiplier: 1.3
+    applies_to: ["overnight_drift"]
+  pre_long_weekend:
+    enabled: false
+    min_weekend_days: 3
+    block_strategies: ["overnight_drift"]
+  opex:
+    enabled: false
+    weekday: 4                        # Friday
+    week_of_month: 3                  # 3rd Friday
+    multiplier: 0.7
+    applies_to: ["mean_reversion", "overnight_drift"]
+
+# -----------------------------------------------------------------------------
 # Watchlist Quality Criteria
 # -----------------------------------------------------------------------------
 watchlist_criteria:
