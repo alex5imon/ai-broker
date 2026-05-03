@@ -7,9 +7,11 @@ says "exercise extreme care with all order logic."
 
 ## Active tracking
 
-- **#39 — Replace bracket entry with plain-limit + standalone-stop** (must land before `$1k` live).
-  Whole-share floor in PR #38 is a Monday-morning unblocker; backtests show it
-  drops ~50% of mean_reversion signals at $1k account size.
+- ~~**#39 — Replace bracket entry with plain-limit + standalone-stop**~~ (resolved).
+  Entry path now submits a plain `LimitOrderRequest` and attaches a standalone
+  `StopOrderRequest` on fill; take-profit is managed by the tick-loop's
+  `check_exits` polling against `target_price`. The PR #38 whole-share floor
+  has been removed — fractional shares pass through end-to-end.
 - **#40 — `PerformanceCalculator` not surfacing closed trades.** Two pre-existing
   test failures reproduce the same pattern as the live `daily_summaries` showing
   0/0/0 wins/losses despite closed entries. Probably the load-bearing reason
@@ -17,6 +19,15 @@ says "exercise extreme care with all order logic."
 - **#41 — Verify PR #20 drain logic.** The verify-before-SELL guard merged after
   the churn it was meant to prevent; needs unit + integration coverage before
   the next sleeve-disable event proves it the hard way.
+- **Rename `STOP_AND_TARGET_ACTIVE` → `STOP_ACTIVE`.** Under the
+  ai-broker#39 entry path only the stop is broker-side (take-profit is
+  polled in `main.check_exits` against `target_price`), so the status
+  name is semantically inaccurate. Deferred from #39 because the rename
+  touches 45 references across 10 files plus a DB migration on the
+  GHA-cached SQLite — too much churn pre-launch for a naming fix.
+  Action: add `PositionStatus.STOP_ACTIVE`, migration v11 (`UPDATE
+  positions SET status='STOP_ACTIVE' WHERE status='STOP_AND_TARGET_ACTIVE'`),
+  bump SCHEMA_VERSION, sweep tests + scripts. No behavior change.
 
 The legacy "Task #2 / #3 / Bug B6" sections below are kept for the audit trail
 but their resolved status is summarized at the top of each.
@@ -386,6 +397,7 @@ For one-shot flatten / liquidation tools:
 - Never assume a `200` from `DELETE /v2/orders` means qty has released.
 
 For the live bot's continuous order management, the existing pattern
-(bracket orders + tick-time fill detection) sidesteps this entirely
-because every cancel + flatten happens during RTH by definition.
+(plain-limit entry + standalone stop attached on fill, with tick-time
+fill detection — see ai-broker#39) sidesteps this entirely because
+every cancel + flatten happens during RTH by definition.
 ```

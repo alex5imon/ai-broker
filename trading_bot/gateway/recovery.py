@@ -187,8 +187,11 @@ class StateRecovery:
         alpaca_by_ticker: dict[str, AlpacaPosition] = {}
         for pos in alpaca_positions:
             ticker: str = str(pos.symbol)
-            qty: int = int(float(pos.qty or 0))
-            if qty != 0:
+            # Float qty: a fractional Alpaca position would truncate to 0
+            # under int() and get filtered out, hiding a real holding from
+            # the reconciler.
+            qty: float = float(pos.qty or 0)
+            if abs(qty) > 1e-6:
                 alpaca_by_ticker[ticker] = pos
 
         for ticker, pos in alpaca_by_ticker.items():
@@ -201,11 +204,16 @@ class StateRecovery:
                 result.positions_created.append(ticker)
             else:
                 db_row: dict[str, Any] = db_by_ticker[ticker]
-                alpaca_qty: int = int(float(pos.qty or 0))
-                db_qty: int = int(db_row.get("quantity", 0))
-                if alpaca_qty != db_qty:
+                # Compare as floats — Alpaca holds fractional quantities (1/1e6
+                # increments). int() truncation here would silently mask a
+                # 0.43-vs-0 sync gap by collapsing both sides to 0. Use a
+                # tolerance to absorb float-repr noise without flagging a
+                # legitimate match as a drift.
+                alpaca_qty: float = float(pos.qty or 0)
+                db_qty: float = float(db_row.get("quantity", 0))
+                if abs(alpaca_qty - db_qty) > 1e-6:
                     logger.warning(
-                        "Quantity mismatch for %s: Alpaca=%d, DB=%d. Updating DB.",
+                        "Quantity mismatch for %s: Alpaca=%.6f, DB=%.6f. Updating DB.",
                         ticker, alpaca_qty, db_qty,
                     )
                     self._update_db_quantity(db_row["id"], alpaca_qty)
@@ -237,8 +245,11 @@ class StateRecovery:
 
         for pos in alpaca_positions:
             ticker: str = str(pos.symbol)
-            qty: int = int(float(pos.qty or 0))
-            if qty == 0:
+            # Float qty: a fractional Alpaca position truncates to 0 here
+            # and the loop would skip ahead, leaving the position
+            # unprotected (no emergency stop placed).
+            qty: float = float(pos.qty or 0)
+            if abs(qty) <= 1e-6:
                 continue
             if ticker not in tickers_with_stops:
                 logger.warning("No stop order found for %s - placing stop", ticker)
@@ -253,7 +264,10 @@ class StateRecovery:
         from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
 
         avg_cost: float = float(pos.avg_entry_price or 0)
-        qty: int = int(float(pos.qty or 0))
+        # Float qty: Alpaca holds fractional positions (1/1e6 increments).
+        # Truncating to int would refuse to place an emergency stop on any
+        # sub-1-share holding.
+        qty: float = float(pos.qty or 0)
         ticker: str = str(pos.symbol)
 
         if avg_cost <= 0:
@@ -269,7 +283,7 @@ class StateRecovery:
         try:
             # Alpaca requires a positive qty; side (SELL for long, BUY for
             # short) determines whether the order closes or opens exposure.
-            order_qty: int = abs(qty)
+            order_qty: float = abs(qty)
             request = StopOrderRequest(
                 symbol=ticker,
                 qty=order_qty,
@@ -281,7 +295,7 @@ class StateRecovery:
             # Alpaca SDK is sync — offload to a worker thread so we don't
             # block the event loop on the HTTP submit.
             await asyncio.to_thread(self._gw.client.submit_order, order_data=request)
-            logger.info("Emergency stop placed for %s: %s %d @ stop %.2f", ticker, side.value, order_qty, stop_price)
+            logger.info("Emergency stop placed for %s: %s %.6f @ stop %.2f", ticker, side.value, order_qty, stop_price)
         except Exception:
             logger.exception("Failed to place emergency stop for %s", ticker)
 
@@ -400,8 +414,12 @@ class StateRecovery:
                     ticker,
                 )
                 continue
-            qty: int = int(float(pos.qty or 0))
-            if qty == 0:
+            # Float qty: a fractional Alpaca position truncated to int
+            # would be zeroed and skipped here — the EOD flatten path
+            # would silently leave it open overnight, exposing the bot
+            # to gap risk it was specifically designed to avoid.
+            qty: float = float(pos.qty or 0)
+            if abs(qty) <= 1e-6:
                 continue
 
             side: OrderSide = OrderSide.SELL if qty > 0 else OrderSide.BUY
@@ -414,7 +432,7 @@ class StateRecovery:
                 )
                 await asyncio.to_thread(self._gw.client.submit_order, order_data=request)
                 logger.warning(
-                    "EOD flatten: %s %d %s (cutoff=%s)",
+                    "EOD flatten: %s %.6f %s (cutoff=%s)",
                     side.value, abs(qty), ticker, cutoff_str,
                 )
                 result.eod_flatten_orders.append(ticker)
@@ -471,7 +489,10 @@ class StateRecovery:
     def _create_db_position(self, ticker: str, pos: AlpacaPosition) -> None:
         now: str = datetime.now(tz=ET).isoformat()
         avg_cost: float = float(pos.avg_entry_price or 0)
-        qty: int = int(float(pos.qty or 0))
+        # Float qty: Alpaca holds fractional positions; truncating an Alpaca-
+        # discovered position to int would write the DB row as 0 shares,
+        # which the exit path then refuses to close.
+        qty: float = float(pos.qty or 0)
 
         conn: sqlite3.Connection = sqlite3.connect(self._db_path)
         try:
@@ -483,13 +504,13 @@ class StateRecovery:
                 (ticker, str(pos.exchange or "US"), "USD", qty, avg_cost, now),
             )
             conn.commit()
-            logger.info("Created DB position for %s: qty=%d, price=%.4f", ticker, qty, avg_cost)
+            logger.info("Created DB position for %s: qty=%.6f, price=%.4f", ticker, qty, avg_cost)
         except sqlite3.OperationalError:
             logger.warning("Could not create position for %s", ticker)
         finally:
             conn.close()
 
-    def _update_db_quantity(self, position_id: int, new_qty: int) -> None:
+    def _update_db_quantity(self, position_id: int, new_qty: float) -> None:
         now: str = datetime.now(tz=ET).isoformat()
         conn: sqlite3.Connection = sqlite3.connect(self._db_path)
         try:
@@ -535,7 +556,11 @@ class StateRecovery:
                         "SELECT * FROM positions WHERE id = ?", (position_id,)
                     ).fetchone()
                     if row:
-                        qty: int = int(row["quantity"] or 0)
+                        # Float-typed: positions.quantity may be fractional.
+                        # int() truncation of -0.43 → 0 would mis-derive side
+                        # as BUY. Sign-of-the-float is the only invariant we
+                        # need here.
+                        qty: float = float(row["quantity"] or 0)
                         # The bot is long-only at the strategy layer, but
                         # the schema technically allows shorts — derive
                         # rather than assume. Positive qty == long entry.

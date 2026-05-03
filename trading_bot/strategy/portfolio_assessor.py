@@ -169,7 +169,11 @@ class PortfolioAssessor:
         market_value: float = float(position.get("market_value", 0.0))
         unrealized_pnl: float = float(position.get("unrealized_pnl", 0.0))
         avg_cost: float = float(position.get("avg_cost", 0.0))
-        quantity: int = int(position.get("quantity", 0))
+        # Float-typed: positions.quantity is fractional under the
+        # ai-broker#39 entry path. int() truncation of 0.43 → 0 would zero
+        # out cost_basis below and produce a 0% P&L for any sub-1-share
+        # holding.
+        quantity: float = float(position.get("quantity", 0))
 
         # Account is USD-only — Alpaca returns USD, no conversion needed
         value_usd: float = market_value
