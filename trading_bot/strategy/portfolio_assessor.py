@@ -417,8 +417,6 @@ class PortfolioAssessor:
         # A real implementation would use IB reqFundamentalData
         estimated_cap: float = price * avg_volume * 252 * 0.01
 
-        currency: str = "USD"
-
         # Score (relaxed thresholds for existing positions per SPEC)
         if estimated_cap > 10_000_000_000:
             return self._w_market_cap  # 20
@@ -570,7 +568,7 @@ class PortfolioAssessor:
     ) -> str:
         """Build a recommended action string."""
         if classification == "HOLD":
-            return f"Place trailing stop at -5% from current price"
+            return "Place trailing stop at -5% from current price"
 
         if classification == "SELL":
             return (
@@ -612,7 +610,6 @@ class PortfolioAssessor:
         Returns an execution result dict.
         """
         ticker: str = assessment.ticker
-        exchange: str = assessment.exchange
 
         bid_ask: tuple[float, float] | None = self._market_data.get_bid_ask(ticker)
         if bid_ask is None:

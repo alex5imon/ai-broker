@@ -665,19 +665,19 @@ class TradingBot:
                 continue
 
             logger.info(
-                "Entry signal: %s %s %d shares @ %.4f",
+                "Entry signal: %s %s %.6f shares @ %.4f",
                 ticker,
                 decision.direction,
-                decision.position_size or 0,
+                decision.position_size or 0.0,
                 decision.signal_price or 0.0,
             )
 
             if self._dry_run:
                 logger.info(
-                    "[DRY RUN] Would enter: %s %s %d shares @ %.4f, stop=%.4f, target=%.4f",
+                    "[DRY RUN] Would enter: %s %s %.6f shares @ %.4f, stop=%.4f, target=%.4f",
                     ticker,
                     decision.direction,
-                    decision.position_size or 0,
+                    decision.position_size or 0.0,
                     decision.signal_price or 0.0,
                     decision.stop_price or 0.0,
                     decision.target_price or 0.0,

@@ -15,6 +15,8 @@ import pytest
 from trading_bot.constants import Market, TZ_EASTERN
 from trading_bot.main import TradingBot, _parse_time
 
+pytestmark = pytest.mark.critical
+
 ET = TZ_EASTERN
 
 

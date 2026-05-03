@@ -1,0 +1,25 @@
+# Minimal pyproject.toml to register pytest markers and ruff config.
+# This project is not packaged for distribution; setup is via
+# requirements.txt and `python -m trading_bot.main`.
+
+[tool.pytest.ini_options]
+markers = [
+    "critical: tests that exercise the live trading path (order placement, risk gates, tick loop). Run on every push via static-checks.yml; the full suite runs in pre-open-check.yml.",
+    "unit: lightweight unit tests with no external dependencies.",
+    "integration: tests that touch SQLite, fixtures with real config, or backtest data.",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# Keep the default ruleset — we already pass it. Add E (pycodestyle errors),
+# F (pyflakes), W (warnings), I (import sort), B (bugbear) once they're clean.
+select = ["E", "F", "W"]
+# Permit long lines in tabular data and SQL strings.
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"trading_bot/multi_strategy_backtest.py" = ["E501"]
+"trading_bot/tests/*" = ["E501"]

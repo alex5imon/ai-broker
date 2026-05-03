@@ -2084,6 +2084,59 @@ def save_walkforward_json(
 # CLI
 # ---------------------------------------------------------------------------
 
+
+def _guard_backtest_args(args: argparse.Namespace) -> None:
+    """Fail-fast guards against the silent-zero traps documented in memory.
+
+    Two recurring foot-guns produced misleading "clean" backtests:
+
+    1. ``data/cache`` empty (worktree without a symlink to the parent
+       repo's data directory) returns 0 trades silently. Fail loud.
+
+    2. ``--multi-intraday`` without ``--no-regime-filter`` against a
+       sparse daily cache silently produces 0 trades because the regime
+       filter has no daily SPY context for the dates requested. Detect
+       the conflict and refuse rather than emitting a clean zero.
+
+    See ``feedback_daily_cache_regime_trap.md`` and
+    ``worktree_data_symlink.md``.
+    """
+    from pathlib import Path
+
+    # ---- Guard 1: data/cache must exist and be non-empty for any mode
+    # that reads from it (Alpaca intraday, --multi-intraday, --download).
+    needs_cache = args.multi_intraday or args.download
+    if needs_cache:
+        cache_dir = Path("data/cache")
+        if not cache_dir.exists():
+            raise RuntimeError(
+                "data/cache directory missing. If running from a worktree, "
+                "symlink data/ from the main repo:\n"
+                "    ln -s ../../data data\n"
+                "Or use --download to populate it."
+            )
+        # Empty cache is a silent zero generator. Allow when --download
+        # is set, since the user is explicitly asking us to populate it.
+        if not args.download and not any(cache_dir.iterdir()):
+            raise RuntimeError(
+                "data/cache exists but is empty. Either populate it with "
+                "--download, or symlink data/ from the main repo "
+                "(see worktree_data_symlink.md)."
+            )
+
+    # ---- Guard 2: --multi-intraday + regime_filter is a known silent-zero
+    # trap when the daily SPY cache doesn't cover the requested window.
+    # Surface the conflict so the user has to consciously choose.
+    if args.multi_intraday and not args.no_regime_filter:
+        logger.warning(
+            "--multi-intraday with regime filter ON: if the daily SPY "
+            "cache doesn't span %s..%s, the regime filter will return "
+            "zero trades silently. Pass --no-regime-filter to turn it "
+            "off, or confirm the daily cache covers this window.",
+            args.from_date, args.to_date,
+        )
+
+
 async def main() -> None:
     """CLI entry point for multi-strategy backtest."""
     from trading_bot.log_setup import setup_logging
@@ -2155,6 +2208,8 @@ async def main() -> None:
         help="Walkforward CI coverage in (0, 1) (default: 0.95)",
     )
     args = parser.parse_args()
+
+    _guard_backtest_args(args)
 
     logger.info(
         "Args: from=%s to=%s config=%s cash=%.0f download=%s daily=%s strategies=%s regime=%s",

@@ -14,6 +14,8 @@ from trading_bot.config import Config
 from trading_bot.constants import GICS_SECTOR
 from trading_bot.execution.risk_manager import RiskManager
 
+pytestmark = pytest.mark.critical
+
 
 def _noop_ensure_future(coro: object) -> None:
     """Swallow fire-and-forget coroutines without needing an event loop."""

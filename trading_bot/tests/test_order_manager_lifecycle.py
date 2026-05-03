@@ -13,6 +13,8 @@ import pytest
 from trading_bot.constants import PositionStatus, TZ_EASTERN
 from trading_bot.execution.order_manager import EntryDecision, OrderManager, _ActiveOrder
 
+pytestmark = pytest.mark.critical
+
 ET = TZ_EASTERN
 
 

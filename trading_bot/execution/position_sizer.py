@@ -29,9 +29,16 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class PositionSize:
-    """Result of a position-sizing calculation."""
+    """Result of a position-sizing calculation.
 
-    shares: int
+    ``shares`` is a ``float`` to support fractional-share strategies via
+    Alpaca's 1e-6 minimum increment. The legacy whole-share path
+    (``PositionSizer.calculate``) still rounds down via ``math.floor``;
+    consumers that need an integer count must cast explicitly. See
+    [ai-broker#55] for the history of why this was widened from ``int``.
+    """
+
+    shares: float
     entry_price: float
     position_value_usd: float   # In USD
     risk_amount_usd: float      # Expected loss if stop hit
