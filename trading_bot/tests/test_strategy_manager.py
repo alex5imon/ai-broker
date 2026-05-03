@@ -1052,6 +1052,141 @@ class TestDrainDisabledSleeves:
         assert n == 1
         base_order_manager.place_exit.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_drain_does_not_close_db_on_transient_alpaca_error(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        tmp_db_path,
+    ):
+        """Regression for review CRITICAL-2: a transient Alpaca lookup
+        failure (5xx, network, rate-limit) must NOT mark the DB row
+        CLOSED. Pre-fix the broad except matched any exception and
+        permanently dropped a possibly-real position from the monitoring
+        loop. Now we distinguish 'position does not exist' (HTTP 404 /
+        code 40410000) from any other error and treat the latter as
+        UNKNOWN — skip + retry next tick.
+        """
+        import sqlite3
+        from alpaca.common.exceptions import APIError
+
+        conn = sqlite3.connect(tmp_db_path)
+        conn.execute(
+            """
+            INSERT INTO positions (
+                id, ticker, exchange, currency, quantity, entry_price,
+                entry_time, status, hold_type, phase, strategy_id
+            ) VALUES (55, 'SPY', 'US', 'USD', 1.0, 100.0,
+                      '2026-04-27T15:40:00-04:00',
+                      'STOP_AND_TARGET_ACTIVE', 'swing', 1, 'breakout')
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        # Simulate a 500 from Alpaca by raising an APIError that does
+        # NOT match the position-not-found markers (no 404, no
+        # 40410000, no "position does not exist" substring).
+        broker_500 = APIError(
+            '{"code": 50010000, "message": "internal server error"}'
+        )
+        base_order_manager._gw.client.get_open_position.side_effect = broker_500
+
+        sm = StrategyManager(
+            strategies=[_StubStrategy(decision=_make_decision())],
+            portfolio_manager=base_portfolio_manager,
+            market_data=base_market_data,
+            order_manager=base_order_manager,
+            risk_manager=base_risk_manager,
+            sentiment=base_sentiment,
+            earnings=base_earnings,
+            config=base_config,
+            db_path=tmp_db_path,
+        )
+
+        n = await sm.drain_disabled_sleeves()
+        assert n == 0
+        # No drain SELL submitted (transient error, can't confirm side).
+        base_order_manager.place_exit.assert_not_awaited()
+
+        # CRITICAL: DB row must remain OPEN — pre-fix bug closed it.
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            row = conn.execute(
+                "SELECT status FROM positions WHERE id = 55"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row[0] == "STOP_AND_TARGET_ACTIVE", (
+            "transient Alpaca error must NOT mark DB CLOSED — pre-fix "
+            "regression"
+        )
+
+    @pytest.mark.asyncio
+    async def test_drain_does_not_close_db_on_generic_exception(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        tmp_db_path,
+    ):
+        """Even non-APIError exceptions (network timeout, parse error,
+        attribute error from a stubbed client) must not close DB rows.
+        """
+        import sqlite3
+
+        conn = sqlite3.connect(tmp_db_path)
+        conn.execute(
+            """
+            INSERT INTO positions (
+                id, ticker, exchange, currency, quantity, entry_price,
+                entry_time, status, hold_type, phase, strategy_id
+            ) VALUES (66, 'SPY', 'US', 'USD', 1.0, 100.0,
+                      '2026-04-27T15:40:00-04:00',
+                      'STOP_AND_TARGET_ACTIVE', 'swing', 1, 'breakout')
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        base_order_manager._gw.client.get_open_position.side_effect = (
+            ConnectionError("network timeout")
+        )
+
+        sm = StrategyManager(
+            strategies=[_StubStrategy(decision=_make_decision())],
+            portfolio_manager=base_portfolio_manager,
+            market_data=base_market_data,
+            order_manager=base_order_manager,
+            risk_manager=base_risk_manager,
+            sentiment=base_sentiment,
+            earnings=base_earnings,
+            config=base_config,
+            db_path=tmp_db_path,
+        )
+
+        n = await sm.drain_disabled_sleeves()
+        assert n == 0
+        base_order_manager.place_exit.assert_not_awaited()
+
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            row = conn.execute(
+                "SELECT status FROM positions WHERE id = 66"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row[0] == "STOP_AND_TARGET_ACTIVE"
+
 
 # ---------------------------------------------------------------------------
 # Within-tick over-firing (2026-04-29 incident)

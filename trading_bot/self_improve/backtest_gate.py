@@ -142,6 +142,15 @@ def _judge(
             f"(max allowed {MAX_DRAWDOWN_INCREASE_PCT:+.2f}pp)"
         )
 
+    # Return guard. Three regimes:
+    #   - baseline > 0: candidate must keep ≥ MIN_RETURN_RATIO of it.
+    #   - baseline == 0: skip ratio check (any value/value is undefined);
+    #     fall back to absolute drop check below.
+    #   - baseline < 0: ratio inverts — a candidate with a "lower" ratio
+    #     is actually MORE NEGATIVE. Pre-fix this branch was skipped
+    #     entirely, so a -50% candidate could pass against a -0.01%
+    #     baseline. Now: candidate must not be worse than baseline by
+    #     more than (1 - MIN_RETURN_RATIO) of |baseline|.
     if baseline.return_pct > 0:
         ratio = candidate.return_pct / baseline.return_pct
         if ratio < MIN_RETURN_RATIO:
@@ -150,6 +159,20 @@ def _judge(
                 f"Return dropped to {ratio:.0%} of baseline "
                 f"(min {MIN_RETURN_RATIO:.0%})"
             )
+    elif baseline.return_pct < 0:
+        # Maximum allowed downside relative to baseline (small + negative).
+        # If MIN_RETURN_RATIO=0.95, a candidate may be at most 5% more
+        # negative than baseline.
+        max_extra_drawdown = abs(baseline.return_pct) * (1.0 - MIN_RETURN_RATIO)
+        if candidate.return_pct < baseline.return_pct - max_extra_drawdown:
+            failed = True
+            notes.append(
+                f"Return worsened to {candidate.return_pct:+.2f}pp from "
+                f"baseline {baseline.return_pct:+.2f}pp (max additional "
+                f"loss {max_extra_drawdown:.2f}pp)"
+            )
+    # baseline.return_pct == 0: ratio check is undefined. The Sharpe and
+    # drawdown gates already cover the regression case.
 
     if candidate.n_trades == 0:
         failed = True

@@ -548,6 +548,132 @@ class TestPlaceExit:
         assert order_id is None
         om._gw.client.submit_order.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_place_exit_refuses_when_only_match_is_entry_failed(
+        self, config, tmp_db_path: str, mock_notifier,
+    ):
+        """Regression for review CRITICAL-1: a position whose only
+        in-memory entry is in ENTRY_FAILED status must NOT be matched —
+        submitting a market SELL would short a never-filled position.
+        """
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        om._active_orders[1] = _ActiveOrder(
+            trade_id=1,
+            ticker="SPY",
+            exchange="US",
+            alpaca_entry_order_id="entry-1",
+            status=PositionStatus.ENTRY_FAILED,
+            entry_shares=10.0,
+            filled_shares=0.0,
+            entry_price=100.0,
+            stop_price=98.0,
+            target_price=104.0,
+            hold_type="intraday",
+            strategy_id="mean_reversion",
+        )
+        om._gw.client.submit_order = MagicMock()
+
+        order_id = await om.place_exit(
+            ticker="SPY", qty=10, reason="orphan_drain",
+        )
+
+        assert order_id is None
+        om._gw.client.submit_order.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_place_exit_refuses_when_only_match_is_closing(
+        self, config, tmp_db_path: str, mock_notifier,
+    ):
+        """Regression: a position already CLOSING (exit in flight) must
+        not be matched — duplicate SELL would over-flatten."""
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        om._active_orders[1] = _ActiveOrder(
+            trade_id=1,
+            ticker="SPY",
+            exchange="US",
+            alpaca_entry_order_id="entry-1",
+            status=PositionStatus.CLOSING,
+            entry_shares=10.0,
+            filled_shares=10.0,
+            entry_price=100.0,
+            stop_price=98.0,
+            target_price=104.0,
+            hold_type="intraday",
+            strategy_id="mean_reversion",
+        )
+        om._gw.client.submit_order = MagicMock()
+
+        order_id = await om.place_exit(
+            ticker="SPY", qty=10, reason="exit_signal",
+        )
+
+        assert order_id is None
+        om._gw.client.submit_order.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_place_exit_transitions_position_to_closing(
+        self, config, tmp_db_path: str, mock_notifier,
+    ):
+        """Regression for review CRITICAL-3 (mirror of place_limit_exit):
+        a successful market SELL must transition the position to CLOSING
+        synchronously so the next stateless tick can't re-fire the same
+        exit signal and double-submit.
+        """
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        # Seed a real DB row so the status update has something to find.
+        conn = sqlite3.connect(tmp_db_path)
+        conn.execute(
+            """INSERT INTO positions
+               (ticker, exchange, currency, sector, quantity, entry_price,
+                entry_time, status, hold_type, phase, strategy_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "SPY", "NASDAQ", "USD", "Information Technology",
+                10, 100.0, datetime.now(tz=ET).isoformat(),
+                "POSITION_OPEN", "intraday", 1, "mean_reversion",
+            ),
+        )
+        trade_id = conn.execute(
+            "SELECT id FROM positions WHERE ticker='SPY'"
+        ).fetchone()[0]
+        conn.commit()
+        conn.close()
+
+        om._active_orders[trade_id] = _ActiveOrder(
+            trade_id=trade_id,
+            ticker="SPY",
+            exchange="NASDAQ",
+            alpaca_entry_order_id="entry-1",
+            alpaca_stop_order_id="stop-1",
+            alpaca_target_order_id="target-1",
+            status=PositionStatus.STOP_AND_TARGET_ACTIVE,
+            entry_shares=10.0,
+            filled_shares=10.0,
+            entry_price=100.0,
+            stop_price=98.0,
+            target_price=104.0,
+            hold_type="intraday",
+            strategy_id="mean_reversion",
+        )
+        submitted = MagicMock()
+        submitted.id = "exit-mkt-1"
+        om._gw.client.submit_order = MagicMock(return_value=submitted)
+
+        order_id = await om.place_exit(
+            ticker="SPY", qty=10, reason="rsi_normalized",
+        )
+        assert order_id == "exit-mkt-1"
+        # In-memory + DB must transition together.
+        assert (
+            om._active_orders[trade_id].status == PositionStatus.CLOSING
+        )
+        conn = sqlite3.connect(tmp_db_path)
+        row = conn.execute(
+            "SELECT status FROM positions WHERE id = ?", (trade_id,),
+        ).fetchone()
+        conn.close()
+        assert row[0] == PositionStatus.CLOSING.value
+
 
 # ---------------------------------------------------------------------------
 # Place-entry failure path
@@ -786,6 +912,43 @@ class TestPlaceLimitExit:
 
         # Caller is expected to fall back to emergency_flatten when None.
         assert order_id is None
+
+    @pytest.mark.asyncio
+    async def test_rolls_back_state_on_alpaca_error(
+        self, config, tmp_db_path: str, mock_notifier
+    ):
+        """Regression for review CRITICAL-3: when Alpaca rejects the
+        limit-exit submission, we must NOT leave the position in CLOSING
+        — fill detection has nothing to confirm and the row would leak
+        forever. The in-memory _ActiveOrder must roll back to its prior
+        status."""
+        om = _make_om(config, tmp_db_path, mock_notifier)
+
+        active = _ActiveOrder(
+            trade_id=1,
+            ticker="SPY",
+            exchange="US",
+            alpaca_entry_order_id="entry-1",
+            alpaca_stop_order_id="stop-1",
+            alpaca_target_order_id="target-1",
+            status=PositionStatus.STOP_AND_TARGET_ACTIVE,
+            entry_shares=10.0,
+            filled_shares=10.0,
+            entry_price=100.0,
+            stop_price=98.0,
+            target_price=104.0,
+            hold_type="intraday",
+        )
+        om._active_orders[1] = active
+        om._gw.client.submit_order = MagicMock(side_effect=RuntimeError("rejected"))
+
+        order_id = await om.place_limit_exit(
+            ticker="SPY", qty=10, limit_price=100.0, reason="time_stop",
+        )
+
+        assert order_id is None
+        # Status MUST be back to its prior value, not stuck at CLOSING.
+        assert active.status == PositionStatus.STOP_AND_TARGET_ACTIVE
 
     @pytest.mark.asyncio
     async def test_rejects_non_positive_qty(

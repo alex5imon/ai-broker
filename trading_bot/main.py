@@ -1111,7 +1111,7 @@ class TradingBot:
                 recent_wr: float = self._calc_recent_win_rate(wr_lookback)
                 if recent_wr >= min_wr:
                     logger.info(
-                        "Phase promotion: MICRO -> SMALL (equity=£%.2f, wr=%.1f%%)",
+                        "Phase promotion: MICRO -> SMALL (equity=$%.2f, wr=%.1f%%)",
                         account_equity_usd, recent_wr * 100,
                     )
                     self._record_phase_transition(
@@ -1141,7 +1141,7 @@ class TradingBot:
                 recent_wr = self._calc_recent_win_rate(wr_lookback)
                 if recent_wr >= min_wr:
                     logger.info(
-                        "Phase promotion: SMALL -> FULL (equity=£%.2f, wr=%.1f%%)",
+                        "Phase promotion: SMALL -> FULL (equity=$%.2f, wr=%.1f%%)",
                         account_equity_usd, recent_wr * 100,
                     )
                     self._record_phase_transition(
@@ -1171,7 +1171,7 @@ class TradingBot:
             demotion_threshold: float = p2_threshold * demotion_pct
             if account_equity_usd < demotion_threshold:
                 logger.warning(
-                    "Phase demotion: SMALL -> MICRO (equity=£%.2f < £%.2f)",
+                    "Phase demotion: SMALL -> MICRO (equity=$%.2f < $%.2f)",
                     account_equity_usd, demotion_threshold,
                 )
                 self._record_phase_transition(
@@ -1194,7 +1194,7 @@ class TradingBot:
             demotion_threshold = p3_threshold * demotion_pct
             if account_equity_usd < demotion_threshold:
                 logger.warning(
-                    "Phase demotion: FULL -> SMALL (equity=£%.2f < £%.2f)",
+                    "Phase demotion: FULL -> SMALL (equity=$%.2f < $%.2f)",
                     account_equity_usd, demotion_threshold,
                 )
                 self._record_phase_transition(
@@ -1429,6 +1429,12 @@ class TradingBot:
             logger.exception("Daily metrics calculation failed for %s", today_str)
             metrics = {}
 
+        # Ghost-key reminder: ``lse_trades`` and ``commission_ratio``
+        # are NOT columns on daily_summaries — both were dropped in the
+        # IBKR-cleanup pass (commit c40fe4d). Including them in the dict
+        # is a silent footgun: they look real, but `repo.save_daily_summary`
+        # binds named parameters and quietly drops the extras. Keep this
+        # dict aligned with the schema.
         summary: dict[str, Any] = {
             "date": today_str,
             "total_trades": metrics.get("total_trades", 0),
@@ -1444,9 +1450,7 @@ class TradingBot:
             "avg_loss_usd": metrics.get("avg_loss"),
             "profit_factor": metrics.get("profit_factor"),
             "phase": self._config.get_phase().value,
-            "lse_trades": metrics.get("lse_trades", 0),
             "us_trades": metrics.get("us_trades", 0),
-            "commission_ratio": metrics.get("commission_ratio"),
             "notes": None,
         }
 
@@ -1457,7 +1461,7 @@ class TradingBot:
             repo.save_daily_summary(conn, summary)
             conn.close()
             saved = True
-            logger.info("Daily summary saved for %s (trades=%d, net_pnl=£%.2f)",
+            logger.info("Daily summary saved for %s (trades=%d, net_pnl=$%.2f)",
                         today_str, summary["total_trades"], summary["net_pnl_usd"])
         except Exception:
             logger.exception("Failed to save daily summary for %s", today_str)

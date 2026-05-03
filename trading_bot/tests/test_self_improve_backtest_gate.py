@@ -174,6 +174,60 @@ def test_judge_fails_on_zero_trades():
     assert "zero trades" in reason
 
 
+@pytest.mark.unit
+def test_judge_fails_on_negative_baseline_with_much_worse_candidate():
+    """Regression for review HIGH (backtest_gate negative-baseline
+    bypass): pre-fix, the return-ratio check was skipped whenever
+    baseline.return_pct <= 0, so a -50% candidate could pass against a
+    -0.01% baseline. With both at negative returns, candidate must not
+    be more negative than baseline by more than (1-MIN_RETURN_RATIO)
+    of |baseline|.
+    """
+    baseline = StrategyMetrics.from_result(
+        _make_strategy_result("mr", return_pct=-1.0)
+    )
+    # Candidate is -50% — catastrophically worse than -1% baseline.
+    candidate = StrategyMetrics.from_result(
+        _make_strategy_result("mr", return_pct=-50.0)
+    )
+    passed, reason = _judge(_make_proposal(), baseline, candidate)
+    assert not passed, (
+        "negative-baseline bypass regression: a -50% candidate must "
+        "fail against a -1% baseline"
+    )
+    assert "Return" in reason or "loss" in reason.lower()
+
+
+@pytest.mark.unit
+def test_judge_passes_on_negative_baseline_with_marginal_candidate():
+    """Symmetric check: a candidate within tolerance of a negative
+    baseline must still pass."""
+    baseline = StrategyMetrics.from_result(
+        _make_strategy_result("mr", return_pct=-1.0)
+    )
+    # Candidate at -1.04% — within 5% extra drawdown of |baseline|.
+    candidate = StrategyMetrics.from_result(
+        _make_strategy_result("mr", return_pct=-1.04)
+    )
+    passed, _ = _judge(_make_proposal(), baseline, candidate)
+    assert passed
+
+
+@pytest.mark.unit
+def test_judge_passes_on_zero_baseline_when_candidate_is_neutral():
+    """Zero baseline: ratio is undefined. Sharpe + drawdown gates are
+    the only quality controls. A candidate matching baseline metrics
+    must pass."""
+    baseline = StrategyMetrics.from_result(
+        _make_strategy_result("mr", return_pct=0.0)
+    )
+    candidate = StrategyMetrics.from_result(
+        _make_strategy_result("mr", return_pct=0.0)
+    )
+    passed, _ = _judge(_make_proposal(), baseline, candidate)
+    assert passed
+
+
 # ---------------------------------------------------------------------------
 # evaluate (end-to-end with stub runner)
 # ---------------------------------------------------------------------------

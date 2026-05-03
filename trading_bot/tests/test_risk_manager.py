@@ -44,7 +44,7 @@ class TestDailyLossLimit:
         self, risk_manager: RiskManager
     ) -> None:
         """Loss = -1.1% of equity → limit breached → can_trade() = False."""
-        # equity £1000, limit = 1% = £10; current P&L = -£11
+        # equity $1000, limit = 1% = $10; current P&L = -$11
         risk_manager.check_daily_loss_limit(-11.0, 1000.0)
         ok, reason = risk_manager.can_trade()
         assert ok is False
@@ -150,7 +150,7 @@ class TestDrawdownBreaker:
         """Equity drops 5% from 5-day peak → breaker fires → trading paused."""
         import sqlite3
 
-        # Insert 5 days of equity history at £1000 (peak)
+        # Insert 5 days of equity history at $1000 (peak)
         conn = sqlite3.connect(tmp_db_path)
         from datetime import date, timedelta
         today = date.today()

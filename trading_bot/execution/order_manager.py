@@ -639,16 +639,43 @@ class OrderManager:
             return None
 
         # Find the matching active order (DB-hydrated) so we can release
-        # the bracket legs that reserve the shares.
+        # the bracket legs that reserve the shares. Exclude terminal-ish
+        # statuses (CLOSED/ENTRY_FAILED) AND CLOSING — a position already
+        # transitioning to closed has its exit order in flight; matching
+        # it here would resubmit a duplicate SELL. ENTRY_FAILED rows
+        # represent positions that never filled, so a market SELL would
+        # open an unintended short.
         matching_trade_id: int | None = None
         matching_active: _ActiveOrder | None = None
+        # If a ticker has any in-memory _ActiveOrder in a refusal status
+        # (ENTRY_FAILED / CLOSING) but no eligible match, refuse — that
+        # means we already submitted an exit (CLOSING) or the entry never
+        # filled (ENTRY_FAILED). Drain or recovery callers should not
+        # follow with another SELL.
+        has_blocking_status: bool = False
         for tid, active in self._active_orders.items():
-            if active.ticker == ticker and active.status not in (
+            if active.ticker != ticker:
+                continue
+            if active.status in (
                 PositionStatus.CLOSED,
+                PositionStatus.ENTRY_FAILED,
+                PositionStatus.CLOSING,
             ):
-                matching_trade_id = tid
-                matching_active = active
-                break
+                has_blocking_status = True
+                continue
+            matching_trade_id = tid
+            matching_active = active
+            break
+
+        if matching_active is None and has_blocking_status:
+            logger.warning(
+                "place_exit refused for %s: existing in-memory order is "
+                "ENTRY_FAILED/CLOSING/CLOSED — refusing to submit a "
+                "market SELL that would short a never-filled position or "
+                "duplicate an in-flight close (reason=%s)",
+                ticker, reason,
+            )
+            return None
 
         if matching_active is not None:
             for oid in (
@@ -659,8 +686,10 @@ class OrderManager:
                 if oid is not None:
                     await self.cancel_order(oid)
         else:
-            # Defensive: cancel anything pending on the symbol so the
-            # market sell isn't blocked by reserved qty.
+            # Recovery / orphan-drain path: no in-memory order tracked
+            # for this ticker (e.g., position predates this process).
+            # Cancel any orphan child orders so the SELL isn't blocked
+            # by reserved qty.
             await self.cancel_all_for_ticker(ticker)
 
         client: TradingClient = self._gw.client
@@ -680,8 +709,18 @@ class OrderManager:
                 "Strategy exit submitted: SELL %s %s @ MARKET (reason=%s, alpaca_id=%s)",
                 qty, ticker, reason, order_id,
             )
+            # Pin order_id → trade_id and transition to CLOSING so the
+            # next stateless tick doesn't re-evaluate the same exit and
+            # double-submit. Fill detection moves CLOSING → CLOSED.
+            # Recovery/drain paths without an in-memory match still
+            # benefit from the caller marking the DB row CLOSING.
             if matching_trade_id is not None:
                 self._alpaca_to_trade[order_id] = matching_trade_id
+                if matching_active is not None:
+                    matching_active.status = PositionStatus.CLOSING
+                self._update_position_status(
+                    matching_trade_id, PositionStatus.CLOSING,
+                )
             return order_id
         except Exception:
             logger.exception(
@@ -724,17 +763,33 @@ class OrderManager:
             return None
 
         # Find the matching active order so we can cancel bracket legs
-        # and pin the exit order_id back to the trade.
+        # and pin the exit order_id back to the trade. Also exclude
+        # CLOSING — a position already transitioning to closed has its
+        # exit order in flight; matching here would resubmit a duplicate.
         matching_trade_id: int | None = None
         matching_active: _ActiveOrder | None = None
+        has_blocking_status: bool = False
         for tid, active in self._active_orders.items():
-            if active.ticker == ticker and active.status not in (
+            if active.ticker != ticker:
+                continue
+            if active.status in (
                 PositionStatus.CLOSED,
                 PositionStatus.ENTRY_FAILED,
+                PositionStatus.CLOSING,
             ):
-                matching_trade_id = tid
-                matching_active = active
-                break
+                has_blocking_status = True
+                continue
+            matching_trade_id = tid
+            matching_active = active
+            break
+
+        if matching_active is None and has_blocking_status:
+            logger.warning(
+                "place_limit_exit refused for %s: existing in-memory "
+                "order is ENTRY_FAILED/CLOSING/CLOSED (reason=%s)",
+                ticker, reason,
+            )
+            return None
 
         if matching_active is not None:
             for oid in (
@@ -747,7 +802,17 @@ class OrderManager:
         else:
             await self.cancel_all_for_ticker(ticker)
 
+        # Snapshot the prior status so we can roll back if Alpaca
+        # rejects the submission. Without this, a failed submit leaves
+        # the in-memory _ActiveOrder/DB row in CLOSING with no
+        # corresponding alpaca order_id — fill detection never advances
+        # CLOSING → CLOSED and the row leaks open forever.
+        prior_status: PositionStatus | None = (
+            matching_active.status if matching_active is not None else None
+        )
+
         client: TradingClient = self._gw.client
+        order_id: str | None = None
         try:
             request = LimitOrderRequest(
                 symbol=ticker,
@@ -760,7 +825,7 @@ class OrderManager:
             order: AlpacaOrder = await asyncio.to_thread(
                 client.submit_order, order_data=request,
             )
-            order_id: str = str(order.id)
+            order_id = str(order.id)
             logger.info(
                 "Limit exit submitted: SELL %s %s @ %.2f (reason=%s, alpaca_id=%s)",
                 qty, ticker, limit_price, reason, order_id,
@@ -772,15 +837,24 @@ class OrderManager:
             # CLOSED once the fill confirms.
             if matching_trade_id is not None:
                 self._alpaca_to_trade[order_id] = matching_trade_id
+                if matching_active is not None:
+                    matching_active.status = PositionStatus.CLOSING
                 self._update_position_status(
                     matching_trade_id, PositionStatus.CLOSING,
                 )
             return order_id
         except Exception:
             logger.exception(
-                "Failed to place limit exit for %s (qty=%s, reason=%s)",
+                "Failed to place limit exit for %s (qty=%s, reason=%s) — "
+                "rolling back in-memory state",
                 ticker, qty, reason,
             )
+            # Roll back: there is no Alpaca order, so we must not leave
+            # the local state pointing at a phantom CLOSING.
+            if matching_active is not None and prior_status is not None:
+                matching_active.status = prior_status
+            if order_id is not None:
+                self._alpaca_to_trade.pop(order_id, None)
             return None
 
     async def flatten_all(self) -> None:

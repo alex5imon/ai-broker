@@ -154,18 +154,26 @@ def _evaluate(baseline_json: str, prelw_json: str) -> dict:
 
     positive_windows = sum(1 for x in pairs if x["delta_pp"] > 0)
     catastrophic = [x for x in pairs if x["delta_pp"] < -2.0]
+    # Acceptance criterion is "4 of 6 windows positive" — the gate must
+    # therefore require a full 6 windows. Pre-fix it accepted 4-of-4
+    # silently, which would have rubber-stamped a sparse run.
+    expected_windows: int = 6
+    has_full_breadth = len(pairs) >= expected_windows
+    passes_4_of_6 = positive_windows >= 4 and has_full_breadth
     return {
         "sleeve": sleeve,
         "total_windows": len(pairs),
+        "expected_windows": expected_windows,
         "positive_windows": positive_windows,
         "catastrophic_windows": catastrophic,
-        "passes_4_of_6": positive_windows >= 4 and len(pairs) >= 4,
+        "passes_4_of_6": passes_4_of_6,
+        "has_full_breadth": has_full_breadth,
         "passes_no_catastrophic": not catastrophic,
         "windows": pairs,
     }
 
 
-def main() -> None:
+def main() -> int:
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
     runs = [
@@ -183,13 +191,37 @@ def main() -> None:
     with summary_path.open("w") as f:
         json.dump(out, f, indent=2)
     print(f"\n=== summary written to {summary_path} ===")
-    if isinstance(out["analysis"], dict):
-        a = out["analysis"]
-        print(f"  total_windows={a['total_windows']}")
-        print(f"  positive_windows={a['positive_windows']}")
-        print(f"  passes_4_of_6={a['passes_4_of_6']}")
-        print(f"  passes_no_catastrophic={a['passes_no_catastrophic']}")
+
+    # Propagate subprocess failures so CI sees the run as red rather
+    # than green on a partial collapse.
+    nonzero_exits = [s for s in summaries if s["exit_code"] != 0]
+    if nonzero_exits:
+        for s in nonzero_exits:
+            print(
+                f"  FAILED run {s['name']}: exit={s['exit_code']} "
+                f"log={s['log']}"
+            )
+        return 1
+
+    if not isinstance(out["analysis"], dict):
+        print(f"  ERROR: {out['analysis']}")
+        return 1
+
+    a = out["analysis"]
+    print(f"  total_windows={a['total_windows']} "
+          f"(expected {a['expected_windows']})")
+    print(f"  positive_windows={a['positive_windows']}")
+    print(f"  has_full_breadth={a['has_full_breadth']}")
+    print(f"  passes_4_of_6={a['passes_4_of_6']}")
+    print(f"  passes_no_catastrophic={a['passes_no_catastrophic']}")
+    if not a["has_full_breadth"]:
+        print(
+            f"  WARNING: only {a['total_windows']} of "
+            f"{a['expected_windows']} expected windows produced — "
+            "gate cannot be evaluated at full breadth"
+        )
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

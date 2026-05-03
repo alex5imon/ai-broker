@@ -25,12 +25,12 @@ class TestPhaseDetection:
         assert phase == Phase.MICRO
 
     def test_phase2_auto_detect_at_threshold(self, config: Config) -> None:
-        """Equity at exactly £5000 → Phase.SMALL."""
+        """Equity at exactly $5000 → Phase.SMALL."""
         phase = config.get_phase(equity_usd=5000.0)
         assert phase == Phase.SMALL
 
     def test_phase3_auto_detect_at_threshold(self, config: Config) -> None:
-        """Equity at exactly £20000 → Phase.FULL."""
+        """Equity at exactly $20000 → Phase.FULL."""
         phase = config.get_phase(equity_usd=20000.0)
         assert phase == Phase.FULL
 
@@ -139,7 +139,7 @@ class TestPhaseTransitionCriteria:
     def test_phase1_to_phase2_all_criteria_met(
         self, tmp_db_path: str, config: Config
     ) -> None:
-        """Equity £5001, 41 days, 55% win rate → promotion criteria met."""
+        """Equity $5001, 41 days, 55% win rate → promotion criteria met."""
         conn = sqlite3.connect(tmp_db_path)
         self._insert_daily_summaries(conn, 41, equity=5001.0)
         # 20 trades, 11 wins = 55% win rate
@@ -172,7 +172,7 @@ class TestPhaseTransitionCriteria:
     def test_phase1_not_promoted_low_equity(
         self, tmp_db_path: str, config: Config
     ) -> None:
-        """Equity £4999 — below threshold, no promotion."""
+        """Equity $4999 — below threshold, no promotion."""
         equity = 4999.0
         p2_threshold = float(config._require("phases", "phase1_to_phase2", "equity_usd"))
         assert equity < p2_threshold
@@ -223,7 +223,7 @@ class TestPhaseTransitionCriteria:
 
 class TestDemotion:
     def test_demotion_on_equity_drop(self, config: Config) -> None:
-        """Phase 2, equity drops to £3999 (< 80% of £5000 threshold) → demoted."""
+        """Phase 2, equity drops to $3999 (< 80% of $5000 threshold) → demoted."""
         p2_threshold = float(
             config._require("phases", "phase1_to_phase2", "equity_usd")
         )
@@ -236,7 +236,7 @@ class TestDemotion:
         assert current_equity < demotion_threshold
 
     def test_no_demotion_above_threshold(self, config: Config) -> None:
-        """Equity at £4100 — above 80% of £5000 threshold (= £4000), no demotion."""
+        """Equity at $4100 — above 80% of $5000 threshold (= $4000), no demotion."""
         p2_threshold = float(
             config._require("phases", "phase1_to_phase2", "equity_usd")
         )

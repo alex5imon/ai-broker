@@ -264,3 +264,35 @@ def test_execute_bulk_skips_db_update_when_no_db_id(tmp_db):
 
     failures = _execute_bulk([_plan("SPY", db_id=None)], client, tmp_db)
     assert failures == 0
+
+
+@pytest.mark.unit
+def test_execute_bulk_does_not_mark_db_closed_on_http_202(tmp_db):
+    """Regression for review CRITICAL: HTTP 202 = order queued for next
+    open. The position is NOT yet flat, so marking the DB row CLOSED
+    would corrupt records pre-market. The script should leave the DB
+    row OPEN and let the daily reconcile close it after the auction.
+    """
+    tmp_db.execute(
+        """INSERT INTO positions
+           (id, ticker, exchange, currency, quantity, entry_price, entry_time,
+            status, hold_type, phase, strategy_id)
+           VALUES (7, 'SPY', 'NYSE', 'USD', 1, 700.0,
+                   '2026-04-27T15:40:00-04:00', 'POSITION_OPEN', 'swing', 1, 'breakout')"""
+    )
+    tmp_db.commit()
+
+    client = MagicMock()
+    # 202 Accepted — Alpaca queued the close for the next open.
+    client.close_all_positions.return_value = [_bulk_response("SPY", 202)]
+
+    failures = _execute_bulk([_plan("SPY", db_id=7)], client, tmp_db)
+    # 202 is not a failure (the bulk call succeeded), but it is also
+    # not a fill — counted as zero failures and DB row stays OPEN.
+    assert failures == 0
+    row = tmp_db.execute(
+        "SELECT status FROM positions WHERE id = 7"
+    ).fetchone()
+    assert row[0] == "POSITION_OPEN", (
+        "HTTP 202 must NOT close the DB row — pre-fix regression"
+    )
