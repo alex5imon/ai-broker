@@ -28,6 +28,42 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 ET: ZoneInfo = TZ_EASTERN
 
+# Alpaca-specific error code for "position does not exist" (HTTP 404).
+# Reference: alpaca-py raises APIError with this code in the JSON body
+# when get_open_position is called for a symbol the account does not hold.
+_ALPACA_POSITION_NOT_FOUND_CODE: int = 40410000
+
+
+def _safe_apierror_code(exc: Any) -> int | None:
+    """Read APIError.code without raising if the body isn't JSON."""
+    try:
+        return int(getattr(exc, "code"))
+    except Exception:
+        return None
+
+
+def _is_alpaca_position_not_found(exc: Any) -> bool:
+    """True iff the APIError signals 'position does not exist' (HTTP 404).
+
+    alpaca-py constructs APIError as APIError(error_str, http_error). In
+    real usage, status_code=404 is the canonical signal. In tests it is
+    common to construct APIError without an http_error, so we also fall
+    back to the JSON 'code' field (40410000) and a substring match on
+    str(exc) — both deterministic markers of the same condition.
+    """
+    if getattr(exc, "status_code", None) == 404:
+        return True
+    code = _safe_apierror_code(exc)
+    if code == _ALPACA_POSITION_NOT_FOUND_CODE:
+        return True
+    # Last-ditch substring check for tests that pass a raw dict body.
+    text = str(exc).lower()
+    if "position does not exist" in text:
+        return True
+    if str(_ALPACA_POSITION_NOT_FOUND_CODE) in text:
+        return True
+    return False
+
 
 class StrategyManager:
     """Orchestrates multiple strategies against the watchlist."""
@@ -433,6 +469,18 @@ class StrategyManager:
                     ticker, sid or "<none>", qty,
                 )
                 continue
+            if check == "UNKNOWN":
+                # Transient Alpaca lookup failure (5xx, network, rate
+                # limit, malformed response). Do NOT mark the DB row
+                # CLOSED — that permanently drops a possibly-real
+                # position from the monitoring loop. Skip and retry
+                # next tick when Alpaca is reachable again.
+                logger.warning(
+                    "Drain skip: %s strategy=%s — Alpaca position lookup "
+                    "failed (transient); will retry next tick",
+                    ticker, sid or "<none>",
+                )
+                continue
             # check == "OK" — Alpaca confirms a same-side position.
 
             logger.warning(
@@ -467,23 +515,45 @@ class StrategyManager:
         """Probe Alpaca for the current position on ``ticker``.
 
         Returns one of:
-          - ``"NOT_HELD"`` — Alpaca holds 0 (or query failed in a way that
-            looks like "no position"). Caller should NOT submit a drain
-            order; should mark DB CLOSED.
+          - ``"NOT_HELD"`` — Alpaca confirmed no position (HTTP 404 or
+            Alpaca error code 40410000). Caller should mark DB CLOSED.
           - ``"OPPOSITE_SIDE"`` — Alpaca holds a position on the opposite
             sign of ``db_qty``. A drain SELL on an already-short position
             would deepen the short. Caller should REFUSE.
           - ``"OK"`` — Alpaca holds a same-sign position. Drain may proceed.
+          - ``"UNKNOWN"`` — Lookup failed for a non-deterministic reason
+            (5xx, network, rate-limit, parse failure). Caller MUST NOT
+            mark CLOSED — a transient broker outage would silently drop
+            real positions out of the monitoring loop.
         """
+        from alpaca.common.exceptions import APIError
+
         try:
             client = self._order_manager._gw.client
             alpaca_pos = client.get_open_position(ticker)
             alpaca_qty = float(getattr(alpaca_pos, "qty", 0) or 0)
+        except APIError as exc:
+            # Distinguish "position does not exist" (HTTP 404 / Alpaca
+            # error code 40410000) from any other API error. Real
+            # position-not-found is the only case where it's safe to
+            # mark the DB row CLOSED. Anything else (5xx, 429, schema
+            # drift) is transient and should NOT mutate state.
+            if _is_alpaca_position_not_found(exc):
+                return "NOT_HELD"
+            logger.warning(
+                "Alpaca position lookup for %s returned APIError "
+                "(status=%s, code=%s) — treating as UNKNOWN",
+                ticker,
+                getattr(exc, "status_code", None),
+                _safe_apierror_code(exc),
+            )
+            return "UNKNOWN"
         except Exception:
-            # alpaca-py raises APIError on "position does not exist".
-            # Treat any lookup failure as not-held; the caller will mark
-            # the DB row CLOSED so we don't retry on every tick.
-            return "NOT_HELD"
+            logger.warning(
+                "Alpaca position lookup for %s failed unexpectedly — "
+                "treating as UNKNOWN", ticker, exc_info=True,
+            )
+            return "UNKNOWN"
 
         if alpaca_qty == 0:
             return "NOT_HELD"

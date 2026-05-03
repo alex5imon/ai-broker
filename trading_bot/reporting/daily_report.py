@@ -382,7 +382,7 @@ def _fmt_money(value: float | None) -> str:
     """Format a monetary value in USD."""
     if value is None:
         return "N/A"
-    return f"\u00a3{value:,.2f}"
+    return f"${value:,.2f}"
 
 
 def _fmt_time(value: str | None) -> str:

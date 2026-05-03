@@ -279,55 +279,58 @@ def plan_and_execute(
         is_market_open = False
     logger.info("Market state: %s", "OPEN" if is_market_open else "CLOSED")
 
-    plans: list[OrphanPlan] = []
+    # Single try/finally wraps the whole DB lifetime — review CRITICAL
+    # (conn leak): the prior structure left ``conn`` open for the
+    # plan-printing block between the planning and execution try blocks.
+    # Any exception in print formatting (e.g., a malformed plan repr)
+    # would leak the connection on the execute path.
     conn = sqlite3.connect(db_path)
     try:
+        conn.row_factory = sqlite3.Row
+        plans: list[OrphanPlan] = []
         for ticker in target_tickers:
             if ticker not in by_ticker:
                 logger.info("%s: not held on Alpaca — nothing to flatten", ticker)
                 continue
             pos_id, child_ids = _find_db_position(conn, ticker)
             plans.append(_build_plan(by_ticker[ticker], pos_id, child_ids))
-    finally:
-        if not execute:
-            conn.close()
 
-    if not plans:
-        logger.info("No orphans to flatten. Done.")
-        return 0
+        if not plans:
+            logger.info("No orphans to flatten. Done.")
+            return 0
 
-    # Print the plan unconditionally so dry-run is the same as the first
-    # half of an execute run.
-    print()
-    tif_label = "DAY (market open)" if is_market_open else "OPG (market closed — queues for next open)"
-    print(f"=== Flatten plan ===  TIF={tif_label}")
-    for p in plans:
-        print(
-            f"  {p.ticker:6s} alpaca_qty={p.alpaca_qty:+.4f}  "
-            f"action={p.flatten_side} {p.flatten_qty} @ MARKET  "
-            f"db_id={p.db_position_id}  cancel_children={len(p.child_order_ids_to_cancel)}"
+        # Print the plan unconditionally so dry-run is the same as the
+        # first half of an execute run.
+        print()
+        tif_label = (
+            "DAY (market open)" if is_market_open
+            else "OPG (market closed — queues for next open)"
         )
-    print()
+        print(f"=== Flatten plan ===  TIF={tif_label}")
+        for p in plans:
+            print(
+                f"  {p.ticker:6s} alpaca_qty={p.alpaca_qty:+.4f}  "
+                f"action={p.flatten_side} {p.flatten_qty} @ MARKET  "
+                f"db_id={p.db_position_id}  "
+                f"cancel_children={len(p.child_order_ids_to_cancel)}"
+            )
+        print()
 
-    if not execute:
-        print("DRY RUN — re-run with --execute to send these orders.")
-        return 0
+        if not execute:
+            print("DRY RUN — re-run with --execute to send these orders.")
+            return 0
 
-    print("EXECUTING — submitting flatten orders to Alpaca...")
-    print()
+        print("EXECUTING — submitting flatten orders to Alpaca...")
+        print()
 
-    # If the planned orphans are exactly the live position set, use the
-    # broker-atomic close_all_positions(cancel_orders=True). That endpoint
-    # cancels every open order AND closes every position in one operation
-    # — broker-side, so it works pre-market when manual cancel + submit
-    # is blocked by held_for_orders on PENDING_CANCEL stops.
-    planned_tickers = {p.ticker for p in plans}
-    live_tickers = set(by_ticker.keys())
-    use_bulk = planned_tickers == live_tickers
+        # If the planned orphans are exactly the live position set, use
+        # the broker-atomic close_all_positions(cancel_orders=True).
+        # Broker-side, so it works pre-market when manual cancel +
+        # submit is blocked by held_for_orders on PENDING_CANCEL stops.
+        planned_tickers = {p.ticker for p in plans}
+        live_tickers = set(by_ticker.keys())
+        use_bulk = planned_tickers == live_tickers
 
-    failures = 0
-    try:
-        conn.row_factory = sqlite3.Row
         if use_bulk:
             logger.info(
                 "Planned orphans (%s) == live Alpaca positions; using "
@@ -343,18 +346,24 @@ def plan_and_execute(
                 "pre-market due to held_for_orders on pending stop cancels.",
                 sorted(live_tickers), sorted(extra),
             )
+            failures = 0
             for plan in plans:
-                ok = _execute_one(plan, client, conn, is_market_open=is_market_open)
+                ok = _execute_one(
+                    plan, client, conn, is_market_open=is_market_open,
+                )
                 if not ok:
                     failures += 1
+
+        if failures:
+            logger.error(
+                "%d/%d flatten action(s) failed — check log",
+                failures, len(plans),
+            )
+            return 1
+        logger.info("All %d orphan(s) flattened successfully", len(plans))
+        return 0
     finally:
         conn.close()
-
-    if failures:
-        logger.error("%d/%d flatten action(s) failed — check log", failures, len(plans))
-        return 1
-    logger.info("All %d orphan(s) flattened successfully", len(plans))
-    return 0
 
 
 def _execute_bulk(
@@ -388,6 +397,29 @@ def _execute_bulk(
             logger.error("Bulk close did not flatten %s (status=%s)", plan.ticker, status)
             failures += 1
             continue
+        # HTTP 202 = Accepted/queued (e.g. pre-market: queued for the
+        # next open). The position is NOT yet flat. Marking the DB row
+        # CLOSED here would corrupt position records — review CRITICAL.
+        # Leave the DB row alone; the daily reconcile picks it up
+        # after the auction fill. Don't count as a failure: the bulk
+        # call itself succeeded.
+        if status == 202:
+            logger.warning(
+                "Bulk close %s: HTTP 202 — order queued for next open. "
+                "Leaving DB row OPEN; reconcile will close it after fill.",
+                plan.ticker,
+            )
+            continue
+        if status != 200:
+            # Anything other than 200/202 is a real per-symbol failure.
+            logger.error(
+                "Bulk close %s: unexpected status %d — treating as failure",
+                plan.ticker, status,
+            )
+            failures += 1
+            continue
+        # status == 200: synchronously accepted/processed. Safe to mark
+        # CLOSED in the DB.
         if plan.db_position_id is not None:
             try:
                 conn.execute(

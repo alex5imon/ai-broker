@@ -344,3 +344,86 @@ class TestStateRecovery:
         result = await recovery.recover()
 
         assert not result.eod_flatten_orders
+
+    @pytest.mark.asyncio
+    async def test_eod_flatten_idempotent_across_ticks(
+        self, tmp_db_path: str, mock_notifier
+    ) -> None:
+        """Regression for review CRITICAL-4: a 5-min cron after 15:55
+        must not submit a fresh market SELL on every tick. After the
+        first successful submission the DB row transitions to CLOSING,
+        so the second tick's _intraday_tickers_in_db excludes it.
+        """
+        conn = sqlite3.connect(tmp_db_path)
+        _insert_db_position_intraday(conn, "PLTR", qty=100)
+        conn.close()
+
+        pos = _alpaca_position("PLTR", qty=100)
+        stop = _alpaca_order("PLTR", order_type="stop")
+        gw = self._make_gateway(positions=[pos], orders=[stop])
+
+        eod_now = datetime(2026, 4, 28, 15, 56, tzinfo=ET)
+        recovery = _make_recovery(gw, tmp_db_path, mock_notifier, now=eod_now)
+
+        # Tick 1 — submits flatten, marks DB CLOSING.
+        result1 = await recovery.recover()
+        assert "PLTR" in result1.eod_flatten_orders
+        first_call_count = gw.client.submit_order.call_count
+        assert first_call_count == 1
+
+        # Verify the DB row transitioned.
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            row = conn.execute(
+                "SELECT status FROM positions WHERE ticker = 'PLTR'"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row[0] == "CLOSING"
+
+        # Tick 2 (next 5-min cron, position not yet filled) — must NOT
+        # submit a duplicate. Reuse the same recovery instance + clock.
+        result2 = await recovery.recover()
+        assert "PLTR" not in result2.eod_flatten_orders
+        assert gw.client.submit_order.call_count == first_call_count, (
+            "second tick must NOT submit a duplicate flatten — "
+            "regression: pre-fix would re-fire every tick"
+        )
+
+    @pytest.mark.asyncio
+    async def test_eod_flatten_skips_when_pending_sell_on_alpaca(
+        self, tmp_db_path: str, mock_notifier
+    ) -> None:
+        """Belt-and-braces idempotency: if an Alpaca-side SELL is
+        already pending (e.g., DB write failed after a prior submit),
+        skip rather than double up.
+        """
+        conn = sqlite3.connect(tmp_db_path)
+        _insert_db_position_intraday(conn, "PLTR", qty=100)
+        conn.close()
+
+        pos = _alpaca_position("PLTR", qty=100)
+        # Pre-existing stop so the stop-verifier doesn't submit one.
+        stop = _alpaca_order("PLTR", order_type="stop")
+        # An open SELL order already exists on Alpaca for this ticker.
+        pending_sell = MagicMock()
+        pending_sell.symbol = "PLTR"
+        pending_sell.side = MagicMock()
+        pending_sell.side.value = "sell"
+        pending_sell.status = MagicMock()
+        pending_sell.status.value = "new"
+        pending_sell.type = MagicMock()
+        pending_sell.type.value = "market"
+        pending_sell.id = "open-sell-1"
+        pending_sell.submitted_at = datetime.now(ET)
+        pending_sell.created_at = pending_sell.submitted_at
+
+        gw = self._make_gateway(positions=[pos], orders=[stop, pending_sell])
+
+        eod_now = datetime(2026, 4, 28, 15, 56, tzinfo=ET)
+        recovery = _make_recovery(gw, tmp_db_path, mock_notifier, now=eod_now)
+        result = await recovery.recover()
+
+        assert "PLTR" not in result.eod_flatten_orders
+        # No new submit_order — only pre-existing orders observed.
+        assert gw.client.submit_order.call_count == 0

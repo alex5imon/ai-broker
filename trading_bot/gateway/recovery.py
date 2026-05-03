@@ -143,7 +143,9 @@ class StateRecovery:
 
         # 8. EOD intraday flatten. Closes intraday-tagged DB positions if the
         #    cron tick lands after the configured cutoff (default 15:55 ET).
-        await self._eod_intraday_flatten(alpaca_positions, result)
+        #    Pass open orders for idempotency (skip tickers with a pending
+        #    SELL already on the broker).
+        await self._eod_intraday_flatten(alpaca_positions, alpaca_orders, result)
 
         # 9. Log and alert
         logger.info("State recovery complete:\n%s", result.summary())
@@ -337,6 +339,7 @@ class StateRecovery:
     async def _eod_intraday_flatten(
         self,
         alpaca_positions: list[AlpacaPosition],
+        alpaca_orders: list[AlpacaOrder],
         result: RecoveryResult,
     ) -> None:
         """Close DB-tagged intraday positions if past the EOD cutoff.
@@ -345,6 +348,17 @@ class StateRecovery:
         positions in the local DB are flattened — that keeps the policy
         decision (which holds are intraday) inside our config rather than
         relying on broker metadata.
+
+        Idempotency (review CRITICAL-4): on a 5-min cron, this method
+        runs every tick after 15:55. Without dedup it submits a fresh
+        market SELL each time. We dedup on two signals:
+
+        1. DB row status — after a successful submission we mark the
+           position ``CLOSING``; ``_intraday_tickers_in_db`` excludes
+           it on subsequent ticks.
+        2. Alpaca open-orders — if there's already a SELL order pending
+           on the ticker (e.g., DB write failed after submit on a
+           prior tick), skip. Belt + braces.
         """
         exit_cfg: dict[str, Any] = self._config.get("exit_intraday", {})
         cutoff_str: str = str(
@@ -367,12 +381,24 @@ class StateRecovery:
         if not intraday_tickers:
             return
 
+        # Tickers that already have a pending SELL on Alpaca — covers
+        # the rare case where a prior tick submitted but then crashed
+        # before we marked the DB row CLOSING.
+        pending_sell_tickers: set[str] = _tickers_with_pending_sell(alpaca_orders)
+
         from alpaca.trading.requests import MarketOrderRequest
         from alpaca.trading.enums import OrderSide, TimeInForce
 
         for pos in alpaca_positions:
             ticker: str = str(pos.symbol)
             if ticker not in intraday_tickers:
+                continue
+            if ticker in pending_sell_tickers:
+                logger.info(
+                    "EOD flatten skip %s: pending close order already on "
+                    "Alpaca (idempotency)",
+                    ticker,
+                )
                 continue
             qty: int = int(float(pos.qty or 0))
             if qty == 0:
@@ -392,19 +418,53 @@ class StateRecovery:
                     side.value, abs(qty), ticker, cutoff_str,
                 )
                 result.eod_flatten_orders.append(ticker)
+                # Mark CLOSING in the DB so the next tick's
+                # _intraday_tickers_in_db excludes this ticker. Done in
+                # the same try block so a DB error here doesn't double
+                # the order — the next tick's pending-sell check will
+                # still catch it.
+                self._mark_intraday_closing(ticker)
             except Exception:
                 logger.exception("EOD flatten failed for %s", ticker)
 
     def _intraday_tickers_in_db(self) -> set[str]:
+        """Tickers in the DB that are intraday-tagged AND still need an
+        EOD flatten. Excludes CLOSED, ENTRY_FAILED, AND CLOSING — the
+        last is what makes EOD flatten idempotent across ticks.
+        """
         conn: sqlite3.Connection = sqlite3.connect(self._db_path)
         try:
             cursor = conn.execute(
                 "SELECT ticker FROM positions "
-                "WHERE status NOT IN ('CLOSED', 'ENTRY_FAILED') AND hold_type = 'intraday'"
+                "WHERE status NOT IN ('CLOSED', 'ENTRY_FAILED', 'CLOSING') "
+                "AND hold_type = 'intraday'"
             )
             return {row[0] for row in cursor.fetchall()}
         except sqlite3.OperationalError:
             return set()
+        finally:
+            conn.close()
+
+    def _mark_intraday_closing(self, ticker: str) -> None:
+        """Transition all open intraday positions for ``ticker`` to
+        CLOSING. Called after a successful EOD flatten submission so
+        subsequent ticks skip the same row."""
+        now: str = datetime.now(tz=ET).isoformat()
+        conn: sqlite3.Connection = sqlite3.connect(self._db_path)
+        try:
+            conn.execute(
+                "UPDATE positions SET status = 'CLOSING', updated_at = ? "
+                "WHERE ticker = ? AND hold_type = 'intraday' "
+                "AND status NOT IN ('CLOSED', 'ENTRY_FAILED', 'CLOSING')",
+                (now, ticker),
+            )
+            conn.commit()
+        except sqlite3.OperationalError:
+            logger.warning(
+                "EOD flatten: failed to mark %s CLOSING in DB; pending-sell "
+                "check on next tick will still suppress duplicates",
+                ticker,
+            )
         finally:
             conn.close()
 
@@ -513,6 +573,36 @@ class StateRecovery:
                 logger.warning("Could not close position id=%d", position_id)
         finally:
             conn.close()
+
+
+def _tickers_with_pending_sell(alpaca_orders: list[AlpacaOrder]) -> set[str]:
+    """Tickers that already have a non-terminal SELL order on Alpaca.
+
+    Used by EOD flatten to dedup — if a previous tick submitted but
+    crashed before persisting state, we'd otherwise double-submit.
+    """
+    pending: set[str] = set()
+    open_statuses = {
+        "new",
+        "accepted",
+        "pending_new",
+        "accepted_for_bidding",
+        "partially_filled",
+        "pending_replace",
+        "pending_cancel",
+    }
+    for order in alpaca_orders:
+        side_obj = getattr(order, "side", None)
+        side_val: str = (
+            getattr(side_obj, "value", "") if side_obj is not None else ""
+        )
+        status_obj = getattr(order, "status", None)
+        status_val: str = (
+            getattr(status_obj, "value", "") if status_obj is not None else ""
+        )
+        if side_val.lower() == "sell" and status_val.lower() in open_statuses:
+            pending.add(str(order.symbol))
+    return pending
 
 
 def _safe_float(value: Any) -> float:
