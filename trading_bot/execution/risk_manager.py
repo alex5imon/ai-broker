@@ -352,7 +352,7 @@ class RiskManager:
             conn: sqlite3.Connection = sqlite3.connect(self._db_path)
             try:
                 cutoff: str = (
-                    date.today() - timedelta(days=rolling_days)
+                    datetime.now(tz=ET).date() - timedelta(days=rolling_days)
                 ).isoformat()
                 rows = conn.execute(
                     "SELECT account_equity_usd FROM daily_summaries "
