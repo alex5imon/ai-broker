@@ -879,19 +879,22 @@ class TradingBot:
                 )
                 continue
 
-            # Cancel existing orders for this ticker first
-            await self._order_manager.cancel_all_for_ticker(ticker)
-
             if exit_decision.use_market_order or force_market_exit:
+                # Market exit: cancel ALL ticker orders first so Alpaca
+                # releases held_for_orders qty before the IOC sell.
+                await self._order_manager.cancel_all_for_ticker(ticker)
                 await self._order_manager.emergency_flatten(ticker, qty, exchange)
                 self._clear_spread_defer(ticker)
             else:
-                # Limit sell at mid-price.  Routed through OrderManager so
-                # the position transitions to CLOSING and the exit order_id
-                # is persisted BEFORE the next tick — without that step, a
-                # slow Alpaca fill leaves the row at POSITION_OPEN and the
-                # next tick re-evaluates the exit condition, risking a
-                # double-submit.
+                # Limit sell at mid-price. place_limit_exit cancels just
+                # the bracket legs it tracks (stop/target/trail) before
+                # submitting; if the submit raises, it rolls back local
+                # state. We deliberately do NOT call cancel_all_for_ticker
+                # here — that would also cancel the protective stop with
+                # no atomic re-attach, leaving the position naked for one
+                # tick if the limit submit fails. On submission failure
+                # we fall back to emergency_flatten, which itself does
+                # cancel_all_for_ticker before the IOC sell.
                 bid_ask = self._market_data.get_bid_ask(ticker)
                 limit_price: float
                 if bid_ask is not None:
@@ -909,6 +912,7 @@ class TradingBot:
                     logger.warning(
                         "Limit exit failed for %s — falling back to market", ticker,
                     )
+                    await self._order_manager.cancel_all_for_ticker(ticker)
                     await self._order_manager.emergency_flatten(ticker, qty, exchange)
                 self._clear_spread_defer(ticker)
 
