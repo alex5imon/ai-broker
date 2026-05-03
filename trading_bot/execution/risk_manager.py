@@ -7,6 +7,7 @@ the current phase via Config.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 import time
@@ -657,7 +658,9 @@ class RiskManager:
 
         # Close all positions and cancel all orders via Alpaca API
         try:
-            gateway.client.close_all_positions(cancel_orders=True)
+            await asyncio.to_thread(
+                gateway.client.close_all_positions, cancel_orders=True,
+            )
             logger.info("Kill switch: closed all positions and cancelled all orders")
         except Exception:
             logger.exception("Kill switch: error flattening positions")

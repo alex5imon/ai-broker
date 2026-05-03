@@ -93,6 +93,14 @@ class _ActiveOrder:
     alpaca_stop_order_id: str | None = None
     alpaca_target_order_id: str | None = None
     alpaca_trail_order_id: str | None = None
+    # Strategy-driven exit (place_exit / place_limit_exit). Populated
+    # when the position transitions to CLOSING; polled by
+    # _check_order_statuses to advance CLOSING -> CLOSED with the real
+    # exit_reason instead of leaving the row for state-recovery to
+    # tag as 'reconciliation_mismatch' next tick. In-memory only —
+    # process restarts fall back to the recovery path.
+    alpaca_exit_order_id: str | None = None
+    exit_reason: str | None = None
     status: PositionStatus = PositionStatus.ENTRY_PENDING
     entry_shares: float = 0.0  # float to support fractional shares
     filled_shares: float = 0.0
@@ -248,8 +256,8 @@ class OrderManager:
                 and active.alpaca_entry_order_id
             ):
                 try:
-                    order: AlpacaOrder = client.get_order_by_id(
-                        active.alpaca_entry_order_id
+                    order: AlpacaOrder = await asyncio.to_thread(
+                        client.get_order_by_id, active.alpaca_entry_order_id,
                     )
                     if order.status.value == "filled":
                         active.filled_shares = float(order.filled_qty or 0)
@@ -319,7 +327,9 @@ class OrderManager:
                     if order_id is None:
                         continue
                     try:
-                        order = client.get_order_by_id(order_id)
+                        order = await asyncio.to_thread(
+                            client.get_order_by_id, order_id,
+                        )
                         if order.status.value == "filled":
                             exit_price: float = float(order.filled_avg_price or 0)
                             logger.info(
@@ -342,6 +352,60 @@ class OrderManager:
                             "Error checking exit order for %s", active.ticker,
                             exc_info=True,
                         )
+
+            # Strategy-driven exit (place_exit / place_limit_exit). Without
+            # this branch the row stays CLOSING until the next tick's
+            # StateRecovery reconciles it as 'reconciliation_mismatch',
+            # losing the real exit_reason. The recovery path is still the
+            # ultimate fallback for crashed ticks / process restarts (the
+            # exit_order_id is in-memory only).
+            if (
+                active.status == PositionStatus.CLOSING
+                and active.alpaca_exit_order_id is not None
+            ):
+                exit_oid: str = active.alpaca_exit_order_id
+                try:
+                    exit_order = await asyncio.to_thread(
+                        client.get_order_by_id, exit_oid,
+                    )
+                    if exit_order.status.value == "filled":
+                        exit_px: float = float(exit_order.filled_avg_price or 0)
+                        reason_str: str = active.exit_reason or "strategy_exit"
+                        logger.info(
+                            "Strategy exit FILLED: %s reason=%s @ %.4f (trade_id=%d)",
+                            active.ticker, reason_str, exit_px, trade_id,
+                        )
+                        await self._close_position(
+                            trade_id, active, exit_px, reason_str,
+                        )
+                        pnl_strategy: float = (
+                            (exit_px - active.entry_price) * active.filled_shares
+                        )
+                        await self._notifier.position_closed(
+                            ticker=active.ticker, pnl=pnl_strategy,
+                            hold_time="", exit_reason=reason_str,
+                        )
+                    elif exit_order.status.value in ("canceled", "expired", "rejected"):
+                        # Limit exit didn't fill (e.g. price gapped through
+                        # the limit). Roll back to STOP_AND_TARGET_ACTIVE so
+                        # the next tick re-evaluates the exit condition; the
+                        # protective stop is re-attached by recovery if it
+                        # was cancelled.
+                        logger.warning(
+                            "Strategy exit %s for %s — rolling back to STOP_AND_TARGET_ACTIVE",
+                            exit_order.status.value, active.ticker,
+                        )
+                        active.alpaca_exit_order_id = None
+                        active.exit_reason = None
+                        active.status = PositionStatus.STOP_AND_TARGET_ACTIVE
+                        self._update_position_status(
+                            trade_id, PositionStatus.STOP_AND_TARGET_ACTIVE,
+                        )
+                except Exception:
+                    logger.warning(
+                        "Error polling strategy exit for %s", active.ticker,
+                        exc_info=True,
+                    )
 
     # ------------------------------------------------------------------
     # Entry orders
@@ -555,7 +619,7 @@ class OrderManager:
     async def cancel_order(self, order_id: str) -> None:
         """Cancel an order by Alpaca order ID."""
         try:
-            self._gw.client.cancel_order_by_id(order_id)
+            await asyncio.to_thread(self._gw.client.cancel_order_by_id, order_id)
             logger.info("Cancelled order %s", order_id)
         except Exception:
             # Benign: order may already be filled/cancelled by the time we try.
@@ -569,10 +633,14 @@ class OrderManager:
                 status=QueryOrderStatus.OPEN,
                 symbols=[ticker],
             )
-            orders: list[AlpacaOrder] = self._gw.client.get_orders(filter=request)
+            orders: list[AlpacaOrder] = await asyncio.to_thread(
+                self._gw.client.get_orders, filter=request,
+            )
             for order in orders:
                 try:
-                    self._gw.client.cancel_order_by_id(str(order.id))
+                    await asyncio.to_thread(
+                        self._gw.client.cancel_order_by_id, str(order.id),
+                    )
                 except Exception:
                     logger.warning("Error cancelling order for %s", ticker, exc_info=True)
             if orders:
@@ -709,6 +777,8 @@ class OrderManager:
                 self._alpaca_to_trade[order_id] = matching_trade_id
                 if matching_active is not None:
                     matching_active.status = PositionStatus.CLOSING
+                    matching_active.alpaca_exit_order_id = order_id
+                    matching_active.exit_reason = reason
                 self._update_position_status(
                     matching_trade_id, PositionStatus.CLOSING,
                 )
@@ -830,6 +900,8 @@ class OrderManager:
                 self._alpaca_to_trade[order_id] = matching_trade_id
                 if matching_active is not None:
                     matching_active.status = PositionStatus.CLOSING
+                    matching_active.alpaca_exit_order_id = order_id
+                    matching_active.exit_reason = reason
                 self._update_position_status(
                     matching_trade_id, PositionStatus.CLOSING,
                 )
@@ -844,6 +916,8 @@ class OrderManager:
             # the local state pointing at a phantom CLOSING.
             if matching_active is not None and prior_status is not None:
                 matching_active.status = prior_status
+                matching_active.alpaca_exit_order_id = None
+                matching_active.exit_reason = None
             if order_id is not None:
                 self._alpaca_to_trade.pop(order_id, None)
             return None
@@ -851,7 +925,9 @@ class OrderManager:
     async def flatten_all(self) -> None:
         """Flatten all positions with market orders (kill switch)."""
         try:
-            self._gw.client.close_all_positions(cancel_orders=True)
+            await asyncio.to_thread(
+                self._gw.client.close_all_positions, cancel_orders=True,
+            )
             logger.warning("Flatten all: closed all positions via Alpaca API")
         except Exception:
             logger.exception("Flatten all: error closing positions")

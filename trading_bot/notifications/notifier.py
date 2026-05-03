@@ -123,6 +123,31 @@ class Notifier:
 
         self._do_send(title, message, priority, resolved_tags)
 
+    def send_sync(
+        self,
+        title: str,
+        message: str,
+        priority: int = 3,
+        tags: list[str] | None = None,
+    ) -> None:
+        """Synchronous send for callers running outside an event loop.
+
+        ``send`` itself is sync under the hood (``requests.post``); this
+        is a coroutine-free entry point for ``RiskManager`` paths that
+        run from sync code (e.g. ``can_trade()``). Scheduling via
+        ``asyncio.ensure_future`` from those paths could be silently
+        dropped if the tick exits before the task runs.
+        """
+        resolved_tags: list[str] = tags if tags is not None else []
+        if not self._can_send_now():
+            logger.warning(
+                "Rate limit (%d/min) hit — dropping notification: %s",
+                self._rate_limit,
+                title,
+            )
+            return
+        self._do_send(title, message, priority, resolved_tags)
+
     # ------------------------------------------------------------------
     # Convenience methods for specific events
     # ------------------------------------------------------------------
