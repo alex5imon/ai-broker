@@ -381,7 +381,9 @@ class OrderManager:
                 time_in_force=TimeInForce.DAY,
                 limit_price=round(decision.limit_price, 2),
             )
-            order: AlpacaOrder = client.submit_order(order_data=request)
+            order: AlpacaOrder = await asyncio.to_thread(
+                client.submit_order, order_data=request,
+            )
             alpaca_order_id: str = str(order.id)
 
             logger.info(
@@ -524,7 +526,9 @@ class OrderManager:
                 time_in_force=TimeInForce.GTC,
                 trail_percent=round(trail_pct * 100, 2),
             )
-            order: AlpacaOrder = client.submit_order(order_data=request)
+            order: AlpacaOrder = await asyncio.to_thread(
+                client.submit_order, order_data=request,
+            )
             order_id: str = str(order.id)
             logger.info(
                 "Trailing stop placed: %s %.6f trail=%.2f%% (alpaca_id=%s, trade_id=%d)",
@@ -955,7 +959,9 @@ class OrderManager:
                 time_in_force=TimeInForce.GTC,
                 stop_price=round(active.stop_price, 2),
             )
-            order: AlpacaOrder = self._gw.client.submit_order(order_data=request)
+            order: AlpacaOrder = await asyncio.to_thread(
+                self._gw.client.submit_order, order_data=request,
+            )
             return str(order.id)
         except Exception:
             logger.exception(
