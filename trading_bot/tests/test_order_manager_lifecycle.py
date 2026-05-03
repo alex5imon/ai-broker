@@ -4,9 +4,9 @@ trail activation, hydration, and cancel/flatten paths."""
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -67,16 +67,6 @@ def _alpaca_order(
     return o
 
 
-def _bracket_legs(stop_id: str = "stop-1", target_id: str = "target-1"):
-    stop_leg = MagicMock()
-    stop_leg.id = stop_id
-    stop_leg.order_type = "stop"
-    target_leg = MagicMock()
-    target_leg.id = target_id
-    target_leg.order_type = "limit"
-    return [stop_leg, target_leg]
-
-
 # ---------------------------------------------------------------------------
 # Hydration
 # ---------------------------------------------------------------------------
@@ -105,31 +95,37 @@ class TestHydration:
 
 
 # ---------------------------------------------------------------------------
-# Entry fill → bracket legs
+# Entry fill → standalone stop attach
 # ---------------------------------------------------------------------------
 
 
 class TestEntryFill:
     @pytest.mark.asyncio
-    async def test_fill_picks_up_bracket_legs(
+    async def test_fill_attaches_standalone_stop(
         self, config, tmp_db_path: str, mock_notifier
     ):
+        """On fill, a single StopOrderRequest is submitted (no take-profit).
+        Take-profit is managed by the tick-loop's check_exits polling against
+        target_price, not by the broker."""
+        from alpaca.trading.requests import StopOrderRequest
+
         om = _make_om(config, tmp_db_path, mock_notifier)
-        entry_alpaca = _alpaca_order("entry-1", "new")
-        om._gw.client.submit_order = MagicMock(return_value=entry_alpaca)
+        captured: list = []
+
+        def _submit(order_data):
+            captured.append(order_data)
+            order_id = f"order-{len(captured)}"
+            return _alpaca_order(order_id, "new")
+
+        om._gw.client.submit_order = MagicMock(side_effect=_submit)
         trade_id = await om.place_entry(_entry())
 
-        # Polling: entry filled, fetch returns bracket legs.
-        # After transitioning to STOP_AND_TARGET_ACTIVE, the loop also probes
-        # the stop and target legs — return "new" for those so the position
-        # stays open and we can assert the leg IDs were captured.
         filled_entry = _alpaca_order(
-            "entry-1", "filled", filled_qty=100, filled_avg_price=10.0,
-            legs=_bracket_legs("stop-9", "target-9"),
+            "order-1", "filled", filled_qty=100, filled_avg_price=10.0,
         )
 
         def lookup(oid: str):
-            if oid == "entry-1":
+            if oid == "order-1":
                 return filled_entry
             return _alpaca_order(oid, "new")
         om._gw.client.get_order_by_id = MagicMock(side_effect=lookup)
@@ -138,32 +134,64 @@ class TestEntryFill:
 
         active = om._active_orders[trade_id]
         assert active.status == PositionStatus.STOP_AND_TARGET_ACTIVE
-        assert active.alpaca_stop_order_id == "stop-9"
-        assert active.alpaca_target_order_id == "target-9"
+        # Second submit_order call was the standalone stop
+        assert len(captured) == 2
+        stop_req = captured[1]
+        assert isinstance(stop_req, StopOrderRequest)
+        assert active.alpaca_stop_order_id == "order-2"
+        # No take-profit submitted to the broker
+        assert active.alpaca_target_order_id is None
         mock_notifier.trade_entry.assert_awaited()
 
     @pytest.mark.asyncio
-    async def test_missing_stop_leg_triggers_emergency_flatten(
+    async def test_stop_attach_failure_triggers_emergency_flatten(
         self, config, tmp_db_path: str, mock_notifier
     ):
+        """If the standalone stop submit fails, the position is unprotected.
+        Recovery: emergency_flatten + notify + collapse to terminal state so
+        the next stateless tick does not re-evaluate a ghost POSITION_OPEN
+        row with no broker-side protection."""
         om = _make_om(config, tmp_db_path, mock_notifier)
-        entry_alpaca = _alpaca_order("entry-1", "new")
-        # Two submit_order calls: entry, then emergency flatten.
-        om._gw.client.submit_order = MagicMock(
-            side_effect=[entry_alpaca, _alpaca_order("flatten-1", "new")]
-        )
-        await om.place_entry(_entry())
+        call_count = {"n": 0}
 
-        # Bracket legs missing entirely
+        def _submit(order_data):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return _alpaca_order("entry-1", "new")
+            if call_count["n"] == 2:
+                # Stop submit fails
+                raise RuntimeError("stop submit rejected")
+            # Third call: emergency flatten market order
+            return _alpaca_order("flatten-1", "new")
+
+        om._gw.client.submit_order = MagicMock(side_effect=_submit)
+        trade_id = await om.place_entry(_entry())
+
         filled = _alpaca_order(
-            "entry-1", "filled", filled_qty=100, filled_avg_price=10.0, legs=None,
+            "entry-1", "filled", filled_qty=100, filled_avg_price=10.0,
         )
         om._gw.client.get_order_by_id = MagicMock(return_value=filled)
 
         await om._check_order_statuses()
 
-        # Emergency flatten was called (second submit_order)
-        assert om._gw.client.submit_order.call_count == 2
+        # entry + (failed) stop + emergency flatten = 3 submit_order calls
+        assert call_count["n"] == 3
+        # Surfaced to the operator as a high-priority notification
+        mock_notifier.send.assert_awaited()
+        # State machine collapsed cleanly — next tick won't re-evaluate.
+        assert trade_id not in om._active_orders
+        # Misleading "trade entered" notification is suppressed for a
+        # position that was force-flattened immediately after fill.
+        mock_notifier.trade_entry.assert_not_awaited()
+        # DB row at terminal status, hydration won't reload it.
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            status = conn.execute(
+                "SELECT status FROM positions WHERE id = ?", (trade_id,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert status == PositionStatus.ENTRY_FAILED.value
 
 
 # ---------------------------------------------------------------------------
@@ -177,8 +205,13 @@ class TestEntryTimeout:
         self, config, tmp_db_path: str, mock_notifier
     ):
         om = _make_om(config, tmp_db_path, mock_notifier)
-        entry_alpaca = _alpaca_order("entry-1", "new")
-        om._gw.client.submit_order = MagicMock(return_value=entry_alpaca)
+        # submit_order is called twice: entry, then standalone stop on partial fill.
+        om._gw.client.submit_order = MagicMock(
+            side_effect=[
+                _alpaca_order("entry-1", "new"),
+                _alpaca_order("stop-1", "new"),
+            ]
+        )
         trade_id = await om.place_entry(_entry(shares=100))
 
         # Partial fill of 80 shares (> 50% default), submitted long ago
@@ -187,7 +220,6 @@ class TestEntryTimeout:
             "entry-1", "partially_filled",
             filled_qty=80.0, filled_avg_price=10.0,
             submitted_at=old_submitted,
-            legs=_bracket_legs(),
         )
         om._gw.client.get_order_by_id = MagicMock(return_value=partial)
         om._gw.client.cancel_order_by_id = MagicMock()
@@ -196,9 +228,11 @@ class TestEntryTimeout:
 
         # Cancelled the timed-out entry
         om._gw.client.cancel_order_by_id.assert_called()
-        # Position transitioned to bracket-active (stop+target leg IDs were picked up)
+        # Position transitioned to STOP_AND_TARGET_ACTIVE with standalone stop
         active = om._active_orders[trade_id]
         assert active.status == PositionStatus.STOP_AND_TARGET_ACTIVE
+        assert active.alpaca_stop_order_id == "stop-1"
+        assert active.alpaca_target_order_id is None
 
     @pytest.mark.asyncio
     async def test_partial_fill_below_min_pct_flattens(
@@ -259,7 +293,12 @@ class TestEntryTimeout:
         om = _make_om(config, tmp_db_path, mock_notifier)
         entry_alpaca = _alpaca_order("entry-1", "new")
         om._gw.client.submit_order = MagicMock(return_value=entry_alpaca)
-        trade_id = await om.place_entry(_entry(shares=100))
+        await om.place_entry(_entry(shares=100))
+
+        # Add stop submit response for the partial-fill transition.
+        om._gw.client.submit_order = MagicMock(
+            side_effect=[_alpaca_order("stop-1", "new")]
+        )
 
         # Naive datetime from "long ago"
         naive_old = datetime.now(tz=ET).replace(tzinfo=None) - timedelta(seconds=600)
@@ -267,7 +306,6 @@ class TestEntryTimeout:
             "entry-1", "partially_filled",
             filled_qty=80.0, filled_avg_price=10.0,
             submitted_at=naive_old,
-            legs=_bracket_legs(),
         )
         om._gw.client.get_order_by_id = MagicMock(return_value=partial)
         om._gw.client.cancel_order_by_id = MagicMock()
@@ -756,16 +794,20 @@ class TestPlaceEntryFailure:
         assert float(pnl_usd) == 0.0
 
 
-class TestFractionalShareFloor:
-    """2026-05-01 incident: Alpaca rejects fractional+bracket combos (code
-    42210000). Floor to whole shares so the bracket path is legal. Until the
-    standalone-stop refactor lands, this is the gate that keeps live trading
-    from no-op'ing every signal."""
+class TestFractionalEntry:
+    """ai-broker#39: Plain-limit + standalone-stop entry path supports fractional
+    shares end-to-end. The previous whole-share floor (PR #38) was a stopgap that
+    dropped ~50% of mean_reversion signals on a $1k account; it has been removed
+    in favor of submitting a non-bracketed limit order followed by a standalone
+    stop on fill."""
 
     @pytest.mark.asyncio
-    async def test_fractional_shares_floored_before_submit(
+    async def test_fractional_shares_passed_through(
         self, config, tmp_db_path: str, mock_notifier
     ):
+        """Fractional shares survive submit untouched — no implicit floor."""
+        from alpaca.trading.requests import LimitOrderRequest
+
         om = _make_om(config, tmp_db_path, mock_notifier)
         captured: list = []
 
@@ -776,22 +818,53 @@ class TestFractionalShareFloor:
         om._gw.client.submit_order = MagicMock(side_effect=_capture)
 
         decision = _entry(ticker="XLF", shares=10, price=51.0)
-        decision.shares = 2.7  # type: ignore[assignment]
+        decision.shares = 2.7
         trade_id = await om.place_entry(decision)
 
         assert trade_id is not None
         assert len(captured) == 1
-        assert int(captured[0].qty) == 2, f"expected qty=2, got {captured[0].qty}"
+        req = captured[0]
+        assert isinstance(req, LimitOrderRequest)
+        # Plain limit — no order_class, no children
+        assert getattr(req, "order_class", None) is None
+        assert getattr(req, "stop_loss", None) is None
+        assert getattr(req, "take_profit", None) is None
+        # Quantity flowed through as-is (no floor)
+        assert float(req.qty) == 2.7
 
     @pytest.mark.asyncio
-    async def test_zero_share_floor_skips_without_db_insert(
+    async def test_sub_one_share_signal_not_dropped(
         self, config, tmp_db_path: str, mock_notifier
     ):
+        """Sub-1-share fractional decision still reaches the broker.
+        Pre-fix the whole-share floor turned this into a no-op."""
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        captured: list = []
+
+        def _capture(order_data):
+            captured.append(order_data)
+            return _alpaca_order("entry-1", "new")
+
+        om._gw.client.submit_order = MagicMock(side_effect=_capture)
+
+        decision = _entry(ticker="SPY", shares=1, price=700.0)
+        decision.shares = 0.43
+        trade_id = await om.place_entry(decision)
+
+        assert trade_id is not None
+        assert len(captured) == 1
+        assert float(captured[0].qty) == 0.43
+
+    @pytest.mark.asyncio
+    async def test_non_positive_shares_skipped_without_db_insert(
+        self, config, tmp_db_path: str, mock_notifier
+    ):
+        """shares <= 0 is a degenerate sizing result; no order or DB row."""
         om = _make_om(config, tmp_db_path, mock_notifier)
         om._gw.client.submit_order = MagicMock()
 
-        decision = _entry(ticker="SPY", shares=10, price=700.0)
-        decision.shares = 0.43  # type: ignore[assignment]
+        decision = _entry(ticker="SPY", shares=1, price=700.0)
+        decision.shares = 0.0
         trade_id = await om.place_entry(decision)
 
         assert trade_id is None
@@ -805,6 +878,101 @@ class TestFractionalShareFloor:
             conn.close()
         assert n_pos == 0
         assert n_trades == 0
+
+    @pytest.mark.asyncio
+    async def test_fractional_fill_attaches_standalone_stop(
+        self, config, tmp_db_path: str, mock_notifier
+    ):
+        """End-to-end: fractional entry → fill → standalone stop with the
+        same fractional qty. Verifies the issue#39 acceptance path."""
+        from alpaca.trading.requests import StopOrderRequest
+
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        captured: list = []
+
+        def _submit(order_data):
+            captured.append(order_data)
+            order_id = f"order-{len(captured)}"
+            return _alpaca_order(order_id, "new")
+
+        om._gw.client.submit_order = MagicMock(side_effect=_submit)
+
+        decision = _entry(ticker="SPY", shares=1, price=700.0)
+        decision.shares = 0.43
+        trade_id = await om.place_entry(decision)
+
+        # Fill the entry at the (fractional) decision quantity
+        filled = _alpaca_order(
+            "order-1", "filled", filled_qty=0.43, filled_avg_price=700.0,
+        )
+
+        def lookup(oid: str):
+            if oid == "order-1":
+                return filled
+            return _alpaca_order(oid, "new")
+        om._gw.client.get_order_by_id = MagicMock(side_effect=lookup)
+
+        await om._check_order_statuses()
+
+        # Two submit calls: the limit entry, then the standalone stop.
+        assert len(captured) == 2
+        stop_req = captured[1]
+        assert isinstance(stop_req, StopOrderRequest)
+        assert float(stop_req.qty) == 0.43
+        active = om._active_orders[trade_id]
+        assert active.alpaca_stop_order_id == "order-2"
+        assert active.alpaca_target_order_id is None
+
+    @pytest.mark.asyncio
+    async def test_alpaca_42210000_simulated_no_rejection_under_new_path(
+        self, config, tmp_db_path: str, mock_notifier
+    ):
+        """Integration check: a stubbed Alpaca that rejects fractional+bracket
+        with code 42210000 but accepts plain LimitOrderRequest must produce
+        zero rejections under the new entry path. This is the regression gate
+        the issue's acceptance criteria call out."""
+        from alpaca.trading.requests import LimitOrderRequest, StopOrderRequest
+
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        captured: list = []
+
+        def _stub_alpaca(order_data):
+            captured.append(order_data)
+            # Simulate Alpaca's real rejection for any fractional+bracket combo.
+            is_bracket = bool(getattr(order_data, "order_class", None))
+            qty = float(getattr(order_data, "qty", 0) or 0)
+            if is_bracket and qty != int(qty):
+                raise RuntimeError(
+                    "{'code':42210000,'message':'fractional orders must be simple orders'}"
+                )
+            return _alpaca_order(f"order-{len(captured)}", "new")
+
+        om._gw.client.submit_order = MagicMock(side_effect=_stub_alpaca)
+
+        decision = _entry(ticker="SPY", shares=1, price=700.0)
+        decision.shares = 0.43
+        trade_id = await om.place_entry(decision)
+
+        # Fractional entry survived without 42210000 rejection.
+        assert trade_id is not None
+
+        # On fill, the standalone stop is also accepted.
+        filled = _alpaca_order(
+            "order-1", "filled", filled_qty=0.43, filled_avg_price=700.0,
+        )
+        om._gw.client.get_order_by_id = MagicMock(
+            side_effect=lambda oid: filled if oid == "order-1"
+            else _alpaca_order(oid, "new")
+        )
+
+        await om._check_order_statuses()
+
+        # Both submitted requests are simple (non-bracket); neither tripped 42210000.
+        assert len(captured) == 2
+        assert isinstance(captured[0], LimitOrderRequest)
+        assert isinstance(captured[1], StopOrderRequest)
+        for req in captured:
+            assert getattr(req, "order_class", None) is None
 
 
 # ---------------------------------------------------------------------------

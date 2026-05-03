@@ -21,14 +21,13 @@ from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, OrderType, TimeInForce, OrderClass
+from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
 from alpaca.trading.models import Order as AlpacaOrder
 from alpaca.trading.requests import (
     GetOrdersRequest,
     LimitOrderRequest,
     MarketOrderRequest,
-    StopLossRequest,
-    TakeProfitRequest,
+    StopOrderRequest,
     TrailingStopOrderRequest,
 )
 
@@ -60,7 +59,7 @@ class EntryDecision:
     ticker: str
     exchange: str
     side: str                 # "BUY"
-    shares: int
+    shares: float             # supports fractional (Alpaca min increment 1e-6)
     limit_price: float
     stop_price: float         # Stop-loss price
     target_price: float       # Take-profit price
@@ -349,22 +348,22 @@ class OrderManager:
     # ------------------------------------------------------------------
 
     async def place_entry(self, decision: EntryDecision) -> int | None:
-        """Place an entry limit order.  Returns the internal trade_id on success."""
-        # Alpaca rejects fractional+bracket combos with code 42210000
-        # ("fractional orders must be simple orders"), and we always submit
-        # bracketed entries so stop+target attach atomically. Floor to whole
-        # shares so the bracket path is legal. The proper fix — plain entry +
-        # standalone stop on fill — is required before live deployment because
-        # this floor drops ~50% of signals on a $1k account; tracked separately.
-        whole_shares: int = int(decision.shares)
-        if whole_shares <= 0:
+        """Place an entry limit order.  Returns the internal trade_id on success.
+
+        Submits a *plain* ``LimitOrderRequest`` — no bracket, no children.
+        Alpaca rejects fractional+bracket combos with code 42210000 and the
+        whole-share floor we used to apply was catastrophic on the $1k live
+        account (dropped ~50% of mean_reversion signals). The protective stop
+        is attached as a standalone order in :meth:`_transition_to_open` once
+        the entry confirms a fill; take-profit is managed by the tick-loop's
+        ``check_exits`` polling against ``target_price``.
+        """
+        if decision.shares <= 0:
             logger.info(
-                "[%s] Entry skipped: whole-share floor produces 0 shares (raw=%.4f, price=%.2f)",
+                "[%s] Entry skipped: shares=%.6f <= 0 (price=%.2f)",
                 decision.ticker, decision.shares, decision.limit_price,
             )
             return None
-        if whole_shares != decision.shares:
-            decision.shares = whole_shares
 
         trade_id: int | None = self._create_position_record(decision)
         if trade_id is None:
@@ -374,11 +373,6 @@ class OrderManager:
         client: TradingClient = self._gw.client
 
         try:
-            # Use a bracket order so stop-loss + take-profit are attached to
-            # the entry as an OCO pair. Placing them as separate orders after
-            # fill fails on small positions because the stop reserves the
-            # whole qty, leaving nothing available for the take-profit
-            # (Alpaca rejects with "insufficient qty available for order").
             request = LimitOrderRequest(
                 symbol=decision.ticker,
                 qty=decision.shares,
@@ -386,19 +380,12 @@ class OrderManager:
                 type=OrderType.LIMIT,
                 time_in_force=TimeInForce.DAY,
                 limit_price=round(decision.limit_price, 2),
-                order_class=OrderClass.BRACKET,
-                stop_loss=StopLossRequest(
-                    stop_price=round(decision.stop_price, 2),
-                ),
-                take_profit=TakeProfitRequest(
-                    limit_price=round(decision.target_price, 2),
-                ),
             )
             order: AlpacaOrder = client.submit_order(order_data=request)
             alpaca_order_id: str = str(order.id)
 
             logger.info(
-                "Entry order placed: %s %s %d @ %.2f (alpaca_id=%s, trade_id=%d)",
+                "Entry order placed: %s %s %.6f @ %.2f (alpaca_id=%s, trade_id=%d)",
                 decision.side, decision.ticker, decision.shares,
                 decision.limit_price, alpaca_order_id, trade_id,
             )
@@ -540,7 +527,7 @@ class OrderManager:
             order: AlpacaOrder = client.submit_order(order_data=request)
             order_id: str = str(order.id)
             logger.info(
-                "Trailing stop placed: %s %d trail=%.2f%% (alpaca_id=%s, trade_id=%d)",
+                "Trailing stop placed: %s %.6f trail=%.2f%% (alpaca_id=%s, trade_id=%d)",
                 ticker, qty, trail_pct * 100, order_id, trade_id,
             )
 
@@ -604,12 +591,12 @@ class OrderManager:
                 client.submit_order, order_data=request,
             )
             logger.warning(
-                "Emergency flatten: SELL %d %s @ MARKET (alpaca_id=%s)",
+                "Emergency flatten: SELL %.6f %s @ MARKET (alpaca_id=%s)",
                 qty, ticker, str(order.id),
             )
         except Exception:
             logger.exception(
-                "CRITICAL: Failed emergency flatten for %s (%d shares)", ticker, qty,
+                "CRITICAL: Failed emergency flatten for %s (%.6f shares)", ticker, qty,
             )
             await self._notifier.send(
                 "Emergency Flatten Failed",
@@ -870,7 +857,16 @@ class OrderManager:
     # ------------------------------------------------------------------
 
     async def _transition_to_open(self, trade_id: int, filled_qty: float) -> None:
-        """Transition from ENTRY_PENDING to POSITION_OPEN, then place exits."""
+        """Transition from ENTRY_PENDING to POSITION_OPEN, then attach a stop.
+
+        The entry was submitted as a *plain* LimitOrderRequest (no bracket),
+        so we submit a standalone protective stop now. Take-profit is *not*
+        sent to Alpaca — the tick-loop's ``check_exits`` polls
+        ``target_price`` and exits via ``place_limit_exit``.
+
+        If the stop submission fails, we emergency-flatten and notify, since
+        the position would otherwise sit unprotected.
+        """
         active: _ActiveOrder | None = self._active_orders.get(trade_id)
         if active is None:
             return
@@ -881,46 +877,53 @@ class OrderManager:
         self._update_position_field(trade_id, "quantity", filled_qty)
         self._update_position_field(trade_id, "entry_price", active.entry_price)
 
-        # Entry was submitted as a BRACKET, so Alpaca auto-created the
-        # stop-loss and take-profit legs once the entry filled. Fetch the
-        # entry order to pull the leg IDs rather than placing new orders.
-        stop_id: str | None = None
-        target_id: str | None = None
-        try:
-            entry_order = self._gw.client.get_order_by_id(active.alpaca_entry_order_id)
-            for leg in getattr(entry_order, "legs", None) or []:
-                leg_type = getattr(leg, "order_type", None) or getattr(leg, "type", None)
-                leg_type_str = str(leg_type).lower()
-                if "stop" in leg_type_str and "trail" not in leg_type_str:
-                    stop_id = str(leg.id)
-                elif "limit" in leg_type_str:
-                    target_id = str(leg.id)
-        except Exception:
-            logger.exception(
-                "Could not fetch bracket legs for %s (trade_id=%d)",
-                active.ticker, trade_id,
-            )
+        stop_id: str | None = await self._place_standalone_stop(
+            trade_id, active, filled_qty,
+        )
 
-        if stop_id is not None:
-            active.alpaca_stop_order_id = stop_id
-            self._update_position_field(trade_id, "alpaca_stop_order_id", stop_id)
-        if target_id is not None:
-            active.alpaca_target_order_id = target_id
-            self._update_position_field(trade_id, "alpaca_target_order_id", target_id)
-
-        if stop_id is not None and target_id is not None:
-            active.status = PositionStatus.STOP_AND_TARGET_ACTIVE
-            self._update_position_status(trade_id, PositionStatus.STOP_AND_TARGET_ACTIVE)
-            logger.info(
-                "Bracket legs active for %s (trade_id=%d): stop=%s, target=%s",
-                active.ticker, trade_id, stop_id, target_id,
-            )
-        elif stop_id is None:
+        if stop_id is None:
+            # Stop-attach failure leaves the position unprotected. Recovery:
+            # emergency_flatten + notify, then collapse local + DB state to a
+            # terminal status so the next stateless cron tick does not
+            # re-evaluate a ghost POSITION_OPEN row that has no broker-side
+            # stop. Reusing ENTRY_FAILED (rather than CLOSED) is a small
+            # semantic stretch — the entry did fill — but it is the only
+            # terminal state hydration treats as "do not load," matching the
+            # in-memory invariant. A trade_entry notification would be
+            # actively misleading for a position that was just force-flattened
+            # so we suppress it.
             logger.error(
-                "CRITICAL: No stop-loss leg found for %s (trade_id=%d). Emergency flattening.",
+                "CRITICAL: Failed to attach standalone stop for %s "
+                "(trade_id=%d). Emergency flattening.",
                 active.ticker, trade_id,
             )
             await self.emergency_flatten(active.ticker, filled_qty, active.exchange)
+            await self._notifier.send(
+                "Stop Attach Failed",
+                f"Could not attach protective stop for {active.ticker} "
+                f"(qty={filled_qty:.6f}). Position emergency-flattened. "
+                f"Investigate Alpaca order rejections.",
+                priority=4,
+                tags=["warning"],
+            )
+            active.status = PositionStatus.ENTRY_FAILED
+            self._update_position_status(trade_id, PositionStatus.ENTRY_FAILED)
+            self._active_orders.pop(trade_id, None)
+            return
+
+        active.alpaca_stop_order_id = stop_id
+        self._update_position_field(trade_id, "alpaca_stop_order_id", stop_id)
+        # Status name retained for back-compat with downstream readers (DB
+        # rows, dashboards, postmortem queries — 45 references across the
+        # tree). Under this entry path only the stop is broker-side; take-
+        # profit is polled in main.check_exits via target_price. Renaming is
+        # tracked as a post-launch follow-up.
+        active.status = PositionStatus.STOP_AND_TARGET_ACTIVE
+        self._update_position_status(trade_id, PositionStatus.STOP_AND_TARGET_ACTIVE)
+        logger.info(
+            "Protective stop active for %s (trade_id=%d): stop_id=%s @ %.4f",
+            active.ticker, trade_id, stop_id, active.stop_price,
+        )
 
         await self._notifier.trade_entry(
             ticker=active.ticker,
@@ -929,6 +932,37 @@ class OrderManager:
             qty=filled_qty,
             reason=f"Phase {self._config.get_phase().value} | {active.hold_type}",
         )
+
+    async def _place_standalone_stop(
+        self, trade_id: int, active: _ActiveOrder, qty: float,
+    ) -> str | None:
+        """Submit a standalone sell-stop order. Returns Alpaca order id or None.
+
+        Catches all exceptions so the caller can choose the recovery path
+        (emergency flatten + notification) without unwinding the transaction.
+        """
+        if active.stop_price <= 0:
+            logger.error(
+                "Refusing to attach stop with non-positive stop_price=%.4f for %s",
+                active.stop_price, active.ticker,
+            )
+            return None
+        try:
+            request = StopOrderRequest(
+                symbol=active.ticker,
+                qty=qty,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.GTC,
+                stop_price=round(active.stop_price, 2),
+            )
+            order: AlpacaOrder = self._gw.client.submit_order(order_data=request)
+            return str(order.id)
+        except Exception:
+            logger.exception(
+                "Standalone stop submit failed for %s (trade_id=%d, qty=%s, stop=%.4f)",
+                active.ticker, trade_id, qty, active.stop_price,
+            )
+            return None
 
     async def activate_trailing_stop(self, trade_id: int, trail_pct: float) -> bool:
         """Activate trailing stop, replacing the take-profit order."""

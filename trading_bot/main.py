@@ -862,14 +862,19 @@ class TradingBot:
                 else:
                     self._clear_spread_defer(ticker)
 
-            qty: int = int(position.get("quantity", 0))
-            if qty <= 0:
+            # Float-typed: positions.quantity may be fractional (mean_reversion
+            # and overnight_drift run with fractional_shares=true under the
+            # ai-broker#39 plain-limit + standalone-stop entry path). int()
+            # would silently truncate 0.43 → 0 and skip every sub-1-share exit,
+            # leaving fractional positions unmanaged.
+            qty: float = float(position.get("quantity", 0))
+            if qty <= 0.0:
                 logger.warning("%s: exit triggered but qty=0 — skipping", ticker)
                 continue
 
             if self._dry_run:
                 logger.info(
-                    "[DRY RUN] Would exit: SELL %d %s @ %.4f (reason=%s)",
+                    "[DRY RUN] Would exit: SELL %.6f %s @ %.4f (reason=%s)",
                     qty, ticker, current_price, exit_decision.reason,
                 )
                 continue
@@ -1009,19 +1014,21 @@ class TradingBot:
             if ticker_market is not None and ticker_market != market:
                 continue
 
-            qty: int = int(position.get("quantity", 0))
-            if qty <= 0:
+            # Float-typed: positions.quantity may be fractional. See note in
+            # check_exits — int() truncation skips sub-1-share holdings.
+            qty: float = float(position.get("quantity", 0))
+            if qty <= 0.0:
                 continue
 
             logger.info(
-                "Wind-down: closing intraday %s (%d shares) for %s market",
+                "Wind-down: closing intraday %s (%.6f shares) for %s market",
                 ticker, qty, market.value,
             )
 
             if self._dry_run:
                 current_price: float | None = self._market_data.get_latest_price(ticker)
                 logger.info(
-                    "[DRY RUN] Would wind-down: SELL %d %s @ %.4f",
+                    "[DRY RUN] Would wind-down: SELL %.6f %s @ %.4f",
                     qty, ticker, current_price or 0.0,
                 )
                 continue
