@@ -146,6 +146,61 @@ class TestEntryFill:
         mock_notifier.trade_entry.assert_awaited()
 
     @pytest.mark.asyncio
+    async def test_fractional_fill_uses_day_tif_for_stop(
+        self, config, tmp_db_path: str, mock_notifier
+    ):
+        """Regression: 2026-05-04 incident.
+
+        Alpaca rejects stop orders on fractional positions with TIF != DAY
+        (error 42210000). Without this guard, every fractional entry hit
+        the failure path → emergency_flatten → orphan drain on next tick,
+        wiping today's strategy attribution.
+        """
+        from alpaca.trading.enums import TimeInForce
+        from alpaca.trading.requests import StopOrderRequest
+        from trading_bot.execution.order_manager import EntryDecision
+
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        captured: list = []
+
+        def _submit(order_data):
+            captured.append(order_data)
+            return _alpaca_order(f"order-{len(captured)}", "new")
+
+        om._gw.client.submit_order = MagicMock(side_effect=_submit)
+
+        # Fractional qty mirrors today's XLY entry: 4.2067 shares.
+        decision = EntryDecision(
+            ticker="XLY", exchange="US", side="BUY",
+            shares=4.2067, limit_price=117.67,
+            stop_price=115.90, target_price=120.0,
+            hold_type="intraday", sector="Consumer Discretionary",
+            phase=3, sentiment_score=0.0, signals="test",
+            currency="USD", strategy_id="mean_reversion",
+            trail_pct=None, trail_activation_price=None,
+        )
+        trade_id = await om.place_entry(decision)
+
+        filled = _alpaca_order(
+            "order-1", "filled", filled_qty=4.2067, filled_avg_price=117.67,
+        )
+        om._gw.client.get_order_by_id = MagicMock(
+            side_effect=lambda oid: filled if oid == "order-1" else _alpaca_order(oid, "new"),
+        )
+
+        await om._check_order_statuses()
+
+        # Stop order was submitted with DAY TIF, not GTC.
+        stop_req = captured[1]
+        assert isinstance(stop_req, StopOrderRequest)
+        assert stop_req.time_in_force == TimeInForce.DAY, (
+            "fractional stop must use DAY TIF (Alpaca rejects GTC for "
+            "fractional with error 42210000)"
+        )
+        active = om._active_orders[trade_id]
+        assert active.status == PositionStatus.STOP_AND_TARGET_ACTIVE
+
+    @pytest.mark.asyncio
     async def test_stop_attach_failure_triggers_emergency_flatten(
         self, config, tmp_db_path: str, mock_notifier
     ):
