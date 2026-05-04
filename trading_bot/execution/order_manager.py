@@ -37,6 +37,7 @@ from trading_bot.constants import (
     PositionStatus,
 )
 from trading_bot.db import repository as repo
+from trading_bot.gateway.order_tif import tif_for_market, tif_for_stop
 
 if TYPE_CHECKING:
     from trading_bot.config import Config
@@ -587,7 +588,7 @@ class OrderManager:
                 symbol=ticker,
                 qty=qty,
                 side=OrderSide.SELL,
-                time_in_force=TimeInForce.GTC,
+                time_in_force=tif_for_stop(qty),
                 trail_percent=round(trail_pct * 100, 2),
             )
             order: AlpacaOrder = await asyncio.to_thread(
@@ -657,7 +658,7 @@ class OrderManager:
                 qty=qty,
                 side=OrderSide.SELL,
                 type=OrderType.MARKET,
-                time_in_force=TimeInForce.IOC,
+                time_in_force=tif_for_market(qty),
             )
             order: AlpacaOrder = await asyncio.to_thread(
                 client.submit_order, order_data=request,
@@ -1032,7 +1033,7 @@ class OrderManager:
                 symbol=active.ticker,
                 qty=qty,
                 side=OrderSide.SELL,
-                time_in_force=TimeInForce.GTC,
+                time_in_force=tif_for_stop(qty),
                 stop_price=round(active.stop_price, 2),
             )
             order: AlpacaOrder = await asyncio.to_thread(

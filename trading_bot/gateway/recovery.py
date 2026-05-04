@@ -261,7 +261,9 @@ class StateRecovery:
     ) -> None:
         """Place a stop-loss order for a position that has no stop."""
         from alpaca.trading.requests import StopOrderRequest
-        from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
+        from alpaca.trading.enums import OrderSide, OrderType
+
+        from trading_bot.gateway.order_tif import tif_for_stop
 
         avg_cost: float = float(pos.avg_entry_price or 0)
         # Float qty: Alpaca holds fractional positions (1/1e6 increments).
@@ -289,7 +291,7 @@ class StateRecovery:
                 qty=order_qty,
                 side=side,
                 type=OrderType.STOP,
-                time_in_force=TimeInForce.GTC,
+                time_in_force=tif_for_stop(order_qty),
                 stop_price=stop_price,
             )
             # Alpaca SDK is sync — offload to a worker thread so we don't
