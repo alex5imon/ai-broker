@@ -157,7 +157,12 @@ class TestStateRecovery:
         conn.close()
 
         gw = self._make_gateway(positions=[])
-        recovery = _make_recovery(gw, tmp_db_path, mock_notifier)
+        # Pin the clock 1 hour in the future so PLTR's just-inserted
+        # entry_time is far outside the fresh-entry grace window.
+        recovery = _make_recovery(
+            gw, tmp_db_path, mock_notifier,
+            now=datetime.now(ET) + timedelta(hours=1),
+        )
         result = await recovery.recover()
         assert "PLTR" in result.positions_closed_mismatch
 
@@ -167,6 +172,71 @@ class TestStateRecovery:
         ).fetchone()
         conn.close()
         assert row[0] == "CLOSED"
+
+    @pytest.mark.asyncio
+    async def test_db_position_not_in_alpaca_deferred_when_entry_fresh(
+        self, tmp_db_path: str, mock_notifier
+    ) -> None:
+        """Live bug observed 2026-05-06: bot opens MSFT at 09:55 ET, the
+        next 10:00 tick's reconciler fires before Alpaca's positions
+        endpoint reflects the fill, and the row is closed as
+        reconciliation_mismatch with NULL exit data — phantom round-trip.
+
+        Fix: positions whose entry_time is within the configured grace
+        window must be deferred, not closed. The next tick (outside the
+        window) will either see the position on Alpaca or close it for
+        real if it never appeared.
+        """
+        conn = sqlite3.connect(tmp_db_path)
+        _insert_db_position(conn, "MSFT")  # entry_time = now
+        conn.close()
+
+        gw = self._make_gateway(positions=[])
+        # 5 minutes after entry — well within the 10-min default grace.
+        recovery = _make_recovery(
+            gw, tmp_db_path, mock_notifier,
+            now=datetime.now(ET) + timedelta(minutes=5),
+        )
+        result = await recovery.recover()
+
+        assert "MSFT" in result.positions_deferred_fresh, (
+            "fresh entry must be deferred, not silently closed"
+        )
+        assert "MSFT" not in result.positions_closed_mismatch
+
+        conn = sqlite3.connect(tmp_db_path)
+        row = conn.execute(
+            "SELECT status FROM positions WHERE ticker='MSFT'"
+        ).fetchone()
+        conn.close()
+        assert row[0] == "POSITION_OPEN", (
+            "deferred row must remain POSITION_OPEN — closing it would "
+            "create the same phantom round-trip the fix is preventing."
+        )
+
+    @pytest.mark.asyncio
+    async def test_db_position_grace_window_overridable_via_config(
+        self, tmp_db_path: str, mock_notifier
+    ) -> None:
+        """Setting recovery.fresh_entry_grace_minutes to 0 disables the
+        defer (covers the regression-tightening case where an operator
+        wants the original behavior back temporarily)."""
+        conn = sqlite3.connect(tmp_db_path)
+        _insert_db_position(conn, "PLTR")
+        conn.close()
+
+        gw = self._make_gateway(positions=[])
+        recovery = _make_recovery(
+            gw, tmp_db_path, mock_notifier,
+            now=datetime.now(ET) + timedelta(minutes=2),
+            config={
+                "exit_intraday": {"stop_loss_pct": 0.02},
+                "recovery": {"fresh_entry_grace_minutes": 0},
+            },
+        )
+        result = await recovery.recover()
+        assert "PLTR" in result.positions_closed_mismatch
+        assert "PLTR" not in result.positions_deferred_fresh
 
     @pytest.mark.asyncio
     async def test_quantity_mismatch_updated(

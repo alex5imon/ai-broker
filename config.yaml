@@ -381,6 +381,18 @@ exit_intraday:
   eod_flatten_time_et: "15:55"    # ET cutoff: flatten intraday-tagged positions
 
 # -----------------------------------------------------------------------------
+# State recovery / reconciliation
+# -----------------------------------------------------------------------------
+recovery:
+  # Don't close DB-only positions whose entry_time is younger than this.
+  # Alpaca's positions endpoint can lag a fresh fill by several minutes,
+  # so a brand-new entry can briefly look DB-only and trip the mismatch
+  # branch — writing a phantom round-trip with NULL exit data. The next
+  # tick (outside the grace window) will close it for real if it never
+  # appeared.
+  fresh_entry_grace_minutes: 10
+
+# -----------------------------------------------------------------------------
 # Exit Parameters - Swing
 # -----------------------------------------------------------------------------
 exit_swing:

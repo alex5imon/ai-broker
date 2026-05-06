@@ -29,6 +29,11 @@ ET: ZoneInfo = TZ_EASTERN
 # Default thresholds — overridable via config.
 _DEFAULT_STALE_ENTRY_MINUTES: int = 5
 _DEFAULT_EOD_FLATTEN_TIME: str = "15:55"
+# Don't close DB-only positions whose entry_time is younger than this.
+# Alpaca's positions endpoint can lag a fresh fill by several minutes,
+# so a brand-new entry can briefly look DB-only and trip the mismatch
+# branch. Override via config.recovery.fresh_entry_grace_minutes.
+_DEFAULT_FRESH_ENTRY_GRACE_MINUTES: int = 10
 
 
 @dataclass
@@ -41,6 +46,7 @@ class RecoveryResult:
 
     positions_created: list[str] = field(default_factory=list)
     positions_closed_mismatch: list[str] = field(default_factory=list)
+    positions_deferred_fresh: list[str] = field(default_factory=list)
     quantities_updated: list[str] = field(default_factory=list)
     stops_placed: list[str] = field(default_factory=list)
     stale_orders_cancelled: list[str] = field(default_factory=list)
@@ -72,6 +78,11 @@ class RecoveryResult:
             lines.append(f"Created DB records for broker-only positions: {', '.join(self.positions_created)}")
         if self.positions_closed_mismatch:
             lines.append(f"Closed DB-only positions (mismatch): {', '.join(self.positions_closed_mismatch)}")
+        if self.positions_deferred_fresh:
+            lines.append(
+                f"Deferred fresh DB-only positions (Alpaca lag): "
+                f"{', '.join(self.positions_deferred_fresh)}"
+            )
         if self.quantities_updated:
             lines.append(f"Updated quantities: {', '.join(self.quantities_updated)}")
         if self.stops_placed:
@@ -219,14 +230,44 @@ class StateRecovery:
                     self._update_db_quantity(db_row["id"], alpaca_qty)
                     result.quantities_updated.append(ticker)
 
+        recovery_cfg: dict[str, Any] = self._config.get("recovery", {}) or {}
+        grace_minutes: int = int(
+            recovery_cfg.get(
+                "fresh_entry_grace_minutes",
+                _DEFAULT_FRESH_ENTRY_GRACE_MINUTES,
+            )
+        )
+        now: datetime = self._now_fn()
+
         for ticker, db_row in db_by_ticker.items():
-            if ticker not in alpaca_by_ticker:
+            if ticker in alpaca_by_ticker:
+                continue
+            entry_age_min: float | None = _entry_age_minutes(
+                db_row.get("entry_time"), now,
+            )
+            if (
+                entry_age_min is not None
+                and entry_age_min < float(grace_minutes)
+            ):
+                # Fresh entry: Alpaca's positions endpoint can lag a fill
+                # by several minutes. Closing here would write a phantom
+                # exit for a position that very likely just opened. Defer
+                # — the next tick will either see it on Alpaca or close
+                # it once it's outside the grace window.
                 logger.warning(
-                    "DB has position %s not in Alpaca - marking CLOSED",
-                    ticker,
+                    "DB has position %s (entry %.1f min ago) not yet on "
+                    "Alpaca — within %d-min fresh-entry grace, deferring "
+                    "close",
+                    ticker, entry_age_min, grace_minutes,
                 )
-                self._close_db_position(db_row["id"], "reconciliation_mismatch")
-                result.positions_closed_mismatch.append(ticker)
+                result.positions_deferred_fresh.append(ticker)
+                continue
+            logger.warning(
+                "DB has position %s not in Alpaca - marking CLOSED",
+                ticker,
+            )
+            self._close_db_position(db_row["id"], "reconciliation_mismatch")
+            result.positions_closed_mismatch.append(ticker)
 
     async def _verify_stop_orders(
         self,
@@ -655,3 +696,19 @@ def _to_et(value: Any) -> datetime | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=ZoneInfo("UTC"))
     return dt.astimezone(ET)
+
+
+def _entry_age_minutes(entry_time: Any, now: datetime) -> float | None:
+    """Minutes elapsed since ``entry_time``, or None if unparseable.
+
+    Used by the fresh-entry grace check in ``_reconcile``: a position
+    whose entry_time is recent enough may not have shown up on Alpaca's
+    positions endpoint yet, so the mismatch branch should defer rather
+    than close it.
+    """
+    et_dt = _to_et(entry_time)
+    if et_dt is None:
+        return None
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=ET)
+    return (now - et_dt).total_seconds() / 60.0
