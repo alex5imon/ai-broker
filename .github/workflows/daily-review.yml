@@ -70,6 +70,25 @@ jobs:
           echo "report_date=${REPORT_DATE}" >> "$GITHUB_OUTPUT"
           echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
 
+      - name: Backfill exit fills from Alpaca
+        # The live close path leaves exit_price/net_pnl NULL on
+        # reconciliation_mismatch rows so the postmortem cannot see realized
+        # P&L. Running backfill before the agent ensures it sees real fills,
+        # not phantom round-trips. The script is idempotent (skips rows
+        # already marked with the backfill: notes prefix).
+        env:
+          ALPACA_ENV: ${{ vars.ALPACA_ENV || 'paper' }}
+          ALPACA_PAPER_KEY_ID: ${{ secrets.ALPACA_PAPER_KEY_ID }}
+          ALPACA_PAPER_SECRET: ${{ secrets.ALPACA_PAPER_SECRET }}
+          ALPACA_LIVE_KEY_ID: ${{ secrets.ALPACA_LIVE_KEY_ID }}
+          ALPACA_LIVE_SECRET: ${{ secrets.ALPACA_LIVE_SECRET }}
+          BOT_LOG_DIR: logs
+        # Continue on error: a failed backfill should not block the report.
+        # Worst case the postmortem sees the same blank rows it would have
+        # seen pre-fix.
+        continue-on-error: true
+        run: python -m trading_bot.self_improve.backfill_cli
+
       - name: Run self-improvement agent
         env:
           ALPACA_ENV: ${{ vars.ALPACA_ENV || 'paper' }}

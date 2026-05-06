@@ -963,6 +963,23 @@ class OrderManager:
         )
 
         if stop_id is None:
+            # The submit may have actually reached the broker — alpaca-py
+            # response parsing can raise after Alpaca accepted the order.
+            # Before emergency-flattening (which is itself fragile and has
+            # been observed to silently fail on the same SDK paths), check
+            # whether a matching stop is already live at Alpaca and adopt it.
+            recovered_stop_id = await self._find_existing_stop(
+                active.ticker, filled_qty,
+            )
+            if recovered_stop_id is not None:
+                logger.warning(
+                    "Recovered stop attach for %s after submit-response loss: "
+                    "alpaca_id=%s (trade_id=%d). Adopting existing broker order.",
+                    active.ticker, recovered_stop_id, trade_id,
+                )
+                stop_id = recovered_stop_id
+
+        if stop_id is None:
             # Stop-attach failure leaves the position unprotected. Recovery:
             # emergency_flatten + notify, then collapse local + DB state to a
             # terminal status so the next stateless cron tick does not
@@ -1046,6 +1063,56 @@ class OrderManager:
                 active.ticker, trade_id, qty, active.stop_price,
             )
             return None
+
+    async def _find_existing_stop(
+        self, ticker: str, qty: float,
+    ) -> str | None:
+        """Look up an open SELL stop on ``ticker`` matching ``qty`` at Alpaca.
+
+        Used by ``_transition_to_open`` to recover from a submit-response
+        loss: alpaca-py occasionally raises during response parsing after
+        the order has actually been accepted by the broker, so the bot
+        thinks the stop placement failed when it succeeded. Adopting the
+        live order is preferable to emergency-flattening a real position.
+        Returns the matching order id or None.
+        """
+        try:
+            from alpaca.trading.enums import QueryOrderStatus
+            request = GetOrdersRequest(
+                status=QueryOrderStatus.OPEN,
+                symbols=[ticker],
+            )
+            orders: list[AlpacaOrder] = await asyncio.to_thread(
+                self._gw.client.get_orders, filter=request,
+            )
+        except Exception:
+            logger.warning(
+                "Could not query open orders for %s during stop recovery",
+                ticker, exc_info=True,
+            )
+            return None
+
+        for order in orders:
+            order_type_obj = getattr(order, "order_type", None) or getattr(
+                order, "type", None,
+            )
+            order_type_str: str = (
+                getattr(order_type_obj, "value", "") if order_type_obj is not None else ""
+            ).lower()
+            side_obj = getattr(order, "side", None)
+            side_str: str = (
+                getattr(side_obj, "value", "") if side_obj is not None else ""
+            ).lower()
+            try:
+                order_qty: float = float(getattr(order, "qty", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if order_type_str != "stop" or side_str != "sell":
+                continue
+            if abs(order_qty - qty) > 1e-6:
+                continue
+            return str(order.id)
+        return None
 
     async def activate_trailing_stop(self, trade_id: int, trail_pct: float) -> bool:
         """Activate trailing stop, replacing the take-profit order."""

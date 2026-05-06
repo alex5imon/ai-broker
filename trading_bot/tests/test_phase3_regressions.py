@@ -431,3 +431,203 @@ class TestB5_UpdatePositionFieldLogsRowsAffected:
             "0-row UPDATE must log loud — that's the silent-failure mode "
             "the live bot was hiding."
         )
+
+
+# ---------------------------------------------------------------------------
+# B6 — _transition_to_open recovers from a stop-attach response loss
+# ---------------------------------------------------------------------------
+
+
+def _alpaca_open_stop(
+    *,
+    order_id: str = "stop-rec-1",
+    symbol: str = "SPY",
+    qty: float = 10.0,
+    side: str = "sell",
+    order_type: str = "stop",
+):
+    """Mock an open Alpaca order shaped like get_orders(status=OPEN) returns."""
+    o = MagicMock()
+    o.id = order_id
+    o.symbol = symbol
+    o.qty = qty
+    o.side = MagicMock()
+    o.side.value = side
+    o.order_type = MagicMock()
+    o.order_type.value = order_type
+    return o
+
+
+class TestB6_TransitionToOpenRecoversFromStopAttachResponseLoss:
+    """Live bug observed 2026-04-29 → 2026-05-05: _place_standalone_stop
+    occasionally returned None even though the stop order had actually
+    been accepted by Alpaca (alpaca-py response parsing raised after the
+    order was submitted). _transition_to_open then emergency-flattened —
+    which itself failed on the same SDK paths — leaving 7 real positions
+    stamped ENTRY_FAILED in the DB while still live at the broker.
+
+    The fix queries Alpaca for an open SELL stop matching the ticker and
+    qty before assuming submission failed; if found, the order is adopted
+    and the position transitions to STOP_AND_TARGET_ACTIVE normally.
+    """
+
+    @pytest.mark.asyncio
+    async def test_recovers_when_matching_stop_exists_at_alpaca(
+        self, config, tmp_db_path: str, mock_notifier
+    ):
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        decision = _entry()
+        # Seed an _ActiveOrder as if the entry had just filled.
+        trade_id = om._create_position_record(decision)
+        active = _ActiveOrder(
+            trade_id=trade_id,
+            ticker=decision.ticker,
+            exchange=decision.exchange,
+            alpaca_entry_order_id="entry-1",
+            status=PositionStatus.ENTRY_PENDING,
+            entry_shares=float(decision.shares),
+            filled_shares=float(decision.shares),
+            entry_price=decision.limit_price,
+            stop_price=decision.stop_price,
+            target_price=decision.target_price,
+            hold_type=decision.hold_type,
+            strategy_id=decision.strategy_id,
+        )
+        om._active_orders[trade_id] = active
+
+        # Force the submit-response loss path: _place_standalone_stop returns
+        # None even though Alpaca actually has the stop. The recovery query
+        # finds the matching open SELL stop.
+        async def _fail_stop_submit(*args, **kwargs):
+            return None
+        om._place_standalone_stop = _fail_stop_submit  # type: ignore[assignment]
+        recovered = _alpaca_open_stop(
+            order_id="recovered-stop",
+            symbol=decision.ticker,
+            qty=float(decision.shares),
+        )
+        om._gw.client.get_orders = MagicMock(return_value=[recovered])
+
+        await om._transition_to_open(trade_id, float(decision.shares))
+
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            row = conn.execute(
+                "SELECT status, alpaca_stop_order_id "
+                "FROM positions WHERE id = ?", (trade_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None
+        assert row[0] == PositionStatus.STOP_AND_TARGET_ACTIVE.value, (
+            "Recovery must adopt the live broker stop and proceed to the "
+            "normal active-stop status — not stamp ENTRY_FAILED."
+        )
+        assert row[1] == "recovered-stop"
+
+    @pytest.mark.asyncio
+    async def test_falls_through_to_entry_failed_when_no_matching_stop_exists(
+        self, config, tmp_db_path: str, mock_notifier
+    ):
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        decision = _entry()
+        trade_id = om._create_position_record(decision)
+        active = _ActiveOrder(
+            trade_id=trade_id,
+            ticker=decision.ticker,
+            exchange=decision.exchange,
+            alpaca_entry_order_id="entry-1",
+            status=PositionStatus.ENTRY_PENDING,
+            entry_shares=float(decision.shares),
+            filled_shares=float(decision.shares),
+            entry_price=decision.limit_price,
+            stop_price=decision.stop_price,
+            target_price=decision.target_price,
+            hold_type=decision.hold_type,
+            strategy_id=decision.strategy_id,
+        )
+        om._active_orders[trade_id] = active
+
+        async def _fail_stop_submit(*args, **kwargs):
+            return None
+        om._place_standalone_stop = _fail_stop_submit  # type: ignore[assignment]
+        # No matching stop on the broker — recovery returns nothing.
+        om._gw.client.get_orders = MagicMock(return_value=[])
+        # Emergency flatten path needs a working market submit_order so the
+        # emergency_flatten exception swallow doesn't mask a real bug.
+        om._gw.client.submit_order = MagicMock(return_value=_alpaca_order())
+
+        await om._transition_to_open(trade_id, float(decision.shares))
+
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            row = conn.execute(
+                "SELECT status FROM positions WHERE id = ?", (trade_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row[0] == PositionStatus.ENTRY_FAILED.value, (
+            "When no broker-side stop exists, the original ENTRY_FAILED "
+            "+ emergency_flatten path must still fire — recovery is for "
+            "response loss only, not a real submission failure."
+        )
+
+    @pytest.mark.asyncio
+    async def test_recovery_ignores_non_matching_orders(
+        self, config, tmp_db_path: str, mock_notifier
+    ):
+        """A stop with a different qty or a BUY-side order must not be
+        adopted as the protective stop — that would attach a wrong-sized
+        or wrong-direction order to the position."""
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        decision = _entry(shares=10)
+        trade_id = om._create_position_record(decision)
+        active = _ActiveOrder(
+            trade_id=trade_id,
+            ticker=decision.ticker,
+            exchange=decision.exchange,
+            alpaca_entry_order_id="entry-1",
+            status=PositionStatus.ENTRY_PENDING,
+            entry_shares=10.0,
+            filled_shares=10.0,
+            entry_price=decision.limit_price,
+            stop_price=decision.stop_price,
+            target_price=decision.target_price,
+            hold_type=decision.hold_type,
+            strategy_id=decision.strategy_id,
+        )
+        om._active_orders[trade_id] = active
+
+        async def _fail_stop_submit(*args, **kwargs):
+            return None
+        om._place_standalone_stop = _fail_stop_submit  # type: ignore[assignment]
+        wrong_qty = _alpaca_open_stop(
+            order_id="wrong-qty", symbol=decision.ticker, qty=5.0,
+        )
+        wrong_side = _alpaca_open_stop(
+            order_id="wrong-side", symbol=decision.ticker, qty=10.0, side="buy",
+        )
+        wrong_type = _alpaca_open_stop(
+            order_id="wrong-type", symbol=decision.ticker, qty=10.0,
+            order_type="limit",
+        )
+        om._gw.client.get_orders = MagicMock(
+            return_value=[wrong_qty, wrong_side, wrong_type],
+        )
+        om._gw.client.submit_order = MagicMock(return_value=_alpaca_order())
+
+        await om._transition_to_open(trade_id, 10.0)
+
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            row = conn.execute(
+                "SELECT status, alpaca_stop_order_id "
+                "FROM positions WHERE id = ?", (trade_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row[0] == PositionStatus.ENTRY_FAILED.value
+        assert row[1] is None or row[1] == "", (
+            "No order matches qty+side+type — must NOT adopt any of the "
+            "non-matching open orders."
+        )
