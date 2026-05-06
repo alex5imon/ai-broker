@@ -9,7 +9,11 @@ on:
 
 concurrency:
   group: bot-run
-  cancel-in-progress: false
+  # Ticks are stateless (state is restored from cache each run), so it is
+  # safe to supersede an in-flight run with a newer one. This prevents a
+  # wedged run (e.g. hosted-runner shortage) from blocking the queue and
+  # turning subsequent dispatches into cancellations.
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -17,7 +21,9 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    # Real per-tick work takes seconds; capping below the 5-min cron interval
+    # ensures one stuck run cannot block more than a single subsequent tick.
+    timeout-minutes: 4
     steps:
       - uses: actions/checkout@v5
 

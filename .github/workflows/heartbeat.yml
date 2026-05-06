@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 3
     env:
       GH_TOKEN: ${{ github.token }}
-      STALE_MINUTES: "20"
+      STALE_MINUTES: "12"
       BOT_WORKFLOW: "bot.yml"
     steps:
       - name: Check last successful bot run
