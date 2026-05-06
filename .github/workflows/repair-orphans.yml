@@ -1,0 +1,88 @@
+name: repair-orphans
+
+# On-demand cleanup for the orphan-position drift introduced by the
+# stop-attach-response-loss bug fixed in PR #64. Restores the cached
+# bot DB, runs trading_bot.self_improve.repair_orphans, then writes
+# the DB back to the same cache prefix the bot reads from on the next
+# scheduled tick. Manual trigger only — never auto-runs.
+#
+# Use the workflow_dispatch dry_run input to preview without writing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (log changes without writing)"
+        type: boolean
+        default: true
+
+# Same group as the bot so a real bot tick can't trample our DB write
+# and vice versa. Don't cancel-in-progress: a half-finished repair
+# leaves the cache in an inconsistent state.
+concurrency:
+  group: bot-run
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Restore SQLite DB
+        # Same key pattern bot.yml uses — restore-keys falls back to the
+        # most recent bot-db-* artifact, and our save below uses the same
+        # prefix so the next bot tick picks our DB up.
+        uses: actions/cache@v5
+        with:
+          path: trading_bot/data/trading_bot.db*
+          key: bot-db-${{ github.run_id }}
+          restore-keys: |
+            bot-db-
+
+      - name: Run repair (dry-run=${{ inputs.dry_run }})
+        env:
+          ALPACA_ENV: ${{ vars.ALPACA_ENV || 'paper' }}
+          ALPACA_PAPER_KEY_ID: ${{ secrets.ALPACA_PAPER_KEY_ID }}
+          ALPACA_PAPER_SECRET: ${{ secrets.ALPACA_PAPER_SECRET }}
+          ALPACA_LIVE_KEY_ID: ${{ secrets.ALPACA_LIVE_KEY_ID }}
+          ALPACA_LIVE_SECRET: ${{ secrets.ALPACA_LIVE_SECRET }}
+          BOT_LOG_DIR: logs
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            python -m trading_bot.self_improve.repair_orphans --dry-run
+          else
+            python -m trading_bot.self_improve.repair_orphans
+          fi
+
+      - name: Upload SQLite DB artifact
+        # Uploaded regardless so the run is auditable.
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: repair-db-${{ github.run_id }}
+          path: trading_bot/data/trading_bot.db*
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: repair-logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 30
+          if-no-files-found: ignore
