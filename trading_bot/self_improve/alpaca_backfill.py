@@ -231,10 +231,64 @@ def insert_backfilled_trade(
     position: ClosedPositionRow,
     exit_fill: ExitFill,
 ) -> None:
-    """Write a complete trades row, idempotent via the notes marker."""
+    """Write or repair a backfilled trades row.
+
+    Two paths, in order:
+
+    1. If a reconciliation_mismatch row already exists for this position
+       (same ticker, same entry_time, NULL exit_price), UPDATE that row in
+       place — fills the missing exit_price/pnl/exit_reason and stamps the
+       backfill notes marker so the candidate query skips it next time.
+       This is the common path: ``StateRecovery._close_db_position``
+       writes the row with NULL exit data, and the backfill repairs it.
+
+    2. Otherwise INSERT a fresh row. Covers older positions that predate
+       the recovery-write path, or any case where the reconciler row is
+       missing for some reason. Idempotent via the same notes marker.
+
+    Avoiding the duplicate INSERT lets ``daily_summaries`` see the real
+    pnl_usd and stops the trades table from growing a phantom row per
+    position per night.
+    """
     gross_pnl = (exit_fill.filled_avg_price - position.entry_price) * position.quantity
     exit_reason = _infer_exit_reason(exit_fill.order_id, position)
     note = f"{BACKFILL_MARKER_PREFIX}{position.position_id}"
+    entry_time_str = position.entry_time.strftime("%Y-%m-%d %H:%M:%S")
+    exit_time_str = exit_fill.filled_at.strftime("%Y-%m-%d %H:%M:%S")
+
+    # Match the reconciliation_mismatch row by (ticker, entry_time prefix,
+    # exit_reason='reconciliation_mismatch', null exit_price). Entry-time
+    # comparison uses a substring match because the live writer stamps a
+    # tz-aware ISO string while we built ours via strftime — exact equality
+    # would never match. The seconds-precision substring is precise enough
+    # to disambiguate (a strategy doesn't open two positions on the same
+    # ticker in the same second).
+    existing = conn.execute(
+        """
+        SELECT id FROM trades
+         WHERE ticker = ?
+           AND substr(entry_time, 1, 19) = ?
+           AND exit_reason = 'reconciliation_mismatch'
+           AND exit_price IS NULL
+         ORDER BY id DESC LIMIT 1
+        """,
+        (position.ticker, entry_time_str),
+    ).fetchone()
+
+    if existing is not None:
+        conn.execute(
+            """
+            UPDATE trades
+               SET exit_time = ?, exit_price = ?, exit_reason = ?,
+                   gross_pnl = ?, net_pnl = ?, pnl_usd = ?, notes = ?
+             WHERE id = ?
+            """,
+            (
+                exit_time_str, exit_fill.filled_avg_price, exit_reason,
+                gross_pnl, gross_pnl, gross_pnl, note, int(existing[0]),
+            ),
+        )
+        return
 
     conn.execute(
         """
@@ -253,9 +307,9 @@ def insert_backfilled_trade(
         """,
         (
             position.ticker, position.exchange, position.currency,
-            position.entry_time.strftime("%Y-%m-%d %H:%M:%S"),
+            entry_time_str,
             position.entry_price, position.quantity,
-            exit_fill.filled_at.strftime("%Y-%m-%d %H:%M:%S"),
+            exit_time_str,
             exit_fill.filled_avg_price, exit_reason,
             gross_pnl, gross_pnl, gross_pnl,
             position.hold_type, position.phase, position.strategy_id, note,
