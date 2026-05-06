@@ -176,6 +176,142 @@ def test_insert_writes_complete_row(tmp_db):
     assert row[5] == f"{BACKFILL_MARKER_PREFIX}1"
 
 
+@pytest.mark.unit
+def test_backfill_updates_existing_reconciliation_mismatch_row(tmp_db):
+    """Live bug: StateRecovery._close_db_position writes a trades row
+    with NULL exit_price and exit_reason='reconciliation_mismatch'.
+    Pre-fix backfill INSERTed a separate row, leaving daily_summaries
+    blind to the actual P&L (it can't tell which of the two duplicates
+    is the truth) and bloating the table by one row per close per night.
+
+    The repair must UPDATE the existing reconciliation_mismatch row,
+    not insert.
+    """
+    p = _make_position(stop_id="alp-stop")
+    # Seed the reconciliation_mismatch row that StateRecovery writes.
+    tmp_db.execute(
+        """
+        INSERT INTO trades (
+            ticker, exchange, currency, side,
+            entry_time, entry_price, quantity,
+            exit_time, exit_reason,
+            hold_type, phase, strategy_id, notes
+        ) VALUES ('SPY', 'NYSE', 'USD', 'BUY',
+                  '2026-04-01 15:45:00', 100.0, 10,
+                  '2026-04-02 09:00:00', 'reconciliation_mismatch',
+                  'swing', 1, 'overnight_drift', 'placeholder')
+        """,
+    )
+    tmp_db.commit()
+
+    fill = ExitFill(
+        order_id="alp-stop",
+        filled_at=datetime(2026, 4, 2, 9, 31, tzinfo=timezone.utc),
+        filled_avg_price=98.0,
+        filled_qty=10.0,
+    )
+    insert_backfilled_trade(tmp_db, p, fill)
+    tmp_db.commit()
+
+    rows = tmp_db.execute(
+        "SELECT id, exit_reason, exit_price, pnl_usd, notes FROM trades "
+        "WHERE ticker='SPY' ORDER BY id"
+    ).fetchall()
+    assert len(rows) == 1, (
+        "backfill must UPDATE the existing reconciliation_mismatch row, "
+        "not insert a duplicate."
+    )
+    row = rows[0]
+    assert row[1] == "stop_loss", "exit_reason rewritten with the real one"
+    assert row[2] == pytest.approx(98.0)
+    assert row[3] == pytest.approx((98.0 - 100.0) * 10)
+    assert row[4] == f"{BACKFILL_MARKER_PREFIX}1", (
+        "notes carries the backfill marker so load_candidates skips next time"
+    )
+
+
+@pytest.mark.unit
+def test_backfill_inserts_when_no_reconciliation_row_present(tmp_db):
+    """Older closed positions that predate the recovery-write path don't
+    have a reconciliation_mismatch row to update — INSERT remains the
+    correct fallback."""
+    p = _make_position(stop_id="alp-stop")
+    fill = ExitFill(
+        order_id="alp-stop",
+        filled_at=datetime(2026, 4, 2, 9, 31, tzinfo=timezone.utc),
+        filled_avg_price=98.0,
+        filled_qty=10.0,
+    )
+    insert_backfilled_trade(tmp_db, p, fill)
+    tmp_db.commit()
+
+    rows = tmp_db.execute(
+        "SELECT exit_price, notes FROM trades WHERE ticker='SPY'"
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == pytest.approx(98.0)
+    assert rows[0][1] == f"{BACKFILL_MARKER_PREFIX}1"
+
+
+@pytest.mark.unit
+def test_backfill_only_updates_matching_entry_time(tmp_db):
+    """Two closes on the same ticker on different days must not collide:
+    the UPDATE keys on entry_time and only modifies the matching row."""
+    p1 = _make_position(
+        position_id=1, stop_id="alp-stop-1",
+    )
+    # Different position, different entry_time
+    other_position = ClosedPositionRow(
+        position_id=2, ticker="SPY", exchange="NYSE", currency="USD",
+        strategy_id="overnight_drift", quantity=10, entry_price=110.0,
+        entry_time=datetime(2026, 5, 5, 15, 45, tzinfo=timezone.utc),
+        hold_type="swing", phase=1,
+        alpaca_order_id="alp-entry-2", alpaca_stop_order_id="alp-stop-2",
+        alpaca_target_order_id=None, alpaca_trail_order_id=None,
+    )
+
+    # Seed two reconciliation_mismatch rows, one per day.
+    for entry_time, ep in [
+        ("2026-04-01 15:45:00", 100.0),
+        ("2026-05-05 15:45:00", 110.0),
+    ]:
+        tmp_db.execute(
+            """
+            INSERT INTO trades (
+                ticker, exchange, currency, side,
+                entry_time, entry_price, quantity,
+                exit_time, exit_reason,
+                hold_type, phase, strategy_id
+            ) VALUES ('SPY', 'NYSE', 'USD', 'BUY',
+                      ?, ?, 10,
+                      '2026-05-06 09:00:00', 'reconciliation_mismatch',
+                      'swing', 1, 'overnight_drift')
+            """,
+            (entry_time, ep),
+        )
+    tmp_db.commit()
+
+    insert_backfilled_trade(tmp_db, p1, ExitFill(
+        order_id="alp-stop-1",
+        filled_at=datetime(2026, 4, 2, 9, 31, tzinfo=timezone.utc),
+        filled_avg_price=98.0, filled_qty=10.0,
+    ))
+    tmp_db.commit()
+
+    rows = tmp_db.execute(
+        "SELECT entry_time, exit_price, pnl_usd FROM trades "
+        "WHERE ticker='SPY' ORDER BY entry_time"
+    ).fetchall()
+    assert len(rows) == 2
+    # The April row got its exit price filled in.
+    assert rows[0][1] == pytest.approx(98.0)
+    # The May row stays untouched.
+    assert rows[1][1] is None, (
+        "the day-2 reconciliation_mismatch row must not be modified by "
+        "the day-1 backfill — entry_time disambiguates them."
+    )
+
+
 # ---------------------------------------------------------------------------
 # backfill (orchestrator with stubbed fill finder)
 # ---------------------------------------------------------------------------

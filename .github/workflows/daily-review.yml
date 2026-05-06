@@ -89,6 +89,16 @@ jobs:
         continue-on-error: true
         run: python -m trading_bot.self_improve.backfill_cli
 
+      - name: Recompute daily_summaries from backfilled trades
+        # The live wind-down writes daily_summaries ~16:10 ET, before this
+        # backfill runs at 21:30 UTC. Without a recompute, daily_summaries
+        # rows stay frozen with wins=0/losses=0/net_pnl=0 even after the
+        # trades are backfilled. Idempotent (INSERT OR REPLACE).
+        env:
+          BOT_LOG_DIR: logs
+        continue-on-error: true
+        run: python -m trading_bot.self_improve.recompute_daily_summaries --days 14
+
       - name: Run self-improvement agent
         env:
           ALPACA_ENV: ${{ vars.ALPACA_ENV || 'paper' }}
