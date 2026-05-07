@@ -1714,6 +1714,240 @@ class TestSameDayReentryDedup:
 
 
 # ---------------------------------------------------------------------------
+# Cross-strategy Alpaca collision guard
+# ---------------------------------------------------------------------------
+
+
+class TestCrossStrategyAlpacaCollision:
+    """Block BUYs that would wash-trade against another sleeve's stop.
+
+    Alpaca rejects a BUY with code 40310000 ("potential wash trade
+    detected. use complex orders") when an opposite-side stop already
+    rests on the same ticker. The 2026-05-07 19:45 UTC overnight_drift
+    tick hit this twice (SPY + QQQ already held by mean_reversion).
+    The same-strategy ``get_open_positions`` guard misses the case
+    because portfolios are scoped per-strategy_id; the live broker
+    state is the source of truth.
+    """
+
+    def _alpaca_pos(self, symbol: str, qty: str = "1.0") -> Any:
+        pos = MagicMock()
+        pos.symbol = symbol
+        pos.qty = qty
+        return pos
+
+    @pytest.mark.asyncio
+    async def test_skips_when_alpaca_holds_ticker_under_other_strategy(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        fake_5min,
+        fake_daily,
+        tmp_db_path,
+    ):
+        # This strategy's in-memory portfolio is empty (it doesn't think
+        # it holds SPY) — but Alpaca says SPY is held (parked there by
+        # another sleeve's earlier entry).
+        base_order_manager._gw.get_positions = AsyncMock(
+            return_value=[self._alpaca_pos("SPY", "1.0")],
+        )
+
+        sm = StrategyManager(
+            strategies=[_StubStrategy(decision=_make_decision())],
+            portfolio_manager=base_portfolio_manager,
+            market_data=base_market_data,
+            order_manager=base_order_manager,
+            risk_manager=base_risk_manager,
+            sentiment=base_sentiment,
+            earnings=base_earnings,
+            config=base_config,
+            db_path=tmp_db_path,
+        )
+
+        n = await sm.scan_for_entries(
+            watchlist=["SPY"],
+            get_5min_bars=fake_5min,
+            get_daily_bars=fake_daily,
+            account_equity_usd=1000.0,
+        )
+        assert n == 0
+        base_order_manager.place_entry.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_allows_when_alpaca_holds_unrelated_ticker(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        fake_5min,
+        fake_daily,
+        tmp_db_path,
+    ):
+        # Alpaca holds QQQ (unrelated to candidate); SPY scan must proceed.
+        base_order_manager._gw.get_positions = AsyncMock(
+            return_value=[self._alpaca_pos("QQQ", "1.0")],
+        )
+
+        sm = StrategyManager(
+            strategies=[_StubStrategy(decision=_make_decision())],
+            portfolio_manager=base_portfolio_manager,
+            market_data=base_market_data,
+            order_manager=base_order_manager,
+            risk_manager=base_risk_manager,
+            sentiment=base_sentiment,
+            earnings=base_earnings,
+            config=base_config,
+            db_path=tmp_db_path,
+        )
+
+        n = await sm.scan_for_entries(
+            watchlist=["SPY"],
+            get_5min_bars=fake_5min,
+            get_daily_bars=fake_daily,
+            account_equity_usd=1000.0,
+        )
+        assert n == 1
+        base_order_manager.place_entry.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_zero_qty_position_does_not_block(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        fake_5min,
+        fake_daily,
+        tmp_db_path,
+    ):
+        # A freshly-closed position can linger in get_positions() with
+        # qty="0" before the broker prunes it. Must NOT trigger a false
+        # block — the wash-trade rejection only applies to non-zero
+        # holdings with resting opposite-side stops.
+        base_order_manager._gw.get_positions = AsyncMock(
+            return_value=[self._alpaca_pos("SPY", "0")],
+        )
+
+        sm = StrategyManager(
+            strategies=[_StubStrategy(decision=_make_decision())],
+            portfolio_manager=base_portfolio_manager,
+            market_data=base_market_data,
+            order_manager=base_order_manager,
+            risk_manager=base_risk_manager,
+            sentiment=base_sentiment,
+            earnings=base_earnings,
+            config=base_config,
+            db_path=tmp_db_path,
+        )
+
+        n = await sm.scan_for_entries(
+            watchlist=["SPY"],
+            get_5min_bars=fake_5min,
+            get_daily_bars=fake_daily,
+            account_equity_usd=1000.0,
+        )
+        assert n == 1
+        base_order_manager.place_entry.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_short_position_blocks_entry(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        fake_5min,
+        fake_daily,
+        tmp_db_path,
+    ):
+        # Alpaca holds SPY short (qty="-1.0"). A long BUY would still
+        # be rejected as a wash trade against the resting buy-to-cover
+        # stop, so the guard must block here too — same severity as
+        # the long-side collision.
+        base_order_manager._gw.get_positions = AsyncMock(
+            return_value=[self._alpaca_pos("SPY", "-1.0")],
+        )
+
+        sm = StrategyManager(
+            strategies=[_StubStrategy(decision=_make_decision())],
+            portfolio_manager=base_portfolio_manager,
+            market_data=base_market_data,
+            order_manager=base_order_manager,
+            risk_manager=base_risk_manager,
+            sentiment=base_sentiment,
+            earnings=base_earnings,
+            config=base_config,
+            db_path=tmp_db_path,
+        )
+
+        n = await sm.scan_for_entries(
+            watchlist=["SPY"],
+            get_5min_bars=fake_5min,
+            get_daily_bars=fake_daily,
+            account_equity_usd=1000.0,
+        )
+        assert n == 0
+        base_order_manager.place_entry.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_alpaca_lookup_failure_fails_open(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        fake_5min,
+        fake_daily,
+        tmp_db_path,
+    ):
+        # If get_positions blows up (transient API error), we must NOT
+        # block the entire scan — same fail-open posture used everywhere
+        # else for advisory broker lookups (regime filter, sentiment).
+        base_order_manager._gw.get_positions = AsyncMock(
+            side_effect=RuntimeError("alpaca 503"),
+        )
+
+        sm = StrategyManager(
+            strategies=[_StubStrategy(decision=_make_decision())],
+            portfolio_manager=base_portfolio_manager,
+            market_data=base_market_data,
+            order_manager=base_order_manager,
+            risk_manager=base_risk_manager,
+            sentiment=base_sentiment,
+            earnings=base_earnings,
+            config=base_config,
+            db_path=tmp_db_path,
+        )
+
+        n = await sm.scan_for_entries(
+            watchlist=["SPY"],
+            get_5min_bars=fake_5min,
+            get_daily_bars=fake_daily,
+            account_equity_usd=1000.0,
+        )
+        assert n == 1
+        base_order_manager.place_entry.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
 # check_exits
 # ---------------------------------------------------------------------------
 
