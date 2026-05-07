@@ -363,6 +363,36 @@ class TestStatePersistence:
     commission-stop circuits. See risk_infrastructure_gaps.md item 1.
     """
 
+    def test_first_session_writes_sentinel_row(
+        self, config: Config, tmp_db_path: str, mock_notifier
+    ) -> None:
+        """First session against a fresh DB must stamp the
+        ``risk_manager:global`` row even when no breaker has tripped.
+
+        Without this the row is "write-only-on-fault" — external
+        monitoring can't tell PR #79's persistence path is wired
+        until something actually goes wrong. Discovered 2026-05-07
+        evening: PR #79 shipped mid-day, end-of-day DB had no row.
+        """
+        import sqlite3
+
+        from trading_bot.db.repository import load_risk_state
+
+        # Fresh RiskManager against a brand-new (no risk_manager:global
+        # row yet) DB.
+        RiskManager(config, tmp_db_path, mock_notifier)
+
+        with sqlite3.connect(tmp_db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = load_risk_state(conn, "risk_manager:global")
+
+        assert row is not None, (
+            "first-session bootstrap must write the sentinel row so "
+            "the persistence path is verifiable before any breaker fires"
+        )
+        # Default state — nothing tripped.
+        assert row["tripped"] is False
+
     def test_pause_survives_new_instance(
         self, config: Config, tmp_db_path: str, mock_notifier
     ) -> None:

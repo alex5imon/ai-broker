@@ -141,6 +141,15 @@ class RiskManager:
         self._hydrate_recent_rejections()
 
         if state_row is None:
+            # First-session bootstrap: stamp the sentinel row so the
+            # ``risk_manager:global`` key is present in the table from
+            # tick #1, before any breaker has had a chance to fire.
+            # Without this the row is "write-only-on-fault" — external
+            # monitoring (and post-deploy verification) can't tell the
+            # persistence path is wired correctly until a breaker
+            # actually trips. 2026-05-07 evening discovery: shipped
+            # PR #79 mid-day, end-of-day DB still had no row.
+            self._persist_state()
             return
 
         blob: dict[str, Any] = state_row.get("state") or {}
