@@ -6,9 +6,9 @@ through a single deterministic tick without hitting Alpaca."""
 
 from __future__ import annotations
 
-from datetime import date, datetime
-from unittest.mock import AsyncMock, MagicMock, patch
-from zoneinfo import ZoneInfo
+from datetime import date
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -34,7 +34,11 @@ def trading_bot(config, tmp_db_path, monkeypatch):
     """
     monkeypatch.setenv("ALPACA_API_KEY", "test")
     monkeypatch.setenv("ALPACA_SECRET_KEY", "test")
-    config._raw["db"] = {"path": tmp_db_path}
+    # Mutate the existing `database.path` key — `Config.db_path` reads
+    # `_raw["database"]["path"]`. Earlier code wrote `_raw["db"]` (wrong
+    # key) so the bot silently used the persistent dev DB and tests
+    # leaked state into each other.
+    config._raw["database"]["path"] = tmp_db_path
 
     bot = TradingBot(config, mode="normal", dry_run=False)
 
@@ -267,6 +271,126 @@ async def test_pre_market_scan_swallows_refresh_errors(trading_bot):
     await trading_bot.pre_market_scan(Market.US)
 
 
+@pytest.mark.asyncio
+async def test_failed_pre_market_scan_does_not_latch_done_flag(trading_bot):
+    """Regression: a failed pre-market scan must NOT latch
+    ``pre_market_done=True`` — otherwise every subsequent tick today
+    would skip the retry and the watchlist would be frozen with
+    whatever stale state existed when the scan blew up.
+
+    Item 6 of risk_infrastructure_gaps.md: the flag write was sitting
+    after the try/except and ran unconditionally, including when the
+    scan raised. Now it lives inside the try and only fires on success.
+
+    Tracks flag state via ``_save_day_flags`` patches rather than
+    re-reading the DB — keeps the assertion focused on whether the
+    flag was *written* in this tick, regardless of any prior state.
+    """
+    trading_bot._config.is_trading_day = MagicMock(return_value=True)
+    _open_hours(trading_bot)
+    trading_bot._is_market_in_premarket = MagicMock(return_value=True)
+    trading_bot._is_market_in_execution = MagicMock(return_value=False)
+    trading_bot._is_market_in_winddown = MagicMock(return_value=False)
+    # Force-clear any prior flag state so the pre-market branch runs
+    # (otherwise the fixture's persistent DB short-circuits us).
+    trading_bot._load_day_flags = MagicMock(return_value={})
+    saved_flags_failed: list[dict[str, Any]] = []
+    trading_bot._save_day_flags = MagicMock(
+        side_effect=lambda _today, flags: saved_flags_failed.append(dict(flags)),
+    )
+    # Pre-market scan blows up.
+    trading_bot.pre_market_scan = AsyncMock(side_effect=RuntimeError("scan boom"))
+
+    await trading_bot.tick()
+
+    # No save in the try block means saved_flags carries only writes
+    # from the after-close handlers — and none of them should contain
+    # ``pre_market_done=True`` because nothing in this tick set it.
+    # Check for the dangerous state — `pre_market_done == True` saved
+    # to disk — rather than the looser "key absent" form. A future
+    # refactor that pre-initialises `flags["pre_market_done"] = False`
+    # before saving would still be safe but would fail the looser test.
+    pre_market_writes = [
+        f for f in saved_flags_failed if f.get("pre_market_done") is True
+    ]
+    assert pre_market_writes == [], (
+        f"Failed scan latched pre_market_done: {pre_market_writes}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_successful_pre_market_scan_latches_done_flag(trading_bot):
+    """Sanity: the happy path still latches the flag so we don't
+    re-run the scan every 5-min tick for the rest of the day."""
+    trading_bot._config.is_trading_day = MagicMock(return_value=True)
+    _open_hours(trading_bot)
+    trading_bot._is_market_in_premarket = MagicMock(return_value=True)
+    trading_bot._is_market_in_execution = MagicMock(return_value=False)
+    trading_bot._is_market_in_winddown = MagicMock(return_value=False)
+    trading_bot._load_day_flags = MagicMock(return_value={})
+    saved_flags_ok: list[dict[str, Any]] = []
+    trading_bot._save_day_flags = MagicMock(
+        side_effect=lambda _today, flags: saved_flags_ok.append(dict(flags)),
+    )
+    trading_bot.pre_market_scan = AsyncMock(return_value=None)
+
+    await trading_bot.tick()
+
+    pre_market_writes = [f for f in saved_flags_ok if f.get("pre_market_done")]
+    assert pre_market_writes, "Successful scan must latch pre_market_done"
+
+
+@pytest.mark.asyncio
+async def test_failed_wind_down_does_not_latch_done_flag(trading_bot):
+    """Sibling of item 6: a failed `wind_down` must NOT latch
+    `wind_down_done=True`. Latching on failure is dangerous here —
+    wind-down closes intraday positions before the close, and a
+    permanently-suppressed retry leaves them open overnight.
+    """
+    trading_bot._config.is_trading_day = MagicMock(return_value=True)
+    _open_hours(trading_bot)
+    trading_bot._is_market_in_premarket = MagicMock(return_value=False)
+    trading_bot._is_market_in_execution = MagicMock(return_value=False)
+    trading_bot._is_market_in_winddown = MagicMock(return_value=True)
+    trading_bot._load_day_flags = MagicMock(return_value={})
+    saved_flags_failed: list[dict[str, Any]] = []
+    trading_bot._save_day_flags = MagicMock(
+        side_effect=lambda _today, flags: saved_flags_failed.append(dict(flags)),
+    )
+    trading_bot.wind_down = AsyncMock(side_effect=RuntimeError("flatten failed"))
+
+    await trading_bot.tick()
+
+    wind_down_writes = [
+        f for f in saved_flags_failed if f.get("wind_down_done") is True
+    ]
+    assert wind_down_writes == [], (
+        f"Failed wind-down latched wind_down_done: {wind_down_writes}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_successful_wind_down_latches_done_flag(trading_bot):
+    """Happy path: successful wind-down latches the flag so we don't
+    re-flatten on every tick in the wind-down window."""
+    trading_bot._config.is_trading_day = MagicMock(return_value=True)
+    _open_hours(trading_bot)
+    trading_bot._is_market_in_premarket = MagicMock(return_value=False)
+    trading_bot._is_market_in_execution = MagicMock(return_value=False)
+    trading_bot._is_market_in_winddown = MagicMock(return_value=True)
+    trading_bot._load_day_flags = MagicMock(return_value={})
+    saved_flags_ok: list[dict[str, Any]] = []
+    trading_bot._save_day_flags = MagicMock(
+        side_effect=lambda _today, flags: saved_flags_ok.append(dict(flags)),
+    )
+    trading_bot.wind_down = AsyncMock(return_value=None)
+
+    await trading_bot.tick()
+
+    wind_down_writes = [f for f in saved_flags_ok if f.get("wind_down_done")]
+    assert wind_down_writes, "Successful wind-down must latch wind_down_done"
+
+
 # ---------------------------------------------------------------------------
 # Day-flag persistence
 # ---------------------------------------------------------------------------
@@ -320,7 +444,7 @@ def test_parse_time_helper():
 def test_dry_run_flag_propagates_to_strategy_manager(config, tmp_db_path, monkeypatch):
     monkeypatch.setenv("ALPACA_API_KEY", "test")
     monkeypatch.setenv("ALPACA_SECRET_KEY", "test")
-    config._raw["db"] = {"path": tmp_db_path}
+    config._raw["database"]["path"] = tmp_db_path
     bot = TradingBot(config, mode="normal", dry_run=True)
     if bot._strategy_manager is not None:
         assert bot._strategy_manager._dry_run is True
@@ -329,6 +453,6 @@ def test_dry_run_flag_propagates_to_strategy_manager(config, tmp_db_path, monkey
 def test_construct_with_close_only_mode(config, tmp_db_path, monkeypatch):
     monkeypatch.setenv("ALPACA_API_KEY", "test")
     monkeypatch.setenv("ALPACA_SECRET_KEY", "test")
-    config._raw["db"] = {"path": tmp_db_path}
+    config._raw["database"]["path"] = tmp_db_path
     bot = TradingBot(config, mode="close-only", dry_run=False)
     assert bot._mode == "close-only"

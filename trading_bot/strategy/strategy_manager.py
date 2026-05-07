@@ -65,6 +65,14 @@ def _is_alpaca_position_not_found(exc: Any) -> bool:
     return False
 
 
+# After this many consecutive failures of the same-day-attempt DB lookup,
+# `_already_attempted_today` flips from fail-open (allow entry, transient
+# SQLite lock) to fail-closed (skip entry). DB corruption is exactly when
+# in-memory portfolio state is also stale, so allowing every ticker would
+# repeat the 2026-04-29 over-firing incident the lookup was added to fix.
+_DB_ERROR_FAIL_CLOSED_THRESHOLD: int = 3
+
+
 VerdictType = Literal["OK", "NOT_HELD", "OPPOSITE_SIDE", "UNKNOWN"]
 
 
@@ -122,6 +130,9 @@ class StrategyManager:
         self._dry_run: bool = dry_run
         self._regime_filter: RegimeFilter | None = regime_filter
         self._loss_cooldown: LossCooldownTracker | None = loss_cooldown
+        # Consecutive `_already_attempted_today` DB failures this session.
+        # Reset on any success. See `_DB_ERROR_FAIL_CLOSED_THRESHOLD`.
+        self._db_error_streak: int = 0
 
     @property
     def strategies(self) -> list[StrategyBase]:
@@ -282,6 +293,12 @@ class StrategyManager:
                 # doesn't see them — so the next 5-min tick re-fires the
                 # same order. Cross-check the DB for any same-day attempt
                 # (open OR closed) by this strategy on this ticker.
+                #
+                # The internal DB-error streak counter is session-global
+                # across all (ticker, strategy_id) pairs in this scan —
+                # intentional: once the DB is hard-down for this cron
+                # invocation, we want to block all remaining entries, not
+                # re-tolerate transient errors per ticker.
                 if self._already_attempted_today(ticker, strategy.strategy_id):
                     logger.debug(
                         "[%s] %s already attempted today — skipping",
@@ -798,12 +815,24 @@ class StrategyManager:
     # ------------------------------------------------------------------
 
     def _already_attempted_today(self, ticker: str, strategy_id: str) -> bool:
-        """Persistent same-day-attempt check (any status, any tick)."""
+        """Persistent same-day-attempt check (any status, any tick).
+
+        Tiered failure handling:
+        - Single transient errors (SQLite locked by an artifact-cache
+          backup, etc.) fail OPEN (return ``False``, allow the entry) so
+          a brief race doesn't block legitimate trades. The in-memory
+          portfolio dedup and broker-side rejections still cover us.
+        - After ``_DB_ERROR_FAIL_CLOSED_THRESHOLD`` consecutive failures
+          we flip to fail CLOSED (return ``True``, skip the entry). DB
+          corruption is exactly when in-memory portfolio state is also
+          stale, so allowing every ticker through would repeat the
+          2026-04-29 over-firing incident this lookup was built to stop.
+        """
         et_today: str = datetime.now(tz=ET).date().isoformat()
         try:
             conn: sqlite3.Connection = sqlite3.connect(self._db_path)
             try:
-                return repo.has_attempted_today(
+                result: bool = repo.has_attempted_today(
                     conn,
                     ticker=ticker,
                     strategy_id=strategy_id,
@@ -812,13 +841,26 @@ class StrategyManager:
             finally:
                 conn.close()
         except Exception:
-            # On DB error, fail OPEN (allow entry) — we have other guards
-            # (in-memory portfolio dedup above, broker-side rejections).
+            self._db_error_streak += 1
+            if self._db_error_streak >= _DB_ERROR_FAIL_CLOSED_THRESHOLD:
+                logger.error(
+                    "Same-day attempt lookup failed %d×: failing CLOSED "
+                    "for %s/%s (skipping entry until DB recovers)",
+                    self._db_error_streak, strategy_id, ticker,
+                    exc_info=True,
+                )
+                return True
             logger.warning(
-                "Same-day attempt lookup failed for %s/%s — proceeding",
-                strategy_id, ticker, exc_info=True,
+                "Same-day attempt lookup failed for %s/%s — proceeding "
+                "(streak=%d/%d)",
+                strategy_id, ticker,
+                self._db_error_streak, _DB_ERROR_FAIL_CLOSED_THRESHOLD,
+                exc_info=True,
             )
             return False
+        # Success — reset the streak.
+        self._db_error_streak = 0
+        return result
 
     def _fomc_size_multiplier(self) -> float:
         """Lookup today's FOMC multiplier from config (defaults to 1.0).
