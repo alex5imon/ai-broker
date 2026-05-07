@@ -371,6 +371,97 @@ class TestEntryTimeout:
         om._gw.client.cancel_order_by_id.assert_called()
 
 
+class TestUninitiatedEntrySweep:
+    """ENTRY_PENDING rows with alpaca_order_id IS NULL (crash between
+    INSERT and submit_order) — the timeout sweep at line 257 requires a
+    non-NULL order id, so without an explicit sweep these rows sit forever
+    occupying a position slot. See risk_infrastructure_gaps.md item 4.
+    """
+
+    @pytest.mark.asyncio
+    async def test_aged_pending_with_null_order_id_marked_entry_failed(
+        self, config, tmp_db_path: str, mock_notifier
+    ):
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        # Pre-populate a ghost row directly: status=ENTRY_PENDING, no
+        # alpaca_order_id, entry_time well past the timeout window.
+        old_iso: str = (
+            datetime.now(tz=ET) - timedelta(seconds=3600)
+        ).isoformat()
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            conn.execute(
+                "INSERT INTO positions (ticker, exchange, currency, "
+                "quantity, entry_price, stop_price, target_price, "
+                "status, hold_type, phase, strategy_id, entry_time, "
+                "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "GHOST", "US", "USD", 100, 10.0, 9.8, 10.4,
+                    PositionStatus.ENTRY_PENDING.value, "intraday", 1,
+                    "mean_reversion", old_iso, old_iso,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # No Alpaca calls should be needed — the row has no order id.
+        om._gw.client.get_order_by_id = MagicMock()
+
+        await om._check_order_statuses()
+
+        # Row is now ENTRY_FAILED in the DB and not in _active_orders.
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            row = conn.execute(
+                "SELECT status FROM positions WHERE ticker = 'GHOST'"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row[0] == PositionStatus.ENTRY_FAILED.value
+        # Should not have queried Alpaca for an order it never had.
+        om._gw.client.get_order_by_id.assert_not_called()
+        assert all(a.ticker != "GHOST" for a in om._active_orders.values())
+
+    @pytest.mark.asyncio
+    async def test_recent_pending_with_null_order_id_left_alone(
+        self, config, tmp_db_path: str, mock_notifier
+    ):
+        """A row with NULL order id but entry_time within the timeout
+        window must NOT be marked ENTRY_FAILED — the submit could still
+        be in flight (concurrent tick, slow Alpaca round trip).
+        """
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        recent_iso: str = datetime.now(tz=ET).isoformat()
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            conn.execute(
+                "INSERT INTO positions (ticker, exchange, currency, "
+                "quantity, entry_price, stop_price, target_price, "
+                "status, hold_type, phase, strategy_id, entry_time, "
+                "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "FRESH", "US", "USD", 100, 10.0, 9.8, 10.4,
+                    PositionStatus.ENTRY_PENDING.value, "intraday", 1,
+                    "mean_reversion", recent_iso, recent_iso,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        await om._check_order_statuses()
+
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            row = conn.execute(
+                "SELECT status FROM positions WHERE ticker = 'FRESH'"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row[0] == PositionStatus.ENTRY_PENDING.value
+
+
 # ---------------------------------------------------------------------------
 # Exit fill detection
 # ---------------------------------------------------------------------------
