@@ -606,6 +606,14 @@ class StrategyManager:
         Returns ``frozenset()`` (empty, not ``None``) when Alpaca reports
         no positions; the empty case still means "we know there's no
         collision" and should be treated as a clean signal.
+
+        Note: ``GatewayConnection.get_positions`` already swallows
+        broker-side exceptions and returns ``[]``, so the empty-set
+        path is what fires in practice during a transient API error.
+        The ``try/except`` here is defense in depth in case the
+        gateway contract ever changes — keeps fail-open semantics
+        owned at this call site rather than silently relying on the
+        transport layer's behaviour.
         """
         try:
             positions = await self._order_manager._gw.get_positions()
@@ -627,7 +635,10 @@ class StrategyManager:
                 qty = float(qty_raw) if qty_raw is not None else 0.0
             except (TypeError, ValueError):
                 continue
-            if qty != 0.0:
+            # Use a small epsilon rather than ``!= 0.0`` so a freshly
+            # closed position lingering with a near-zero string qty
+            # ("0.0", "0E-9", etc.) doesn't falsely block entries.
+            if abs(qty) > 1e-9:
                 held.add(symbol)
         return frozenset(held)
 

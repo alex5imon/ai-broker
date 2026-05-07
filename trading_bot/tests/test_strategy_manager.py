@@ -1819,6 +1819,92 @@ class TestCrossStrategyAlpacaCollision:
         base_order_manager.place_entry.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_zero_qty_position_does_not_block(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        fake_5min,
+        fake_daily,
+        tmp_db_path,
+    ):
+        # A freshly-closed position can linger in get_positions() with
+        # qty="0" before the broker prunes it. Must NOT trigger a false
+        # block — the wash-trade rejection only applies to non-zero
+        # holdings with resting opposite-side stops.
+        base_order_manager._gw.get_positions = AsyncMock(
+            return_value=[self._alpaca_pos("SPY", "0")],
+        )
+
+        sm = StrategyManager(
+            strategies=[_StubStrategy(decision=_make_decision())],
+            portfolio_manager=base_portfolio_manager,
+            market_data=base_market_data,
+            order_manager=base_order_manager,
+            risk_manager=base_risk_manager,
+            sentiment=base_sentiment,
+            earnings=base_earnings,
+            config=base_config,
+            db_path=tmp_db_path,
+        )
+
+        n = await sm.scan_for_entries(
+            watchlist=["SPY"],
+            get_5min_bars=fake_5min,
+            get_daily_bars=fake_daily,
+            account_equity_usd=1000.0,
+        )
+        assert n == 1
+        base_order_manager.place_entry.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_short_position_blocks_entry(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        fake_5min,
+        fake_daily,
+        tmp_db_path,
+    ):
+        # Alpaca holds SPY short (qty="-1.0"). A long BUY would still
+        # be rejected as a wash trade against the resting buy-to-cover
+        # stop, so the guard must block here too — same severity as
+        # the long-side collision.
+        base_order_manager._gw.get_positions = AsyncMock(
+            return_value=[self._alpaca_pos("SPY", "-1.0")],
+        )
+
+        sm = StrategyManager(
+            strategies=[_StubStrategy(decision=_make_decision())],
+            portfolio_manager=base_portfolio_manager,
+            market_data=base_market_data,
+            order_manager=base_order_manager,
+            risk_manager=base_risk_manager,
+            sentiment=base_sentiment,
+            earnings=base_earnings,
+            config=base_config,
+            db_path=tmp_db_path,
+        )
+
+        n = await sm.scan_for_entries(
+            watchlist=["SPY"],
+            get_5min_bars=fake_5min,
+            get_daily_bars=fake_daily,
+            account_equity_usd=1000.0,
+        )
+        assert n == 0
+        base_order_manager.place_entry.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_alpaca_lookup_failure_fails_open(
         self,
         base_market_data,
