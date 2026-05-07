@@ -7,7 +7,6 @@ suite — here we only test the A/B harness.
 
 from __future__ import annotations
 
-from typing import Any
 
 import pytest
 
@@ -17,7 +16,6 @@ from trading_bot.multi_strategy_backtest import (
     StrategyResult,
 )
 from trading_bot.self_improve.backtest_gate import (
-    BacktestComparison,
     StrategyMetrics,
     _judge,
     _mutate_config,

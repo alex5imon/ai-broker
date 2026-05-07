@@ -9,7 +9,6 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from trading_bot.strategy.base import ExitSignal, StrategyDecision
 from trading_bot.strategy.strategies.mean_reversion import MeanReversionStrategy
 from trading_bot.strategy.strategies.trend_following import TrendFollowingStrategy
 from trading_bot.strategy.strategies.breakout import BreakoutStrategy
@@ -477,7 +476,11 @@ class TestVirtualPortfolio:
 
     def test_idempotent_row_creation(self, tmp_db_path: str) -> None:
         vp1 = VirtualPortfolio("test_strat", "Test", 250.0, tmp_db_path)
-        vp2 = VirtualPortfolio("test_strat", "Test", 250.0, tmp_db_path)
+        # Constructing a second portfolio with the same strategy_id must
+        # not collide on the existing DB row. The instance itself is not
+        # asserted on — the test passes if construction returns without
+        # raising and vp1's state remains intact.
+        VirtualPortfolio("test_strat", "Test", 250.0, tmp_db_path)
         assert abs(vp1.current_cash - 250.0) < 0.01
 
 

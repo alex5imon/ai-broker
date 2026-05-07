@@ -269,16 +269,6 @@ def test_backfill_only_updates_matching_entry_time(tmp_db):
     p1 = _make_position(
         position_id=1, stop_id="alp-stop-1",
     )
-    # Different position, different entry_time. ET-aware to mirror
-    # production storage; see _make_position docstring.
-    other_position = ClosedPositionRow(
-        position_id=2, ticker="SPY", exchange="NYSE", currency="USD",
-        strategy_id="overnight_drift", quantity=10, entry_price=110.0,
-        entry_time=datetime(2026, 5, 5, 15, 45, tzinfo=TZ_EASTERN),
-        hold_type="swing", phase=1,
-        alpaca_order_id="alp-entry-2", alpaca_stop_order_id="alp-stop-2",
-        alpaca_target_order_id=None, alpaca_trail_order_id=None,
-    )
 
     # Seed two reconciliation_mismatch rows, one per day. Format matches
     # the live writer (ET-aware ISO).

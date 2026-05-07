@@ -42,8 +42,10 @@ def _alpaca_open_stop(*, order_id: str = "stop-1", symbol: str = "SPY",
     o.id = order_id
     o.symbol = symbol
     o.qty = qty
-    o.side = MagicMock(); o.side.value = side
-    o.order_type = MagicMock(); o.order_type.value = order_type
+    o.side = MagicMock()
+    o.side.value = side
+    o.order_type = MagicMock()
+    o.order_type.value = order_type
     return o
 
 

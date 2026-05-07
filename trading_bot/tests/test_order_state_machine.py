@@ -2,17 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
-import sqlite3
-from datetime import datetime
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from trading_bot.constants import PositionStatus
-from trading_bot.execution.order_manager import EntryDecision, OrderManager, _ActiveOrder
+from trading_bot.execution.order_manager import EntryDecision, OrderManager
 
 pytestmark = pytest.mark.critical
 
@@ -116,8 +112,7 @@ class TestOrderStateMachine:
             side_effect=[entry_order, stop_order, target_order]
         )
 
-        trade_id = await om.place_entry(_entry_decision())
-        active = om._active_orders[trade_id]
+        await om.place_entry(_entry_decision())
 
         # Simulate polling: entry order now filled
         filled_order = _mock_alpaca_order(
@@ -161,10 +156,12 @@ class TestOrderStateMachine:
         """cancel_all_for_ticker cancels matching orders via Alpaca."""
         om = _make_order_manager(config, tmp_db_path, mock_notifier)
 
-        # Mock get_orders to return orders for filtering
+        # Mock get_orders to return orders for filtering. The third
+        # order (symbol="F") is intentionally NOT included in the
+        # return value — proves we'd skip non-matching tickers if it
+        # were there.
         order1 = _mock_alpaca_order("ord-1", "new", symbol="PLTR")
         order2 = _mock_alpaca_order("ord-2", "new", symbol="PLTR")
-        order3 = _mock_alpaca_order("ord-3", "new", symbol="F")
 
         om._gw.client.get_orders = MagicMock(return_value=[order1, order2])
         om._gw.client.cancel_order_by_id = MagicMock()

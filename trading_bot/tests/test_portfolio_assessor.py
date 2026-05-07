@@ -18,7 +18,7 @@ from trading_bot.strategy.portfolio_assessor import PortfolioAssessor, PositionA
 
 def _make_assessor(
     config: Config,
-    
+
     mock_notifier,
     market_data: Any = None,
     sentiment: Any = None,

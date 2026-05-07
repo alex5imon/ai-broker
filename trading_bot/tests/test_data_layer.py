@@ -7,8 +7,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import date, datetime, timedelta
-from unittest.mock import MagicMock, patch
-from zoneinfo import ZoneInfo
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -104,8 +103,12 @@ async def test_unsubscribe_all_clears(mock_notifier, monkeypatch):
 @pytest.mark.asyncio
 async def test_refresh_quotes_updates_cache(mock_notifier, monkeypatch):
     md = _make_md(mock_notifier, monkeypatch)
-    spy_q = MagicMock(); spy_q.bid_price = 100.00; spy_q.ask_price = 100.10
-    qqq_q = MagicMock(); qqq_q.bid_price = 200.00; qqq_q.ask_price = 200.20
+    spy_q = MagicMock()
+    spy_q.bid_price = 100.00
+    spy_q.ask_price = 100.10
+    qqq_q = MagicMock()
+    qqq_q.bid_price = 200.00
+    qqq_q.ask_price = 200.20
     md._historical_client.get_stock_latest_quote = MagicMock(
         return_value={"SPY": spy_q, "QQQ": qqq_q}
     )
@@ -138,7 +141,9 @@ async def test_refresh_quotes_recovers_stale(mock_notifier, monkeypatch):
     md._subscriptions["SPY"] = MarketDataSubscription(
         ticker="SPY", exchange="US", is_stale=True, excluded=True,
     )
-    q = MagicMock(); q.bid_price = 100.0; q.ask_price = 100.10
+    q = MagicMock()
+    q.bid_price = 100.0
+    q.ask_price = 100.10
     md._historical_client.get_stock_latest_quote = MagicMock(return_value={"SPY": q})
     await md.refresh_quotes(["SPY"])
     assert md._subscriptions["SPY"].is_stale is False
@@ -238,8 +243,12 @@ def test_parse_duration_known_units(mock_notifier, monkeypatch):
 async def test_get_historical_bars_parses_response(mock_notifier, monkeypatch):
     md = _make_md(mock_notifier, monkeypatch)
     bar = MagicMock()
-    bar.open = 10.0; bar.high = 10.5; bar.low = 9.5; bar.close = 10.2
-    bar.volume = 100_000; bar.timestamp = datetime(2026, 1, 1, tzinfo=ET)
+    bar.open = 10.0
+    bar.high = 10.5
+    bar.low = 9.5
+    bar.close = 10.2
+    bar.volume = 100_000
+    bar.timestamp = datetime(2026, 1, 1, tzinfo=ET)
     response = MagicMock()
     response.data = {"SPY": [bar]}
     md._historical_client.get_stock_bars = MagicMock(return_value=response)

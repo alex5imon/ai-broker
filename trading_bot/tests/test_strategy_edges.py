@@ -8,7 +8,6 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from trading_bot.strategy.strategies.mean_reversion import MeanReversionStrategy
 from trading_bot.strategy.strategies.sentiment_combo import SentimentComboStrategy

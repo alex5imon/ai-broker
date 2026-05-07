@@ -5,9 +5,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import date, timedelta
 from typing import Any
-from unittest.mock import MagicMock
 
-import pytest
 
 from trading_bot.config import Config
 from trading_bot.constants import Phase

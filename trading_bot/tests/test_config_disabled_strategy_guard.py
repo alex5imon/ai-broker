@@ -164,10 +164,10 @@ def test_returns_empty_on_db_failure(tmp_path):
     bot's startup. The check is defensive; failure should be silent
     (with a warning log) rather than fatal."""
     cfg = _build_config({"mean_reversion": {"enabled": True}})
-    nonexistent = str(tmp_path / "nonexistent.db")
     # sqlite3.connect creates a file even for a nonexistent path, so
-    # we'd actually succeed. Force a real failure with a directory path.
-    bad_path = str(tmp_path)  # path is a directory → connect succeeds, query fails
+    # passing a missing file would actually succeed. Force a real
+    # failure with a directory path: connect succeeds, query fails.
+    bad_path = str(tmp_path)
     assert cfg.detect_disabled_strategy_orphans(bad_path) == []
 
 
