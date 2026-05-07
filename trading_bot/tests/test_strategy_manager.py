@@ -929,15 +929,34 @@ class TestDrainDisabledSleeves:
         base_order_manager.place_exit.assert_not_awaited()
 
         # DB row is now CLOSED so we don't retry on every subsequent tick.
+        # AND a matching trades row is written with exit_reason
+        # 'reconciliation_mismatch' and exit_price NULL so the nightly
+        # alpaca_backfill can find and repair it. Without this row the
+        # P&L for this position would be silently dropped from
+        # daily_summaries forever.
         conn = sqlite3.connect(tmp_db_path)
         try:
-            row = conn.execute(
+            pos_row = conn.execute(
                 "SELECT status FROM positions WHERE id = 99"
+            ).fetchone()
+            trade_row = conn.execute(
+                "SELECT exit_reason, exit_price, exit_time, ticker, "
+                "strategy_id FROM trades "
+                "WHERE ticker = 'SPY' AND exit_reason = 'reconciliation_mismatch' "
+                "AND exit_price IS NULL"
             ).fetchone()
         finally:
             conn.close()
-        assert row is not None
-        assert row[0] == "CLOSED"
+        assert pos_row is not None
+        assert pos_row[0] == "CLOSED"
+        assert trade_row is not None, (
+            "Drain NOT_HELD must write a trades row for backfill to repair"
+        )
+        assert trade_row[0] == "reconciliation_mismatch"
+        assert trade_row[1] is None
+        assert trade_row[2] is not None  # exit_time stamped
+        assert trade_row[3] == "SPY"
+        assert trade_row[4] == "breakout"
 
     @pytest.mark.asyncio
     async def test_drain_refuses_when_alpaca_holds_opposite_side(
