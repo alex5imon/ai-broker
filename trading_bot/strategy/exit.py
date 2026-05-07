@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from trading_bot.config import Config
 from trading_bot.constants import TZ_EASTERN, ExitReason, HoldType
+from trading_bot.data.holiday_calendar import HolidayCalendar
 from trading_bot.data.market_data import MarketDataManager
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -68,6 +69,16 @@ class ExitManager:
         self._spread_recheck_s: int = int(
             config._require("exit_spread_protection", "recheck_interval_seconds")
         )
+
+        # NYSE holiday calendar for swing-trade trading-day counting.
+        # ``check_time_stop`` swing branch counts actual sessions between
+        # entry and now, so a Thu entry doesn't hit a 5-day stop on the
+        # following Tue (which is only 2 trading days away).
+        try:
+            raw_cfg: dict[str, Any] = config.raw_section()
+        except Exception:
+            raw_cfg = {}
+        self._holiday_calendar: HolidayCalendar = HolidayCalendar(raw_cfg)
 
     # ------------------------------------------------------------------
     # Parameter helpers
@@ -126,9 +137,13 @@ class ExitManager:
     ) -> bool:
         """Check if position has exceeded maximum hold time.
 
-        Intraday: 4 hours.
-        Swing: 5 trading days (approximated as 5 * 24h = 120 hours for
-        initial check; the caller should count actual trading days).
+        Intraday: ``time_stop_hours`` (default 4) wall-clock hours.
+        Swing: ``max_hold_days`` (default 5) **trading** days, counted
+        via ``HolidayCalendar`` so weekends and NYSE holidays don't
+        consume the budget. A Thursday entry with ``max_hold_days=5``
+        now expires the following Thursday session, not the following
+        Tuesday — the calendar-day version was eating ~40% of the
+        budget on weekends/holidays.
         """
         entry_time_raw: Any = position.get("entry_time")
         if entry_time_raw is None:
@@ -164,15 +179,50 @@ class ExitManager:
 
         if hold_type == HoldType.INTRADAY:
             max_hours: float = float(params.get("time_stop_hours", 4))
-            max_duration: timedelta = timedelta(hours=max_hours)
-        else:
-            # Swing: max_hold_days trading days (use calendar days * 1.4
-            # as a rough upper bound; precise counting done by the caller)
-            max_days: int = int(params.get("max_hold_days", 5))
-            max_duration = timedelta(days=max_days)
+            elapsed: timedelta = current_time - entry_time
+            return elapsed >= timedelta(hours=max_hours)
 
-        elapsed: timedelta = current_time - entry_time
-        return elapsed >= max_duration
+        # Swing: count trading days between entry date and now.
+        max_days: int = int(params.get("max_hold_days", 5))
+        # Convert both timestamps to ET dates so the comparison is
+        # session-aligned rather than UTC-anchored.
+        entry_date: date = entry_time.astimezone(ET).date()
+        current_date: date = current_time.astimezone(ET).date()
+        elapsed_trading_days: int = self._count_trading_days_between(
+            entry_date, current_date,
+        )
+        return elapsed_trading_days >= max_days
+
+    def _count_trading_days_between(
+        self,
+        start_date: date,
+        end_date: date,
+    ) -> int:
+        """Count NYSE trading days strictly between *start_date* (entry)
+        and *end_date* (now), exclusive of the entry date and inclusive
+        of any session ending on or before *end_date*.
+
+        Examples (no holidays, no weekends shown):
+        - entry Mon, now Mon → 0 (same session, intraday — the swing
+          branch shouldn't fire).
+        - entry Mon, now Tue → 1.
+        - entry Thu, now Mon → 2 (Fri + Mon).
+        - entry Thu, now Tue → 3 (Fri + Mon + Tue).
+
+        Returns 0 when ``end_date <= start_date``. The walk is bounded
+        by calendar-day distance so a corrupted timestamp can't loop
+        forever.
+        """
+        if end_date <= start_date:
+            return 0
+        cal: HolidayCalendar = self._holiday_calendar
+        count: int = 0
+        cursor: date = start_date + timedelta(days=1)
+        while cursor <= end_date:
+            if cal.is_trading_day(cursor):
+                count += 1
+            cursor += timedelta(days=1)
+        return count
 
     # ------------------------------------------------------------------
     # Composite exit evaluation

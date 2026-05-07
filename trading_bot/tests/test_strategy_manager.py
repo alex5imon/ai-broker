@@ -1948,6 +1948,138 @@ class TestCrossStrategyAlpacaCollision:
 
 
 # ---------------------------------------------------------------------------
+# Same-day attempt DB-error escalation (item 5)
+# ---------------------------------------------------------------------------
+
+
+class TestSameDayAttemptDbErrorEscalation:
+    """`_already_attempted_today` flips fail-open → fail-closed after a
+    streak of DB errors.
+
+    The original 2026-04-29 over-firing fix (per-tick same-day-attempt
+    lookup) failed silently when the DB was unreachable: every ticker
+    sailed through the guard, recreating the very pattern the guard
+    was added to stop. A short streak is still tolerated (single
+    SQLite lock from artifact-cache backup), but a sustained streak
+    must skip the entry.
+    """
+
+    def _make_sm(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        tmp_db_path,
+    ) -> StrategyManager:
+        return StrategyManager(
+            strategies=[_StubStrategy(decision=_make_decision())],
+            portfolio_manager=base_portfolio_manager,
+            market_data=base_market_data,
+            order_manager=base_order_manager,
+            risk_manager=base_risk_manager,
+            sentiment=base_sentiment,
+            earnings=base_earnings,
+            config=base_config,
+            db_path=tmp_db_path,
+        )
+
+    def test_single_error_fails_open(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        tmp_db_path,
+    ):
+        sm = self._make_sm(
+            base_market_data, base_risk_manager, base_earnings, base_sentiment,
+            base_order_manager, base_portfolio_manager, base_config, tmp_db_path,
+        )
+        # Use a path that does not exist as a directory so connect() fails.
+        sm._db_path = "/nonexistent/dir/that/does/not/exist.db"
+        # First call: fail open (return False).
+        assert sm._already_attempted_today("SPY", "stub") is False
+        assert sm._db_error_streak == 1
+
+    def test_streak_below_threshold_fails_open(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        tmp_db_path,
+    ):
+        sm = self._make_sm(
+            base_market_data, base_risk_manager, base_earnings, base_sentiment,
+            base_order_manager, base_portfolio_manager, base_config, tmp_db_path,
+        )
+        sm._db_path = "/nonexistent/dir/that/does/not/exist.db"
+        # Two failures (below the threshold of 3): still fail open.
+        assert sm._already_attempted_today("SPY", "stub") is False
+        assert sm._already_attempted_today("QQQ", "stub") is False
+        assert sm._db_error_streak == 2
+
+    def test_streak_at_threshold_fails_closed(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        tmp_db_path,
+    ):
+        sm = self._make_sm(
+            base_market_data, base_risk_manager, base_earnings, base_sentiment,
+            base_order_manager, base_portfolio_manager, base_config, tmp_db_path,
+        )
+        sm._db_path = "/nonexistent/dir/that/does/not/exist.db"
+        # Third consecutive failure must flip to fail-closed.
+        assert sm._already_attempted_today("SPY", "stub") is False
+        assert sm._already_attempted_today("QQQ", "stub") is False
+        assert sm._already_attempted_today("XLF", "stub") is True
+        assert sm._db_error_streak == 3
+
+    def test_success_resets_streak(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        tmp_db_path,
+    ):
+        sm = self._make_sm(
+            base_market_data, base_risk_manager, base_earnings, base_sentiment,
+            base_order_manager, base_portfolio_manager, base_config, tmp_db_path,
+        )
+        # Build up a streak against a bad path...
+        sm._db_path = "/nonexistent/dir/that/does/not/exist.db"
+        sm._already_attempted_today("SPY", "stub")
+        sm._already_attempted_today("QQQ", "stub")
+        assert sm._db_error_streak == 2
+        # ...then heal the DB. A successful lookup must reset to zero
+        # so subsequent transient errors don't immediately fail-closed.
+        sm._db_path = tmp_db_path
+        result = sm._already_attempted_today("SPY", "stub")
+        assert result is False  # No row → not attempted today
+        assert sm._db_error_streak == 0
+
+
+# ---------------------------------------------------------------------------
 # check_exits
 # ---------------------------------------------------------------------------
 

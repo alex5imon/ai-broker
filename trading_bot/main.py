@@ -365,12 +365,18 @@ class TradingBot:
             ):
                 try:
                     await self.pre_market_scan(Market.US)
+                    # Only latch the flag and persist the ranked watchlist
+                    # if the scan actually completed. A failed scan that
+                    # latched the flag would freeze the watchlist for the
+                    # rest of the day — every subsequent tick would see
+                    # `pre_market_done=True` and skip the retry.
+                    flags["pre_market_done"] = True
+                    flags["ranked_us_watchlist"] = self._active_watchlist.get(
+                        Market.US, [],
+                    )
+                    self._save_day_flags(today_et, flags)
                 except Exception:
-                    logger.exception("Pre-market scan failed")
-                flags["pre_market_done"] = True
-                # Persist the ranked watchlist too so the next tick can re-use it.
-                flags["ranked_us_watchlist"] = self._active_watchlist.get(Market.US, [])
-                self._save_day_flags(today_et, flags)
+                    logger.exception("Pre-market scan failed — will retry next tick")
             else:
                 # Restore ranked watchlist from flags if pre-market already ran
                 ranked: list[str] = flags.get("ranked_us_watchlist") or []

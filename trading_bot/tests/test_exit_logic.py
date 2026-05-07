@@ -165,20 +165,67 @@ class TestTimeStop:
         pos = _long_position(hold_type="intraday", entry_time=entry)
         assert exit_manager.check_time_stop(pos, datetime.now(ET)) is False
 
-    def test_time_stop_swing_held_4_days_not_triggered(
+    def test_time_stop_swing_held_4_trading_days_not_triggered(
         self, exit_manager: ExitManager
     ) -> None:
-        """Swing held 4 days — within 5-day max, no exit."""
-        entry = datetime.now(ET) - timedelta(days=4)
+        """Swing held 4 trading days (Mon → Fri) — under the 5-day max."""
+        # 2026-05-04 is a Monday; 2026-05-08 is the following Friday.
+        # Mon → Fri spans Tue, Wed, Thu, Fri = 4 trading days (no holidays).
+        entry = datetime(2026, 5, 4, 10, 0, tzinfo=ET)
+        now = datetime(2026, 5, 8, 16, 0, tzinfo=ET)
         pos = _long_position(hold_type="swing", entry_time=entry)
-        assert exit_manager.check_time_stop(pos, datetime.now(ET)) is False
+        assert exit_manager.check_time_stop(pos, now) is False
 
-    def test_time_stop_swing_held_6_days_triggers(
+    def test_time_stop_swing_held_5_trading_days_triggers(
         self, exit_manager: ExitManager
     ) -> None:
-        entry = datetime.now(ET) - timedelta(days=6)
+        """Swing held exactly 5 trading days (Mon → following Mon)."""
+        # Mon 2026-05-04 → Mon 2026-05-11 spans Tue, Wed, Thu, Fri, Mon
+        # = 5 trading days, which hits the 5-day max.
+        entry = datetime(2026, 5, 4, 10, 0, tzinfo=ET)
+        now = datetime(2026, 5, 11, 10, 0, tzinfo=ET)
         pos = _long_position(hold_type="swing", entry_time=entry)
-        assert exit_manager.check_time_stop(pos, datetime.now(ET)) is True
+        assert exit_manager.check_time_stop(pos, now) is True
+
+    def test_time_stop_swing_thursday_to_tuesday_not_triggered(
+        self, exit_manager: ExitManager
+    ) -> None:
+        """Regression: Thu → Tue is 5 calendar days but only 3 trading
+        days (Fri, Mon, Tue). Under the old calendar-day logic this
+        triggered the stop on day 5; under the new trading-day logic it
+        must not (the position has only had 3 sessions to work).
+        """
+        # Thu 2026-05-07 → Tue 2026-05-12 = 5 calendar days, 3 trading days.
+        entry = datetime(2026, 5, 7, 10, 0, tzinfo=ET)
+        now = datetime(2026, 5, 12, 16, 0, tzinfo=ET)
+        pos = _long_position(hold_type="swing", entry_time=entry)
+        assert exit_manager.check_time_stop(pos, now) is False
+
+    def test_time_stop_swing_skips_holidays(
+        self, exit_manager: ExitManager
+    ) -> None:
+        """Regression: Memorial Day (Mon 2026-05-25) does NOT count as a
+        trading day. Tue 2026-05-19 → Wed 2026-05-27 = 8 calendar days,
+        but only 5 trading days (Wed, Thu, Fri, Tue, Wed) because
+        weekends + Memorial Day are excluded. This is the trigger boundary.
+        """
+        entry = datetime(2026, 5, 19, 10, 0, tzinfo=ET)
+        now = datetime(2026, 5, 27, 16, 0, tzinfo=ET)
+        pos = _long_position(hold_type="swing", entry_time=entry)
+        assert exit_manager.check_time_stop(pos, now) is True
+
+    def test_time_stop_swing_holiday_keeps_position_alive(
+        self, exit_manager: ExitManager
+    ) -> None:
+        """One trading day short due to Memorial Day: must NOT trigger."""
+        # Wed 2026-05-20 → Wed 2026-05-27 = 7 calendar days, but Memorial
+        # Day Mon 2026-05-25 is excluded → 4 trading days (Thu, Fri, Tue,
+        # Wed). Under calendar-day logic this would have triggered at 7
+        # days; under trading-day logic the position keeps running.
+        entry = datetime(2026, 5, 20, 10, 0, tzinfo=ET)
+        now = datetime(2026, 5, 27, 16, 0, tzinfo=ET)
+        pos = _long_position(hold_type="swing", entry_time=entry)
+        assert exit_manager.check_time_stop(pos, now) is False
 
     def test_time_stop_no_entry_time_returns_false(
         self, exit_manager: ExitManager
