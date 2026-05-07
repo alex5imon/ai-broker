@@ -47,12 +47,18 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: requirements.txt
+          # Cache invalidates when either file changes. requirements-dev.txt
+          # holds the pinned static-analysis tools (ruff/mypy/bandit/
+          # pip-audit) so setup-python warms them up alongside the
+          # trading deps, instead of cold-installing them every run.
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
 
       - name: Install deps
         run: |
           pip install -r requirements.txt
-          pip install ruff mypy bandit pip-audit
+          pip install -r requirements-dev.txt
 
       - name: Live-path regex guards
         run: bash scripts/check_live_path.sh

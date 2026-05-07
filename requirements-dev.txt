@@ -1,0 +1,9 @@
+# Static-analysis tools used by .github/workflows/static-checks.yml.
+# Pinned so CI is deterministic against tool-release breakage (e.g. a
+# new ruff rule landing on `latest` and flagging existing code), and
+# so setup-python's pip cache can warm them up — these aren't in
+# requirements.txt and otherwise cold-install on every run.
+ruff==0.15.12
+mypy==1.20.2
+bandit==1.9.4
+pip-audit==2.10.0
