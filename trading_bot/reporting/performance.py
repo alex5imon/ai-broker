@@ -2,6 +2,18 @@
 
 All monetary values are in USD (the Alpaca account base currency).
 Dates are YYYY-MM-DD strings in US/Eastern.
+
+Date extraction note
+--------------------
+``trades.entry_time`` / ``exit_time`` are stored as ET-aware ISO strings
+(``'2026-05-06T15:45:38.067537-04:00'``). SQLite's built-in ``date(t)``
+function silently converts ISO timestamps to UTC before extracting the
+date — so a 22:00 ET exit lands on the *next* UTC date and silently
+disappears from the day it actually traded. We extract the ET-local
+date with ``substr(exit_time, 1, 10)`` instead: the first 10 chars of
+an ET-aware ISO are the ET-local YYYY-MM-DD, robust across DST.
+This invariant is asserted in
+``test_reporting_and_ops.py::test_trades_table_format_invariant``.
 """
 
 from __future__ import annotations
@@ -60,7 +72,7 @@ class PerformanceCalculator:
             trades_rows = conn.execute(
                 """
                 SELECT * FROM trades
-                WHERE date(exit_time) = ?
+                WHERE substr(exit_time, 1, 10) = ?
                   AND exit_time IS NOT NULL
                 ORDER BY exit_time
                 """,
@@ -222,7 +234,7 @@ class PerformanceCalculator:
             trade_rows = conn.execute(
                 """
                 SELECT pnl_usd FROM trades
-                WHERE date(exit_time) BETWEEN ? AND ?
+                WHERE substr(exit_time, 1, 10) BETWEEN ? AND ?
                   AND pnl_usd IS NOT NULL
                 """,
                 (start_date, end_date),
@@ -405,7 +417,7 @@ class PerformanceCalculator:
                            COALESCE(SUM(pnl_usd), 0.0) AS net_pnl_usd,
                            COALESCE(AVG(pnl_usd), 0.0) AS avg_pnl_usd
                     FROM trades
-                    WHERE date(exit_time) = ? AND pnl_usd IS NOT NULL
+                    WHERE substr(exit_time, 1, 10) = ? AND pnl_usd IS NOT NULL
                     GROUP BY ticker
                     ORDER BY net_pnl_usd DESC
                     """,

@@ -38,13 +38,19 @@ def _dates_with_trades(
     conn: sqlite3.Connection, days_back: int,
 ) -> list[str]:
     """Return YYYY-MM-DD strings for the last ``days_back`` calendar days
-    that have at least one trades row with a non-null exit_time."""
+    that have at least one trades row with a non-null exit_time.
+
+    Uses ``substr(exit_time, 1, 10)`` rather than SQLite's built-in
+    ``date(...)`` because exit_time is stored as an ET-aware ISO string;
+    ``date()`` would silently convert to UTC and shift late-ET trades to
+    the wrong calendar day. See ``performance.py`` module docstring.
+    """
     cutoff: date = (
         datetime.now(tz=TZ_EASTERN).date() - timedelta(days=days_back)
     )
     rows = conn.execute(
-        "SELECT DISTINCT date(exit_time) AS d FROM trades "
-        "WHERE exit_time IS NOT NULL AND date(exit_time) >= ? "
+        "SELECT DISTINCT substr(exit_time, 1, 10) AS d FROM trades "
+        "WHERE exit_time IS NOT NULL AND substr(exit_time, 1, 10) >= ? "
         "ORDER BY d",
         (cutoff.isoformat(),),
     ).fetchall()

@@ -118,6 +118,86 @@ def test_daily_metrics_usd_passthrough(tmp_db_path):
     assert m["gross_pnl_usd"] == 10.0
 
 
+def test_daily_metrics_late_evening_ET_exit_lands_on_ET_date(tmp_db_path):
+    """Regression: trades closed in the 20:00-23:59 ET window must land on
+    the ET-local trading date.
+
+    This is the failure mode behind ai-broker#40. ``exit_time`` is stored
+    as ET-aware ISO (``-04:00`` offset). SQLite's built-in ``date(t)``
+    silently converts to UTC before extracting the date, so 22:00 ET on
+    2026-05-06 (= 02:00 UTC on 2026-05-07) gets bucketed under the wrong
+    day and silently drops out of that day's metrics.
+
+    The fix is ``substr(exit_time, 1, 10)`` — first 10 chars of an
+    ET-aware ISO are always the ET-local YYYY-MM-DD.
+    """
+    pc = PerformanceCalculator(tmp_db_path)
+    # 22:00 ET on a fixed date — well past the 20:00 ET threshold where
+    # the UTC-conversion bug fires.
+    et_date_str = "2026-05-06"
+    late_et_iso = f"{et_date_str}T22:00:00-04:00"
+
+    _seed_trade(tmp_db_path, ticker="A", exit_time=late_et_iso,
+                pnl_usd=10.0, gross_pnl=10.0)
+    _seed_trade(tmp_db_path, ticker="B", exit_time=late_et_iso,
+                pnl_usd=-3.0, gross_pnl=-3.0)
+
+    m = pc.calculate_daily_metrics(et_date_str)
+    assert m["total_trades"] == 2, (
+        "Late-ET-evening trades must count under their ET-local date. "
+        "If this fails, the read query likely went back to using "
+        "SQLite's date(...) on a tz-aware ISO string."
+    )
+    assert m["wins"] == 1
+    assert m["losses"] == 1
+
+
+def test_trades_table_format_invariant(tmp_db_path):
+    """All ``trades.entry_time`` / ``exit_time`` writers must produce
+    ET-aware ISO. This invariant is what makes the
+    ``substr(..., 1, 10)`` ET-date extraction robust across DST and
+    avoids the silent ``date()`` UTC conversion described in
+    ``performance.py``'s module docstring.
+
+    The live writer (``repository._now_eastern_iso``) uses
+    ``datetime.now(TZ_EASTERN).isoformat()`` which always emits
+    ``YYYY-MM-DDTHH:MM:SS[.ffffff]±HH:MM``. The backfill writer
+    (``alpaca_backfill.py``) was historically a different format and is
+    now aligned. This test seeds the canonical format and asserts the
+    invariant via a regex — if a future writer drifts back to e.g.
+    ``strftime('%Y-%m-%d %H:%M:%S')`` (naive, no T separator, no
+    offset), this fails fast.
+    """
+    import re
+
+    iso_re = re.compile(
+        r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+        r"(?:\.\d+)?"            # optional microseconds
+        r"[+\-]\d{2}:\d{2}$"     # ±HH:MM offset (never naive, never Z)
+    )
+
+    et_iso = datetime.now(tz=ET).isoformat()
+    _seed_trade(tmp_db_path, ticker="A", exit_time=et_iso,
+                pnl_usd=1.0, gross_pnl=1.0)
+
+    with sqlite3.connect(tmp_db_path) as conn:
+        rows = conn.execute(
+            "SELECT entry_time, exit_time FROM trades "
+            "WHERE entry_time IS NOT NULL AND exit_time IS NOT NULL"
+        ).fetchall()
+
+    assert rows, "expected the seeded row"
+    for entry_time, exit_time in rows:
+        assert iso_re.match(entry_time), (
+            f"entry_time {entry_time!r} is not ET-aware ISO — see "
+            "performance.py module docstring for the invariant."
+        )
+        assert iso_re.match(exit_time), (
+            f"exit_time {exit_time!r} is not ET-aware ISO — see "
+            "performance.py module docstring for the invariant."
+        )
+
+
 def test_intraday_drawdown():
     trades = [
         {"pnl_usd": 10.0},   # cumulative 10, peak 10

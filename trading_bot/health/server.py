@@ -128,10 +128,15 @@ class HealthServer:
                 ).fetchone()
                 open_positions_count = int(row["cnt"]) if row else 0
 
-                # Trades today
+                # Trades today. Uses substr(entry_time, 1, 10) — the
+                # first 10 chars of an ET-aware ISO are the ET-local
+                # date. SQLite's date() would re-interpret the offset
+                # as UTC and silently shift evening trades. See
+                # performance.py module docstring.
                 today_str: str = now_et.strftime("%Y-%m-%d")
                 row = conn.execute(
-                    "SELECT COUNT(*) AS cnt FROM trades WHERE date(entry_time) = ?",
+                    "SELECT COUNT(*) AS cnt FROM trades "
+                    "WHERE substr(entry_time, 1, 10) = ?",
                     (today_str,),
                 ).fetchone()
                 trades_today = int(row["cnt"]) if row else 0
@@ -141,7 +146,7 @@ class HealthServer:
                     """
                     SELECT COALESCE(SUM(pnl_usd), 0.0) AS total
                     FROM trades
-                    WHERE date(exit_time) = ? AND pnl_usd IS NOT NULL
+                    WHERE substr(exit_time, 1, 10) = ? AND pnl_usd IS NOT NULL
                     """,
                     (today_str,),
                 ).fetchone()

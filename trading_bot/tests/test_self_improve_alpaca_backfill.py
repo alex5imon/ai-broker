@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from trading_bot.constants import TZ_EASTERN
 from trading_bot.self_improve.alpaca_backfill import (
     BACKFILL_MARKER_PREFIX,
     ClosedPositionRow,
@@ -66,6 +67,11 @@ def _make_position(
     target_id: str | None = None,
     trail_id: str | None = None,
 ) -> ClosedPositionRow:
+    # entry_time is ET-aware to mirror production: load_candidates()
+    # parses positions.entry_time (stored as ET-aware ISO by the live
+    # writer) and preserves the original tz. Tests that previously
+    # constructed this as UTC were leaning on the now-removed
+    # strftime() format coincidence — see ai-broker#40.
     return ClosedPositionRow(
         position_id=position_id,
         ticker=ticker,
@@ -74,7 +80,7 @@ def _make_position(
         strategy_id="overnight_drift",
         quantity=10,
         entry_price=100.0,
-        entry_time=datetime(2026, 4, 1, 15, 45, tzinfo=timezone.utc),
+        entry_time=datetime(2026, 4, 1, 15, 45, tzinfo=TZ_EASTERN),
         hold_type="swing",
         phase=1,
         alpaca_order_id="alp-entry",
@@ -189,6 +195,9 @@ def test_backfill_updates_existing_reconciliation_mismatch_row(tmp_db):
     """
     p = _make_position(stop_id="alp-stop")
     # Seed the reconciliation_mismatch row that StateRecovery writes.
+    # entry_time/exit_time are ET-aware ISO matching the live writer
+    # (repository._now_eastern_iso) — the format the post-#40 backfill
+    # matches against.
     tmp_db.execute(
         """
         INSERT INTO trades (
@@ -197,8 +206,8 @@ def test_backfill_updates_existing_reconciliation_mismatch_row(tmp_db):
             exit_time, exit_reason,
             hold_type, phase, strategy_id, notes
         ) VALUES ('SPY', 'NYSE', 'USD', 'BUY',
-                  '2026-04-01 15:45:00', 100.0, 10,
-                  '2026-04-02 09:00:00', 'reconciliation_mismatch',
+                  '2026-04-01T15:45:00-04:00', 100.0, 10,
+                  '2026-04-02T05:00:00-04:00', 'reconciliation_mismatch',
                   'swing', 1, 'overnight_drift', 'placeholder')
         """,
     )
@@ -260,20 +269,22 @@ def test_backfill_only_updates_matching_entry_time(tmp_db):
     p1 = _make_position(
         position_id=1, stop_id="alp-stop-1",
     )
-    # Different position, different entry_time
+    # Different position, different entry_time. ET-aware to mirror
+    # production storage; see _make_position docstring.
     other_position = ClosedPositionRow(
         position_id=2, ticker="SPY", exchange="NYSE", currency="USD",
         strategy_id="overnight_drift", quantity=10, entry_price=110.0,
-        entry_time=datetime(2026, 5, 5, 15, 45, tzinfo=timezone.utc),
+        entry_time=datetime(2026, 5, 5, 15, 45, tzinfo=TZ_EASTERN),
         hold_type="swing", phase=1,
         alpaca_order_id="alp-entry-2", alpaca_stop_order_id="alp-stop-2",
         alpaca_target_order_id=None, alpaca_trail_order_id=None,
     )
 
-    # Seed two reconciliation_mismatch rows, one per day.
+    # Seed two reconciliation_mismatch rows, one per day. Format matches
+    # the live writer (ET-aware ISO).
     for entry_time, ep in [
-        ("2026-04-01 15:45:00", 100.0),
-        ("2026-05-05 15:45:00", 110.0),
+        ("2026-04-01T15:45:00-04:00", 100.0),
+        ("2026-05-05T15:45:00-04:00", 110.0),
     ]:
         tmp_db.execute(
             """
@@ -284,7 +295,7 @@ def test_backfill_only_updates_matching_entry_time(tmp_db):
                 hold_type, phase, strategy_id
             ) VALUES ('SPY', 'NYSE', 'USD', 'BUY',
                       ?, ?, 10,
-                      '2026-05-06 09:00:00', 'reconciliation_mismatch',
+                      '2026-05-06T05:00:00-04:00', 'reconciliation_mismatch',
                       'swing', 1, 'overnight_drift')
             """,
             (entry_time, ep),
