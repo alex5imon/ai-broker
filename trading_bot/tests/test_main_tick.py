@@ -35,7 +35,11 @@ def trading_bot(config, tmp_db_path, monkeypatch):
     """
     monkeypatch.setenv("ALPACA_API_KEY", "test")
     monkeypatch.setenv("ALPACA_SECRET_KEY", "test")
-    config._raw["db"] = {"path": tmp_db_path}
+    # Mutate the existing `database.path` key — `Config.db_path` reads
+    # `_raw["database"]["path"]`. Earlier code wrote `_raw["db"]` (wrong
+    # key) so the bot silently used the persistent dev DB and tests
+    # leaked state into each other.
+    config._raw["database"]["path"] = tmp_db_path
 
     bot = TradingBot(config, mode="normal", dry_run=False)
 
@@ -279,10 +283,9 @@ async def test_failed_pre_market_scan_does_not_latch_done_flag(trading_bot):
     after the try/except and ran unconditionally, including when the
     scan raised. Now it lives inside the try and only fires on success.
 
-    Tracks flag state via ``_save_day_flags`` patches so we don't rely
-    on the test fixture's DB path (the fixture sets ``_raw["db"]`` but
-    ``Config.db_path`` reads ``_raw["database"]["path"]`` — a separate
-    bug — so the persistent dev DB is what actually backs the flag).
+    Tracks flag state via ``_save_day_flags`` patches rather than
+    re-reading the DB — keeps the assertion focused on whether the
+    flag was *written* in this tick, regardless of any prior state.
     """
     trading_bot._config.is_trading_day = MagicMock(return_value=True)
     _open_hours(trading_bot)
@@ -387,7 +390,7 @@ def test_parse_time_helper():
 def test_dry_run_flag_propagates_to_strategy_manager(config, tmp_db_path, monkeypatch):
     monkeypatch.setenv("ALPACA_API_KEY", "test")
     monkeypatch.setenv("ALPACA_SECRET_KEY", "test")
-    config._raw["db"] = {"path": tmp_db_path}
+    config._raw["database"]["path"] = tmp_db_path
     bot = TradingBot(config, mode="normal", dry_run=True)
     if bot._strategy_manager is not None:
         assert bot._strategy_manager._dry_run is True
@@ -396,6 +399,6 @@ def test_dry_run_flag_propagates_to_strategy_manager(config, tmp_db_path, monkey
 def test_construct_with_close_only_mode(config, tmp_db_path, monkeypatch):
     monkeypatch.setenv("ALPACA_API_KEY", "test")
     monkeypatch.setenv("ALPACA_SECRET_KEY", "test")
-    config._raw["db"] = {"path": tmp_db_path}
+    config._raw["database"]["path"] = tmp_db_path
     bot = TradingBot(config, mode="close-only", dry_run=False)
     assert bot._mode == "close-only"

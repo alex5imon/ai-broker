@@ -433,8 +433,14 @@ async def test_notifier_osascript_fallback_swallows_error():
 
 @pytest.fixture
 def health_config(config, tmp_db_path):
-    """Wrap the real Config but override db_path to our temp DB."""
-    config._raw["db"] = {"path": tmp_db_path}
+    """Wrap the real Config but override db_path to our temp DB.
+
+    Mutates the existing `database.path` key (the one `Config.db_path`
+    actually reads). Earlier code wrote `_raw["db"]`, which the property
+    ignored, so health-check tests silently ran against the persistent
+    dev DB.
+    """
+    config._raw["database"]["path"] = tmp_db_path
     return config
 
 
@@ -488,7 +494,7 @@ async def test_health_handler_error_status(health_config):
 async def test_health_handler_swallows_db_errors(health_config, monkeypatch):
     hs = _make_health(health_config)
     # Point at a path that doesn't exist
-    health_config._raw["db"] = {"path": "/nonexistent/path/db.sqlite"}
+    health_config._raw["database"]["path"] = "/nonexistent/path/db.sqlite"
     response = await hs._handle_health(MagicMock())
     assert response.status == 200
 
