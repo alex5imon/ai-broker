@@ -7,7 +7,7 @@ import logging
 import sqlite3
 from dataclasses import replace
 from datetime import datetime
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -65,6 +65,9 @@ def _is_alpaca_position_not_found(exc: Any) -> bool:
     return False
 
 
+VerdictType = Literal["OK", "NOT_HELD", "OPPOSITE_SIDE", "UNKNOWN"]
+
+
 class AlpacaPositionCheck(NamedTuple):
     """Outcome of probing Alpaca for a position before a drain SELL.
 
@@ -85,7 +88,7 @@ class AlpacaPositionCheck(NamedTuple):
     default and the caller doesn't read it.
     """
 
-    verdict: str
+    verdict: VerdictType
     alpaca_qty: float
 
 
@@ -466,14 +469,12 @@ class StrategyManager:
             if qty <= 0:
                 continue
 
-            # INVARIANT: re-fetch Alpaca qty before EACH SELL. The DB
-            # is the bot's intent; the broker is truth. DB qty drifts
-            # via manual flatten, broker-side stop fills not yet
-            # written back, state-recovery races, and partial fills
-            # mid-tick. Submitting a SELL for the DB qty when Alpaca
-            # holds less closes the long *and* opens a short for the
-            # difference — the 2026-04-30 incident class. Drain SELL
-            # qty must be bounded by Alpaca's position size.
+            # Re-fetch Alpaca qty before each SELL — see the
+            # AlpacaPositionCheck docstring for the full invariant.
+            # The DB is the bot's intent; the broker is truth.
+            # Submitting a SELL for the DB qty when Alpaca holds less
+            # closes the long *and* opens a short for the difference
+            # — the 2026-04-30 incident class.
             position_id: int | None = pos.get("id")
             check = self._check_alpaca_position(ticker, db_qty=qty)
             if check.verdict == "NOT_HELD":
@@ -516,10 +517,14 @@ class StrategyManager:
             # someone else's position to handle.
             qty_to_sell: float = min(qty, abs(check.alpaca_qty))
             if qty_to_sell <= 0:
-                # Defensive: NOT_HELD already covers alpaca_qty=0; this
-                # only fires if check.alpaca_qty came back as something
-                # exotic (NaN-ish, negative same-sign rounding). Log
-                # and skip rather than submit a zero-qty order.
+                # Structural guard: given verdict=="OK", alpaca_qty is
+                # nonzero and same-sign as db_qty (db_qty>0 enforced
+                # above), so abs(alpaca_qty) > 0 and this branch is
+                # unreachable today. NaN propagates through min() but
+                # is filtered upstream as OPPOSITE_SIDE since
+                # ``NaN > 0`` is False. Kept as a final safety net
+                # against future logic changes — never submit a
+                # zero-qty order.
                 logger.warning(
                     "Drain skip: %s strategy=%s — computed qty_to_sell=%.4f "
                     "(db=%+.4f, alpaca=%+.4f); refusing to submit",
