@@ -74,11 +74,12 @@ class ExitManager:
         # ``check_time_stop`` swing branch counts actual sessions between
         # entry and now, so a Thu entry doesn't hit a 5-day stop on the
         # following Tue (which is only 2 trading days away).
-        try:
-            raw_cfg: dict[str, Any] = config.raw_section()
-        except Exception:
-            raw_cfg = {}
-        self._holiday_calendar: HolidayCalendar = HolidayCalendar(raw_cfg)
+        # ``raw_section()`` returns a dict copy and cannot raise — let any
+        # programming error (e.g. ``_raw`` reassigned to a non-dict) fail
+        # the constructor rather than silently degrade to fallback dates.
+        self._holiday_calendar: HolidayCalendar = HolidayCalendar(
+            config.raw_section()
+        )
 
     # ------------------------------------------------------------------
     # Parameter helpers

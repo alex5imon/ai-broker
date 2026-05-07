@@ -307,8 +307,12 @@ async def test_failed_pre_market_scan_does_not_latch_done_flag(trading_bot):
     # No save in the try block means saved_flags carries only writes
     # from the after-close handlers — and none of them should contain
     # ``pre_market_done=True`` because nothing in this tick set it.
+    # Check for the dangerous state — `pre_market_done == True` saved
+    # to disk — rather than the looser "key absent" form. A future
+    # refactor that pre-initialises `flags["pre_market_done"] = False`
+    # before saving would still be safe but would fail the looser test.
     pre_market_writes = [
-        f for f in saved_flags_failed if "pre_market_done" in f
+        f for f in saved_flags_failed if f.get("pre_market_done") is True
     ]
     assert pre_market_writes == [], (
         f"Failed scan latched pre_market_done: {pre_market_writes}"
@@ -335,6 +339,57 @@ async def test_successful_pre_market_scan_latches_done_flag(trading_bot):
 
     pre_market_writes = [f for f in saved_flags_ok if f.get("pre_market_done")]
     assert pre_market_writes, "Successful scan must latch pre_market_done"
+
+
+@pytest.mark.asyncio
+async def test_failed_wind_down_does_not_latch_done_flag(trading_bot):
+    """Sibling of item 6: a failed `wind_down` must NOT latch
+    `wind_down_done=True`. Latching on failure is dangerous here —
+    wind-down closes intraday positions before the close, and a
+    permanently-suppressed retry leaves them open overnight.
+    """
+    trading_bot._config.is_trading_day = MagicMock(return_value=True)
+    _open_hours(trading_bot)
+    trading_bot._is_market_in_premarket = MagicMock(return_value=False)
+    trading_bot._is_market_in_execution = MagicMock(return_value=False)
+    trading_bot._is_market_in_winddown = MagicMock(return_value=True)
+    trading_bot._load_day_flags = MagicMock(return_value={})
+    saved_flags_failed: list[dict[str, Any]] = []
+    trading_bot._save_day_flags = MagicMock(
+        side_effect=lambda _today, flags: saved_flags_failed.append(dict(flags)),
+    )
+    trading_bot.wind_down = AsyncMock(side_effect=RuntimeError("flatten failed"))
+
+    await trading_bot.tick()
+
+    wind_down_writes = [
+        f for f in saved_flags_failed if f.get("wind_down_done") is True
+    ]
+    assert wind_down_writes == [], (
+        f"Failed wind-down latched wind_down_done: {wind_down_writes}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_successful_wind_down_latches_done_flag(trading_bot):
+    """Happy path: successful wind-down latches the flag so we don't
+    re-flatten on every tick in the wind-down window."""
+    trading_bot._config.is_trading_day = MagicMock(return_value=True)
+    _open_hours(trading_bot)
+    trading_bot._is_market_in_premarket = MagicMock(return_value=False)
+    trading_bot._is_market_in_execution = MagicMock(return_value=False)
+    trading_bot._is_market_in_winddown = MagicMock(return_value=True)
+    trading_bot._load_day_flags = MagicMock(return_value={})
+    saved_flags_ok: list[dict[str, Any]] = []
+    trading_bot._save_day_flags = MagicMock(
+        side_effect=lambda _today, flags: saved_flags_ok.append(dict(flags)),
+    )
+    trading_bot.wind_down = AsyncMock(return_value=None)
+
+    await trading_bot.tick()
+
+    wind_down_writes = [f for f in saved_flags_ok if f.get("wind_down_done")]
+    assert wind_down_writes, "Successful wind-down must latch wind_down_done"
 
 
 # ---------------------------------------------------------------------------

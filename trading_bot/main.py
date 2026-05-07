@@ -406,10 +406,14 @@ class TradingBot:
             ):
                 try:
                     await self.wind_down(Market.US)
+                    # Same latch-on-success discipline as pre-market: a
+                    # failed wind-down must NOT set the flag, otherwise
+                    # subsequent ticks in the wind-down window won't
+                    # retry and intraday positions stay open past close.
+                    flags["wind_down_done"] = True
+                    self._save_day_flags(today_et, flags)
                 except Exception:
-                    logger.exception("Wind-down failed")
-                flags["wind_down_done"] = True
-                self._save_day_flags(today_et, flags)
+                    logger.exception("Wind-down failed — will retry next tick")
 
             # --- 15. After-close daily tasks ---
             await self._maybe_check_phase_transition(today_et, flags)

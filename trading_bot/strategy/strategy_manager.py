@@ -293,6 +293,12 @@ class StrategyManager:
                 # doesn't see them — so the next 5-min tick re-fires the
                 # same order. Cross-check the DB for any same-day attempt
                 # (open OR closed) by this strategy on this ticker.
+                #
+                # The internal DB-error streak counter is session-global
+                # across all (ticker, strategy_id) pairs in this scan —
+                # intentional: once the DB is hard-down for this cron
+                # invocation, we want to block all remaining entries, not
+                # re-tolerate transient errors per ticker.
                 if self._already_attempted_today(ticker, strategy.strategy_id):
                     logger.debug(
                         "[%s] %s already attempted today — skipping",
