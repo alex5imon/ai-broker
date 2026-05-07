@@ -47,12 +47,19 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Restore SQLite DB
-        # Same key prefix bot.yml writes to — we read the latest cached DB
-        # so the postmortem sees today's trades.
+        # Read the latest bot DB and write back under the same prefix so
+        # the next bot.yml tick picks up backfill UPDATEs and the
+        # daily_summaries recompute. Pre-2026-05-07 we saved under a
+        # daily-review-db-* prefix that the bot never restored from, so
+        # the recompute's writes were stranded.
+        # Cache key collisions with bot.yml are not a concern here: this
+        # workflow runs at 21:30 UTC weekdays — well after the 21:00 UTC
+        # market close — and uses its own concurrency group, so no live
+        # bot tick is in flight when we write.
         uses: actions/cache@v5
         with:
           path: trading_bot/data/trading_bot.db*
-          key: daily-review-db-${{ github.run_id }}
+          key: bot-db-${{ github.run_id }}
           restore-keys: |
             bot-db-
 
