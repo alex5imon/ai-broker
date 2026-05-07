@@ -95,7 +95,7 @@ close (via `.github/workflows/daily-review.yml`, 21:30 UTC weekdays). It:
 
 - Modular package under `trading_bot/` — each subsystem (strategy, execution, risk, reporting, etc.) is its own module.
 - **US-only** — trades US equities via Alpaca (NYSE/NASDAQ), commission-free.
-- **Stateless tick model** — each `python -m trading_bot.main` invocation runs one `tick()` and exits. Per-strategy state (day flags, spread-defer timers) is persisted in the `tick_state` / `risk_circuit_state` SQLite tables, so the next cron invocation picks up cleanly. No long-running process, no WebSocket stream, no heartbeat loop.
+- **Stateless tick model** — each `python -m trading_bot.main` invocation runs one `tick()` and exits. Per-strategy state (day flags, spread-defer timers, loss-cooldown counters) and global risk state (pause window, drawdown breaker, daily-loss-limit hit, commission stop) are persisted in the `tick_state` / `risk_circuit_state` SQLite tables, so the next cron invocation picks up cleanly. No long-running process, no WebSocket stream, no heartbeat loop.
 - **Alpaca integration:**
   - `TradingClient` (REST) for orders, positions, account queries
   - `StockHistoricalDataClient` for historical OHLCV bars

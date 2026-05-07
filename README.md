@@ -224,10 +224,12 @@ Each invocation runs one `tick()` and exits:
    whichever windows are active, gated by day-scoped flags.
 7. Phase-transition + daily-summary checks once per day.
 
-Per-strategy state (day flags, spread-defer timers, strategy sleeves)
-lives in the `tick_state` / `risk_circuit_state` SQLite tables so the
-next cron invocation picks up cleanly. There is no long-running
-process, no WebSocket stream, and no heartbeat loop.
+Per-strategy state (day flags, spread-defer timers, strategy sleeves,
+loss-cooldown counters) and global risk state (pause window, drawdown
+breaker, daily-loss-limit hit, commission stop, recent rejections) live
+in the `tick_state` / `risk_circuit_state` SQLite tables so the next
+cron invocation picks up cleanly. There is no long-running process, no
+WebSocket stream, and no heartbeat loop.
 
 ## Heartbeat
 
