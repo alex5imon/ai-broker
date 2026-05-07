@@ -110,57 +110,39 @@ class TestTakeProfit:
 
 
 # ---------------------------------------------------------------------------
-# Trailing stop
+# Trailing stop is broker-managed
 # ---------------------------------------------------------------------------
 
 
-class TestTrailingStop:
-    def test_trailing_stop_activation(self, exit_manager: ExitManager) -> None:
-        """Price rises +1.5% — trailing stop should activate for intraday."""
-        pos = _long_position(entry_price=10.0, hold_type="intraday",
-                             trailing_active=False, highest_price=10.0)
-        # activation at +1.5% = 10.15
-        triggered, high = exit_manager.check_trailing_stop(pos, 10.16)
-        # Should activate (pct_from_entry >= 0.015) but not triggered yet
-        assert triggered is False  # price hasn't dropped 1% from high
-        assert high is not None and high >= 10.15
+class TestTrailingStopIsBrokerManaged:
+    """The software-side trailing stop was removed in favour of Alpaca's
+    native ``TrailingStopOrderRequest``. ``ExitManager`` no longer offers
+    a ``check_trailing_stop`` method, and ``should_exit`` never produces
+    an ``ExitReason.TRAILING_STOP`` decision — the broker fires the stop
+    autonomously and the bot picks up the fill via order-status polling.
+    See ``risk_infrastructure_gaps.md`` item 2.
+    """
 
-    def test_trailing_stop_triggers(self, exit_manager: ExitManager) -> None:
-        """Trailing active, price falls 1% from high — should trigger."""
-        # Simulate: entry=10, high=10.20 (already at +2%), trailing active
-        pos = _long_position(entry_price=10.0, hold_type="intraday",
-                             trailing_active=True, highest_price=10.20)
-        # Trail distance = 1%, so trail price = 10.20 * 0.99 = 10.098
-        triggered, _ = exit_manager.check_trailing_stop(pos, 10.05)
-        assert triggered is True
-
-    def test_trailing_stop_not_yet_activated(self, exit_manager: ExitManager) -> None:
-        """Price at +1.4% — below 1.5% activation threshold."""
-        pos = _long_position(entry_price=10.0, hold_type="intraday",
-                             trailing_active=False, highest_price=10.0)
-        # +1.4% = 10.14
-        triggered, _ = exit_manager.check_trailing_stop(pos, 10.14)
-        assert triggered is False
-
-    def test_trailing_stop_swing_higher_activation(
+    def test_check_trailing_stop_is_removed(
         self, exit_manager: ExitManager
     ) -> None:
-        """Swing activation is 2.5%, not 1.5%."""
-        pos = _long_position(entry_price=10.0, hold_type="swing",
-                             trailing_active=False, highest_price=10.0)
-        # +2.4% — below swing 2.5% activation
-        triggered, _ = exit_manager.check_trailing_stop(pos, 10.24)
-        assert triggered is False
+        assert not hasattr(exit_manager, "check_trailing_stop")
 
-    def test_trailing_stop_does_not_trigger_if_price_holds(
+    def test_should_exit_does_not_fire_trailing_stop(
         self, exit_manager: ExitManager
     ) -> None:
-        """Trailing active, price remains above trail level — no exit."""
-        # high=10.20, trail distance=1%, trail_price=10.098; price=10.15 > trail
-        pos = _long_position(entry_price=10.0, hold_type="intraday",
-                             trailing_active=True, highest_price=10.20)
-        triggered, _ = exit_manager.check_trailing_stop(pos, 10.15)
-        assert triggered is False
+        # Position deeply in trailing-stop territory: high=10.20, trailing
+        # active, current price 10.05 (would have triggered the old
+        # software-side trail). Stop loss / take profit / time stop are
+        # all clear.
+        pos = _long_position(
+            entry_price=10.0, stop_price=9.80, target_price=10.30,
+            hold_type="intraday", trailing_active=True,
+            highest_price=10.20,
+        )
+        decision = exit_manager.should_exit(pos, 10.05, datetime.now(ET))
+        assert decision.should_exit is False
+        assert decision.reason is None
 
 
 # ---------------------------------------------------------------------------
@@ -233,15 +215,6 @@ class TestShouldExit:
         assert decision.should_exit is True
         assert decision.reason == ExitReason.TAKE_PROFIT
         assert decision.is_emergency is False
-
-    def test_trailing_stop_fires(self, exit_manager: ExitManager) -> None:
-        pos = _long_position(entry_price=10.0, stop_price=9.80,
-                             target_price=10.30, hold_type="intraday",
-                             trailing_active=True, highest_price=10.20)
-        # trail_price = 10.20 * 0.99 = 10.098; current = 10.05 < trail
-        decision = exit_manager.should_exit(pos, 10.05, datetime.now(ET))
-        assert decision.should_exit is True
-        assert decision.reason == ExitReason.TRAILING_STOP
 
     def test_no_exit_all_conditions_clear(self, exit_manager: ExitManager) -> None:
         pos = _long_position(entry_price=10.0, stop_price=9.80,

@@ -16,7 +16,6 @@ from zoneinfo import ZoneInfo
 from trading_bot.config import Config
 from trading_bot.constants import TZ_EASTERN, ExitReason, HoldType
 from trading_bot.data.market_data import MarketDataManager
-from trading_bot.utils import coalesce
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -122,89 +121,6 @@ class ExitManager:
         # Short
         return current_price <= target_price
 
-    def check_trailing_stop(
-        self, position: dict[str, Any], current_price: float
-    ) -> tuple[bool, float | None]:
-        """Check the trailing stop.
-
-        Returns ``(triggered, new_highest_price)``.
-
-        Activation thresholds (from entry price):
-        - Intraday: +1.5%
-        - Swing: +2.5%
-
-        Once active, trails at:
-        - Intraday: -1% from highest price
-        - Swing: -1.5% from highest price
-        """
-        entry_price: float = position.get("entry_price", 0.0)
-        direction: str = position.get("direction", "long")
-        hold_type_str: str = position.get("hold_type", "intraday")
-        hold_type: HoldType = HoldType(hold_type_str)
-
-        params: dict[str, Any] = self.get_exit_params(hold_type)
-        activation_pct: float = float(params["trailing_activation_pct"])
-        trail_distance_pct: float = float(params["trailing_distance_pct"])
-
-        # highest_price may be NULL in DB before first trail update; use
-        # coalesce so a stored None falls back to entry_price.
-        highest_price: float = float(coalesce(position, "highest_price", entry_price))
-        trailing_active: bool = bool(coalesce(position, "trailing_active", False))
-
-        if entry_price <= 0:
-            return False, None
-
-        if direction == "long":
-            # Update highest
-            if current_price > highest_price:
-                highest_price = current_price
-
-            # Check activation
-            pct_from_entry: float = (highest_price - entry_price) / entry_price
-            if not trailing_active and pct_from_entry < activation_pct:
-                # Not yet activated
-                return False, highest_price
-
-            # Trailing stop is active (or just activated)
-            trail_price: float = highest_price * (1.0 - trail_distance_pct)
-            triggered: bool = current_price <= trail_price
-
-            if not trailing_active:
-                logger.info(
-                    "%s: Trailing stop ACTIVATED at +%.1f%% (high=%.4f, trail=%.4f)",
-                    position.get("ticker", "?"),
-                    pct_from_entry * 100,
-                    highest_price,
-                    trail_price,
-                )
-
-            return triggered, highest_price
-
-        else:
-            # Short position: track lowest price
-            lowest_price: float = float(coalesce(position, "lowest_price", entry_price))
-            if current_price < lowest_price:
-                lowest_price = current_price
-
-            pct_from_entry = (entry_price - lowest_price) / entry_price
-            if not trailing_active and pct_from_entry < activation_pct:
-                return False, lowest_price
-
-            trail_price = lowest_price * (1.0 + trail_distance_pct)
-            triggered = current_price >= trail_price
-
-            if not trailing_active:
-                logger.info(
-                    "%s: Trailing stop ACTIVATED (short) at +%.1f%% "
-                    "(low=%.4f, trail=%.4f)",
-                    position.get("ticker", "?"),
-                    pct_from_entry * 100,
-                    lowest_price,
-                    trail_price,
-                )
-
-            return triggered, lowest_price
-
     def check_time_stop(
         self, position: dict[str, Any], current_time: datetime
     ) -> bool:
@@ -273,8 +189,16 @@ class ExitManager:
         Checks in priority order:
         1. Stop loss (emergency)
         2. Take profit
-        3. Trailing stop
-        4. Time stop
+        3. Time stop
+
+        Trailing stops are managed by Alpaca natively via
+        ``TrailingStopOrderRequest`` (submitted by
+        ``OrderManager.activate_trailing_stop`` once
+        ``trail_activation_price`` is reached). The broker tracks the
+        high-water mark and fires the stop autonomously, so there is no
+        software-side trail check here. The previous duplicate check
+        risked racing the broker's stop and never persisted
+        ``highest_price`` between ticks.
 
         Returns an :class:`ExitDecision`.
         """
@@ -306,26 +230,7 @@ class ExitManager:
                 use_market_order=False,
             )
 
-        # Priority 3: Trailing stop
-        trailing_triggered, new_high = self.check_trailing_stop(
-            position, current_price
-        )
-        if trailing_triggered:
-            logger.info(
-                "%s: TRAILING STOP triggered at %.4f (high=%.4f)",
-                ticker,
-                current_price,
-                new_high,
-            )
-            return ExitDecision(
-                should_exit=True,
-                reason=ExitReason.TRAILING_STOP,
-                is_emergency=False,
-                exit_price=current_price,
-                use_market_order=False,
-            )
-
-        # Priority 4: Time stop
+        # Priority 3: Time stop
         if self.check_time_stop(position, current_time):
             hold_type_str: str = position.get("hold_type", "intraday")
             hold_type: HoldType = HoldType(hold_type_str)
