@@ -1051,6 +1051,339 @@ class TestDrainDisabledSleeves:
         n = await sm.drain_disabled_sleeves()
         assert n == 1
         base_order_manager.place_exit.assert_awaited_once()
+        # Pin the qty: when DB and Alpaca agree, drain SELLs the full
+        # DB qty. The other tests below pin the partial / overshoot
+        # cases.
+        kwargs = base_order_manager.place_exit.await_args.kwargs
+        assert kwargs["qty"] == pytest.approx(5.0)
+
+    # -----------------------------------------------------------------
+    # Drain SELL qty bounded by Alpaca truth (ai-broker#41)
+    # -----------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_drain_partial_when_alpaca_holds_less_than_db(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        tmp_db_path,
+    ):
+        """DB says +10 SPY, Alpaca holds +5 (e.g. external partial
+        flatten landed between the bot's writes and this tick).
+
+        Submitting SELL 10 here would close the long *and* open a
+        short for the missing 5 — the latent half of the 2026-04-30
+        incident class. The drain SELL must be bounded by Alpaca's
+        actual qty.
+        """
+        import sqlite3
+
+        conn = sqlite3.connect(tmp_db_path)
+        conn.execute(
+            """
+            INSERT INTO positions (
+                ticker, exchange, currency, quantity, entry_price,
+                entry_time, status, hold_type, phase, strategy_id
+            ) VALUES ('SPY', 'US', 'USD', 10.0, 100.0,
+                      '2026-04-27T15:40:00-04:00',
+                      'STOP_AND_TARGET_ACTIVE', 'swing', 1, 'breakout')
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        partial = MagicMock()
+        partial.qty = "5.0"  # Alpaca holds less than DB
+        base_order_manager._gw.client.get_open_position.return_value = partial
+
+        sm = StrategyManager(
+            strategies=[_StubStrategy(decision=_make_decision())],
+            portfolio_manager=base_portfolio_manager,
+            market_data=base_market_data,
+            order_manager=base_order_manager,
+            risk_manager=base_risk_manager,
+            sentiment=base_sentiment,
+            earnings=base_earnings,
+            config=base_config,
+            db_path=tmp_db_path,
+        )
+
+        n = await sm.drain_disabled_sleeves()
+        assert n == 1
+        base_order_manager.place_exit.assert_awaited_once()
+        kwargs = base_order_manager.place_exit.await_args.kwargs
+        assert kwargs["qty"] == pytest.approx(5.0), (
+            "drain SELL must be bounded by Alpaca qty (5), not DB qty (10), "
+            "or it would close +5 and open -5 short"
+        )
+
+    @pytest.mark.asyncio
+    async def test_drain_caps_at_db_qty_when_alpaca_holds_more(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        tmp_db_path,
+    ):
+        """DB says +5 SPY, Alpaca holds +10. The +5 the DB tracks is
+        ours to drain; the additional +5 belongs to some other code
+        path (manual entry, live add-to-position outside the drain
+        loop) and is not the drain's to flatten.
+
+        Submit SELL 5, not 10.
+        """
+        import sqlite3
+
+        conn = sqlite3.connect(tmp_db_path)
+        conn.execute(
+            """
+            INSERT INTO positions (
+                ticker, exchange, currency, quantity, entry_price,
+                entry_time, status, hold_type, phase, strategy_id
+            ) VALUES ('SPY', 'US', 'USD', 5.0, 100.0,
+                      '2026-04-27T15:40:00-04:00',
+                      'STOP_AND_TARGET_ACTIVE', 'swing', 1, 'breakout')
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        bigger = MagicMock()
+        bigger.qty = "10.0"  # Alpaca holds more than DB tracks
+        base_order_manager._gw.client.get_open_position.return_value = bigger
+
+        sm = StrategyManager(
+            strategies=[_StubStrategy(decision=_make_decision())],
+            portfolio_manager=base_portfolio_manager,
+            market_data=base_market_data,
+            order_manager=base_order_manager,
+            risk_manager=base_risk_manager,
+            sentiment=base_sentiment,
+            earnings=base_earnings,
+            config=base_config,
+            db_path=tmp_db_path,
+        )
+
+        n = await sm.drain_disabled_sleeves()
+        assert n == 1
+        base_order_manager.place_exit.assert_awaited_once()
+        kwargs = base_order_manager.place_exit.await_args.kwargs
+        assert kwargs["qty"] == pytest.approx(5.0), (
+            "drain must not overshoot DB-tracked qty even if Alpaca holds "
+            "more — the surplus is not the drain's to flatten"
+        )
+
+    @pytest.mark.asyncio
+    async def test_drain_rechecks_alpaca_per_position(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        tmp_db_path,
+    ):
+        """The Alpaca verification must run before every SELL in the
+        drain loop, not just before the first one. Pre-PR-#20 the
+        drain looped over a stale snapshot and emitted SELLs in
+        pairs ~2 minutes apart — the per-iteration check is what
+        prevents a partial pre-tick drain from wrecking later
+        iterations.
+
+        Seed two orphan positions on different tickers; assert
+        get_open_position is called for each.
+        """
+        import sqlite3
+
+        conn = sqlite3.connect(tmp_db_path)
+        conn.execute(
+            """
+            INSERT INTO positions (
+                ticker, exchange, currency, quantity, entry_price,
+                entry_time, status, hold_type, phase, strategy_id
+            ) VALUES
+              ('SPY',  'US', 'USD', 5.0, 100.0,
+               '2026-04-27T15:40:00-04:00',
+               'STOP_AND_TARGET_ACTIVE', 'swing', 1, 'breakout'),
+              ('XLRE', 'US', 'USD', 20.0, 50.0,
+               '2026-04-28T09:40:00-04:00',
+               'STOP_AND_TARGET_ACTIVE', 'swing', 1, 'trend_following')
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        # Both Alpaca-side positions match DB: SELL fires for each.
+        def _get_open_position(ticker: str):
+            pos = MagicMock()
+            pos.qty = "5.0" if ticker == "SPY" else "20.0"
+            return pos
+
+        base_order_manager._gw.client.get_open_position.side_effect = (
+            _get_open_position
+        )
+
+        sm = StrategyManager(
+            strategies=[_StubStrategy(decision=_make_decision())],
+            portfolio_manager=base_portfolio_manager,
+            market_data=base_market_data,
+            order_manager=base_order_manager,
+            risk_manager=base_risk_manager,
+            sentiment=base_sentiment,
+            earnings=base_earnings,
+            config=base_config,
+            db_path=tmp_db_path,
+        )
+
+        n = await sm.drain_disabled_sleeves()
+        assert n == 2
+        # Per-iteration check ran for each of the two orphan tickers.
+        assert (
+            base_order_manager._gw.client.get_open_position.call_count == 2
+        ), "Alpaca position lookup must run once per orphan position"
+        # Two SELLs submitted, one per ticker.
+        assert base_order_manager.place_exit.await_count == 2
+        called_tickers = {
+            call.kwargs["ticker"]
+            for call in base_order_manager.place_exit.await_args_list
+        }
+        assert called_tickers == {"SPY", "XLRE"}
+
+    @pytest.mark.asyncio
+    async def test_drain_refuses_on_nan_alpaca_qty(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        tmp_db_path,
+    ):
+        """If Alpaca returns NaN for ``qty`` (schema drift, parser
+        oddity), the drain must refuse to submit any SELL.
+
+        ``NaN > 0`` is False, so the side-mismatch check inside
+        ``_check_alpaca_position`` returns OPPOSITE_SIDE — the drain
+        logs CRITICAL and skips. Pin this behavior so a future loosening
+        of the side-mismatch check can't silently route NaN through
+        ``min(qty, abs(NaN))`` (which is NaN) into ``place_exit``.
+        """
+        import sqlite3
+
+        conn = sqlite3.connect(tmp_db_path)
+        conn.execute(
+            """
+            INSERT INTO positions (
+                ticker, exchange, currency, quantity, entry_price,
+                entry_time, status, hold_type, phase, strategy_id
+            ) VALUES ('SPY', 'US', 'USD', 10.0, 100.0,
+                      '2026-04-27T15:40:00-04:00',
+                      'STOP_AND_TARGET_ACTIVE', 'swing', 1, 'breakout')
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        nan_pos = MagicMock()
+        nan_pos.qty = "nan"
+        base_order_manager._gw.client.get_open_position.return_value = nan_pos
+
+        sm = StrategyManager(
+            strategies=[_StubStrategy(decision=_make_decision())],
+            portfolio_manager=base_portfolio_manager,
+            market_data=base_market_data,
+            order_manager=base_order_manager,
+            risk_manager=base_risk_manager,
+            sentiment=base_sentiment,
+            earnings=base_earnings,
+            config=base_config,
+            db_path=tmp_db_path,
+        )
+
+        n = await sm.drain_disabled_sleeves()
+        assert n == 0
+        base_order_manager.place_exit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_drain_dry_run_logs_bounded_qty_on_partial(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        tmp_db_path,
+        caplog,
+    ):
+        """Dry-run path must emit the bounded qty in its log line, not
+        the raw DB qty. A regression where the dry-run preview shows
+        ``qty=10`` while the live path SELLs 5 would mask the partial
+        bound during operator review.
+        """
+        import logging
+        import sqlite3
+
+        conn = sqlite3.connect(tmp_db_path)
+        conn.execute(
+            """
+            INSERT INTO positions (
+                ticker, exchange, currency, quantity, entry_price,
+                entry_time, status, hold_type, phase, strategy_id
+            ) VALUES ('SPY', 'US', 'USD', 10.0, 100.0,
+                      '2026-04-27T15:40:00-04:00',
+                      'STOP_AND_TARGET_ACTIVE', 'swing', 1, 'breakout')
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        partial = MagicMock()
+        partial.qty = "5.0"
+        base_order_manager._gw.client.get_open_position.return_value = partial
+
+        sm = StrategyManager(
+            strategies=[_StubStrategy(decision=_make_decision())],
+            portfolio_manager=base_portfolio_manager,
+            market_data=base_market_data,
+            order_manager=base_order_manager,
+            risk_manager=base_risk_manager,
+            sentiment=base_sentiment,
+            earnings=base_earnings,
+            config=base_config,
+            db_path=tmp_db_path,
+            dry_run=True,
+        )
+
+        with caplog.at_level(logging.WARNING, logger="trading_bot.strategy.strategy_manager"):
+            n = await sm.drain_disabled_sleeves()
+
+        # Dry-run skips order submission entirely; no row is closed.
+        assert n == 0
+        base_order_manager.place_exit.assert_not_awaited()
+        # The "Draining orphan position" warning emits the bounded qty.
+        drain_lines = [
+            r.getMessage() for r in caplog.records
+            if "Draining orphan position" in r.getMessage()
+        ]
+        assert drain_lines, "expected a 'Draining orphan position' log line"
+        assert "qty=5.0000" in drain_lines[0], (
+            f"dry-run log must show bounded qty (5), got: {drain_lines[0]}"
+        )
 
     @pytest.mark.asyncio
     async def test_drain_does_not_close_db_on_transient_alpaca_error(
