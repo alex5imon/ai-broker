@@ -6,12 +6,20 @@ name: static-checks
 #      async execution code, and bans naive date.today() / datetime.now()
 #      in live-path modules. Encodes lessons from PR #52, #56, and the
 #      overnight_drift naive-date fix.
-#   2. ruff check on the whole package.
-#   3. mypy --strict-equality on the critical path only (execution,
+#   2. ruff check on live + post-close paths (self_improve, reporting, db,
+#      health). Backtester and tests still excluded — they have known
+#      lint debt unrelated to live correctness.
+#   3. bandit -lll — HIGH-severity security findings only (eval, exec,
+#      subprocess shell=True, weak crypto, hardcoded passwords).
+#      MEDIUM is noisy on this codebase: f-string SQL with bound `?`
+#      placeholders and the intentional 0.0.0.0 health bind both trip
+#      it. Tighten to MEDIUM once those are individually nosec'd.
+#   4. pip-audit — known-vulnerable dependency versions.
+#   5. mypy --strict-equality on the critical path only (execution,
 #      strategy, gateway, main, config). Backtester / self_improve /
 #      reporting / tests are excluded — they don't run on the live tick
 #      and would drown the signal in noise.
-#   4. pytest -m critical — fast subset (the markers tag the modules
+#   6. pytest -m critical — fast subset (the markers tag the modules
 #      exercising order placement, risk gates, and the tick loop).
 #
 # This runs on every push and PR. Must stay fast (<60s) so contributors
@@ -44,16 +52,15 @@ jobs:
       - name: Install deps
         run: |
           pip install -r requirements.txt
-          pip install ruff mypy
+          pip install ruff mypy bandit pip-audit
 
       - name: Live-path regex guards
         run: bash scripts/check_live_path.sh
 
-      - name: Ruff (live path)
-        # Scoped to the modules that run on the live tick. Backtester,
-        # self_improve, reporting, and tests have known unused-import
-        # noise we'll clean up incrementally — broaden this scope once
-        # those are dealt with.
+      - name: Ruff (live + post-close paths)
+        # Live-tick modules + post-close modules (self_improve,
+        # reporting, db, health) — both are clean today. Backtester
+        # and tests still have known noise; add when cleaned up.
         run: |
           ruff check \
             trading_bot/main.py \
@@ -62,7 +69,24 @@ jobs:
             trading_bot/gateway/ \
             trading_bot/strategy/ \
             trading_bot/utils/ \
-            trading_bot/data/market_data.py
+            trading_bot/data/market_data.py \
+            trading_bot/self_improve/ \
+            trading_bot/reporting/ \
+            trading_bot/db/ \
+            trading_bot/health/
+
+      - name: Bandit (HIGH severity)
+        # HIGH-only gate: eval/exec, subprocess shell=True, weak crypto,
+        # hardcoded passwords, pickle on untrusted data. MEDIUM is
+        # currently noisy (parameterised SQL with f-string placeholders
+        # for `?,?,?`, intentional 0.0.0.0 health bind) and would
+        # require ~6 #nosec annotations to clean — separate task.
+        run: bandit -r trading_bot/ -lll -q
+
+      - name: pip-audit
+        # Hard gate on known-vulnerable dependency versions. No findings
+        # today; this locks in the baseline.
+        run: pip-audit -r requirements.txt
 
       - name: Mypy (critical path)
         run: |
