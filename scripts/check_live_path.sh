@@ -13,6 +13,11 @@
 #   2. Inside live-path modules, no naive date.today() / datetime.now()
 #      without an explicit tz= keyword. Use trading_today() / trading_now()
 #      from trading_bot.utils.time, or pass tz=TZ_EASTERN.
+#   3. Inside live-path modules, no equality comparison on money-typed
+#      variables (price/pnl/cash/qty/equity/...) against literal numbers.
+#      Float arithmetic accumulates ±1e-15 drift; `pnl == 0` mis-classifies
+#      a scratch trade as a tiny win/loss. Use `abs(x) < epsilon` or
+#      `math.isclose()`.
 #
 # Usage:
 #   bash scripts/check_live_path.sh
@@ -105,6 +110,42 @@ if [ -n "$NAIVE_HITS" ]; then
     echo "$NAIVE_HITS" | sed 's/^/    /'
     echo "  Use trading_today() / trading_now() from trading_bot.utils.time,"
     echo "  or pass tz=TZ_EASTERN explicitly."
+    FAIL=1
+else
+    echo "  OK"
+fi
+
+# ---------------------------------------------------------------------
+# Rule 3 — no equality comparisons on money-typed variables
+# ---------------------------------------------------------------------
+# Catches `pnl == 0`, `price != 100.0`, etc. Float arithmetic drifts;
+# a scratch trade with P&L of 1e-15 must be classified the same as 0.0.
+# Allow `<= 0`, `>= 0`, `> 0`, `< 0` — those are direction checks, not
+# exact-value checks. Allow `is None` / `is not None` (no equality).
+echo "[live-path] Rule 3 — no equality on money-typed variables"
+MONEY_VARS='price|pnl|cash|qty|quantity|equity|amount|balance|cost|fees|commission|exit_price|entry_price|stop_price|target_price|net_pnl'
+MONEY_HITS=""
+for path in "${LIVE_PATHS[@]}"; do
+    [ -e "$path" ] || continue
+    hits=$(
+        grep -nE "\\b(${MONEY_VARS})[a-z_]*\\s*(==|!=)\\s*[-+]?[0-9]" "$path" \
+            --include="*.py" -r 2>/dev/null \
+            | grep -vE "^[^:]+:[0-9]+:[[:space:]]*#" \
+            | grep -vE '"""' \
+            | grep -vE "'''" \
+            | grep -v "tests/" \
+            || true
+    )
+    if [ -n "$hits" ]; then
+        MONEY_HITS="${MONEY_HITS}${hits}"$'\n'
+    fi
+done
+
+if [ -n "$MONEY_HITS" ]; then
+    echo "  FAIL — equality comparison on money-typed variable in live path:"
+    echo "$MONEY_HITS" | sed 's/^/    /'
+    echo "  Use abs(x) < epsilon or math.isclose() — float drift makes"
+    echo "  exact equality unreliable for money/price/qty values."
     FAIL=1
 else
     echo "  OK"

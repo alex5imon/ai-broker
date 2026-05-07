@@ -1,0 +1,45 @@
+# Pre-commit hooks mirror the static-checks GitHub workflow so the
+# feedback loop is local (sub-second) rather than waiting for CI.
+#
+# Setup:  pip install pre-commit && pre-commit install
+# Update: pre-commit autoupdate (then pin the versions back to match
+#         requirements-dev.txt — the CI gate is the source of truth).
+#
+# Versions are pinned to the same revisions as requirements-dev.txt so
+# local runs and CI runs use byte-identical tools. If you bump one,
+# bump the other.
+
+repos:
+  - repo: local
+    hooks:
+      - id: live-path-regex-guards
+        name: live-path regex guards
+        description: |
+          Block sync client.submit_order in async exec code and naive
+          datetime.now()/date.today() in live-path modules. Mirrors
+          static-checks job step 1.
+        entry: bash scripts/check_live_path.sh
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: ruff
+        name: ruff (whole repo)
+        description: |
+          Mirrors the static-checks ruff gate. Whole-repo today after
+          the 2026-05-07 cleanup pass.
+        entry: ruff check .
+        language: system
+        types: [python]
+        pass_filenames: false
+
+      - id: bandit
+        name: bandit (HIGH severity)
+        description: |
+          HIGH-severity security findings only. Matches static-checks
+          job step 3. MEDIUM is on a separate path; promote when the
+          known false-positives are individually nosec-annotated.
+        entry: bandit -r trading_bot/ -lll -q
+        language: system
+        pass_filenames: false
+        always_run: true

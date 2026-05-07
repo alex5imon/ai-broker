@@ -26,6 +26,12 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 ET: ZoneInfo = TZ_EASTERN
 
+# Tolerance for "scratch trade" (P&L exactly zero). The P&L float
+# accumulator can drift to ±1e-15 from rounding, so a strict ``== 0``
+# would mis-classify those as tiny wins/losses and wrongly advance the
+# loss-streak counter.
+_SCRATCH_EPSILON: float = 1e-9
+
 
 def _key(strategy_id: str) -> str:
     return f"loss_cooldown:{strategy_id}"
@@ -67,10 +73,10 @@ class LossCooldownTracker:
 
         ``pnl > 0`` resets the counter and clears any active cooldown.
         ``pnl < 0`` increments the counter; if it reaches the configured
-        threshold, a cooldown window is set. ``pnl == 0`` (a scratch
-        trade) is treated as neutral — neither resetting nor advancing
-        the streak — to avoid false cooldowns from break-even runs on
-        commission-free SPY intraday.
+        threshold, a cooldown window is set. A scratch trade (``|pnl| <
+        _SCRATCH_EPSILON``) is treated as neutral — neither resetting
+        nor advancing the streak — to avoid false cooldowns from
+        break-even runs on commission-free SPY intraday.
         """
         if not self._config.enabled:
             return
@@ -100,8 +106,11 @@ class LossCooldownTracker:
                         )
                     return
 
-                if pnl == 0:
+                if abs(pnl) < _SCRATCH_EPSILON:
                     # Scratch trade — neither resets nor advances the streak.
+                    # Use an epsilon rather than `pnl == 0.0` because float
+                    # arithmetic in the P&L calc can produce ±1e-15 noise
+                    # (`shares × (exit - entry)` accumulates rounding).
                     return
 
                 consecutive += 1

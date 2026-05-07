@@ -1465,7 +1465,10 @@ class OrderManager:
     # column outside this map. Far harder to misuse than a dynamic
     # f-string with a separate allowlist.
     _POSITION_UPDATE_SQL: dict[str, str] = {
-        col: f"UPDATE positions SET {col} = ?, updated_at = ? WHERE id = ?"
+        # Column name is part of the static SQL key — comprehension iterates
+        # over a hardcoded tuple of column names below. No runtime input
+        # reaches the f-string.
+        col: f"UPDATE positions SET {col} = ?, updated_at = ? WHERE id = ?"  # nosec B608
         for col in (
             "status", "alpaca_order_id", "alpaca_stop_order_id",
             "alpaca_target_order_id", "alpaca_trail_order_id", "oca_group",
