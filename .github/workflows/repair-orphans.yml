@@ -16,11 +16,13 @@ on:
         type: boolean
         default: true
 
-# Same group as the bot so a real bot tick can't trample our DB write
-# and vice versa. Don't cancel-in-progress: a half-finished repair
-# leaves the cache in an inconsistent state.
+# Own concurrency group so a scheduled bot.yml tick (which sets
+# cancel-in-progress=true on the bot-run group) cannot send a cancel
+# signal mid-write. The repair re-restores the most recent bot-db-*
+# cache via restore-keys and writes back under the same prefix, so
+# the next bot tick still picks up our changes.
 concurrency:
-  group: bot-run
+  group: repair-run
   cancel-in-progress: false
 
 permissions:

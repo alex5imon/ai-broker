@@ -45,14 +45,17 @@ logger = logging.getLogger(__name__)
 ET: ZoneInfo = TZ_EASTERN
 
 
-@dataclass
+@dataclass(frozen=True)
 class RepairReport:
     """Summary of a single repair invocation."""
 
     entry_failed_scanned: int
     entry_failed_repaired: int
+    entry_failed_marked_closed: int
     unknown_duplicates_scanned: int
     unknown_duplicates_closed: int
+    phantom_live_scanned: int
+    phantom_live_closed: int
     dry_run: bool
 
 
@@ -86,6 +89,33 @@ def _load_unknown_duplicates(
         (),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+async def _fetch_live_tickers(client) -> set[str]:
+    """Fetch the set of tickers currently held at Alpaca (qty != 0).
+
+    Single broker query at the top of the repair, threaded through every
+    decision so the script can distinguish "filled and still held" (flip
+    to live) from "filled then exited later" (mark CLOSED).
+    """
+    try:
+        positions = await asyncio.to_thread(client.get_all_positions)
+    except Exception:
+        logger.warning(
+            "Could not list Alpaca positions — falling back to "
+            "filled-only check (may flip ghost rows to live)",
+            exc_info=True,
+        )
+        return set()
+    out: set[str] = set()
+    for p in positions:
+        try:
+            qty = float(getattr(p, "qty", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if abs(qty) > 1e-6:
+            out.add(str(getattr(p, "symbol", "")))
+    return out
 
 
 async def _check_order_filled(client, alpaca_order_id: str):
@@ -154,16 +184,31 @@ async def _find_open_stop_for_ticker(
 async def _repair_entry_failed(
     conn: sqlite3.Connection,
     client,
+    live_tickers: set[str],
     *,
     dry_run: bool,
-) -> tuple[int, int]:
-    """Flip ENTRY_FAILED → STOP_AND_TARGET_ACTIVE for rows whose Alpaca
-    order actually filled, adopting any matching open stop.
+) -> tuple[int, int, int]:
+    """Repair ENTRY_FAILED rows.
 
-    Returns (scanned, repaired).
+    Three outcomes per row:
+
+    - Order **filled and ticker is still held** → flip to
+      ``STOP_AND_TARGET_ACTIVE`` (adopt matching broker stop) or
+      ``POSITION_OPEN`` (no live stop yet — next reconciler tick
+      attaches one).
+    - Order **filled but ticker is NOT held at Alpaca** → mark
+      ``CLOSED`` with a backfill note. The fill happened then the
+      position was exited (intraday close, MOO, manual flatten); the
+      previous version of this script wrongly flipped these to
+      POSITION_OPEN, creating ghost rows.
+    - Order **not filled** (canceled/expired/rejected) → leave
+      ``ENTRY_FAILED`` (genuine failure).
+
+    Returns ``(scanned, flipped_to_live, marked_closed)``.
     """
     candidates = _load_entry_failed_with_order_id(conn)
-    repaired = 0
+    flipped_live = 0
+    marked_closed = 0
     now_iso: str = datetime.now(tz=ET).isoformat()
 
     for pos in candidates:
@@ -187,8 +232,40 @@ async def _repair_entry_failed(
             )
             continue
 
+        ticker = str(pos["ticker"])
+        currently_held: bool = ticker in live_tickers
+
+        if not currently_held:
+            # Filled then exited later. Mark CLOSED with a note —
+            # never flip a ghost to live.
+            logger.info(
+                "%sMarking position %d (%s) CLOSED — entry order %s "
+                "filled @ %.4f but ticker not currently held at Alpaca "
+                "(round-tripped before repair)",
+                "[DRY-RUN] " if dry_run else "",
+                pos["id"], ticker, oid[:8], filled_avg,
+            )
+            if not dry_run:
+                # No notes column on positions — the log line above is
+                # the audit trail. The fill price/quantity is preserved
+                # so daily-review backfill can still match this position
+                # to its exit fill in the trades table.
+                with conn:
+                    conn.execute(
+                        "UPDATE positions SET status = ?, "
+                        "entry_price = ?, quantity = ?, "
+                        "updated_at = ? "
+                        "WHERE id = ?",
+                        (
+                            PositionStatus.CLOSED.value, filled_avg,
+                            filled_qty, now_iso, pos["id"],
+                        ),
+                    )
+            marked_closed += 1
+            continue
+
         stop_id = await _find_open_stop_for_ticker(
-            client, str(pos["ticker"]), filled_qty,
+            client, ticker, filled_qty,
         )
 
         new_status: str = (
@@ -200,12 +277,12 @@ async def _repair_entry_failed(
             "%sRepairing position %d (%s): ENTRY_FAILED -> %s "
             "(qty=%.6f @ %.4f, stop_id=%s)",
             "[DRY-RUN] " if dry_run else "",
-            pos["id"], pos["ticker"], new_status,
+            pos["id"], ticker, new_status,
             filled_qty, filled_avg, stop_id or "none",
         )
 
         if dry_run:
-            repaired += 1
+            flipped_live += 1
             continue
 
         with conn:
@@ -220,9 +297,9 @@ async def _repair_entry_failed(
                     pos["id"],
                 ),
             )
-        repaired += 1
+        flipped_live += 1
 
-    return len(candidates), repaired
+    return len(candidates), flipped_live, marked_closed
 
 
 def _close_unknown_duplicates(
@@ -281,25 +358,135 @@ def _close_unknown_duplicates(
     return len(candidates), closed
 
 
+def _close_phantom_live_rows(
+    conn: sqlite3.Connection,
+    live_tickers: set[str],
+    *,
+    dry_run: bool,
+) -> tuple[int, int]:
+    """Close DB rows whose status is non-terminal but whose ticker is
+    not currently held at Alpaca.
+
+    Catches two failure modes:
+
+    1. Ghost rows left over from a prior repair run that wrongly
+       flipped ENTRY_FAILED → POSITION_OPEN without checking live
+       holdings (the bug this PR fixes).
+    2. Rows that ``StateRecovery._reconcile`` would normally close as
+       ``reconciliation_mismatch``, but silently dropped due to its
+       ``db_by_ticker[ticker] = row`` overwrite when two non-terminal
+       rows share a ticker.
+
+    The bot's reconciler will eventually catch class 1 alone for unique
+    tickers; class 2 needs explicit handling because the reconciler
+    can't see the second row at all.
+
+    Returns ``(scanned, closed)``.
+    """
+    rows = conn.execute(
+        "SELECT id, ticker, strategy_id, status, entry_time "
+        "FROM positions "
+        "WHERE status NOT IN ('CLOSED', 'ENTRY_FAILED') "
+        "ORDER BY ticker, entry_time"
+    ).fetchall()
+    scanned = 0
+    closed = 0
+    now_iso: str = datetime.now(tz=ET).isoformat()
+
+    # Group by ticker so we can decide which row(s) to close. If
+    # Alpaca holds the ticker AND multiple DB rows exist, close the
+    # older ones — the latest entry is the one matching the broker's
+    # actual position.
+    by_ticker: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        by_ticker.setdefault(str(r[1]), []).append({
+            "id": int(r[0]), "ticker": str(r[1]),
+            "strategy_id": r[2], "status": str(r[3]),
+            "entry_time": r[4],
+        })
+
+    for ticker, group in by_ticker.items():
+        scanned += len(group)
+        if ticker not in live_tickers:
+            # Whole group is phantom — close everything.
+            to_close = group
+            reason = "ticker not held at Alpaca (filled then exited)"
+        elif len(group) > 1:
+            # Multiple rows for a held ticker — keep the most recent,
+            # close the older ones (likely older fills already exited
+            # and replaced by a fresh entry).
+            sorted_rows = sorted(group, key=lambda r: r["entry_time"])
+            to_close = sorted_rows[:-1]
+            keeper = sorted_rows[-1]
+            reason = (
+                f"older duplicate of position {keeper['id']} "
+                "(both share a held ticker; reconciler can only "
+                "track one row per ticker)"
+            )
+        else:
+            continue
+
+        for unk in to_close:
+            logger.info(
+                "%sClosing phantom position %d (%s, %s, status=%s) — %s",
+                "[DRY-RUN] " if dry_run else "",
+                unk["id"], unk["ticker"],
+                unk["strategy_id"] or "<blank>",
+                unk["status"], reason,
+            )
+            if dry_run:
+                closed += 1
+                continue
+            with conn:
+                conn.execute(
+                    "UPDATE positions SET status = 'CLOSED', "
+                    "updated_at = ? WHERE id = ?",
+                    (now_iso, unk["id"]),
+                )
+            closed += 1
+
+    return scanned, closed
+
+
 async def repair(
     conn: sqlite3.Connection,
     client,
     *,
     dry_run: bool = False,
 ) -> RepairReport:
-    """Run both repairs. Order matters: fix ENTRY_FAILED first so the
-    sibling lookup in step 2 finds the now-live row."""
-    ef_scanned, ef_repaired = await _repair_entry_failed(
-        conn, client, dry_run=dry_run,
+    """Run all three repair passes. Order matters:
+
+    1. ``_repair_entry_failed`` — flip live or close based on whether
+       the broker actually holds the ticker.
+    2. ``_close_unknown_duplicates`` — close ``unknown`` rows whose
+       sibling is now live (sibling lookup depends on step 1).
+    3. ``_close_phantom_live_rows`` — close any remaining non-terminal
+       row whose ticker isn't held at Alpaca, plus older duplicate
+       rows for held tickers. Catches ghost rows from prior repair
+       runs and the reconciler's silent-drop bug.
+    """
+    live_tickers = await _fetch_live_tickers(client)
+    logger.info("Alpaca currently holds %d ticker(s): %s",
+                len(live_tickers),
+                ", ".join(sorted(live_tickers)) or "<none>")
+
+    ef_scanned, ef_repaired, ef_closed = await _repair_entry_failed(
+        conn, client, live_tickers, dry_run=dry_run,
     )
     unk_scanned, unk_closed = _close_unknown_duplicates(
         conn, dry_run=dry_run,
     )
+    phantom_scanned, phantom_closed = _close_phantom_live_rows(
+        conn, live_tickers, dry_run=dry_run,
+    )
     return RepairReport(
         entry_failed_scanned=ef_scanned,
         entry_failed_repaired=ef_repaired,
+        entry_failed_marked_closed=ef_closed,
         unknown_duplicates_scanned=unk_scanned,
         unknown_duplicates_closed=unk_closed,
+        phantom_live_scanned=phantom_scanned,
+        phantom_live_closed=phantom_closed,
         dry_run=dry_run,
     )
 
@@ -340,10 +527,13 @@ async def _async_main(args: argparse.Namespace) -> int:
         conn.close()
 
     logger.info(
-        "Repair complete: ef_scanned=%d ef_repaired=%d "
-        "unk_scanned=%d unk_closed=%d dry_run=%s",
+        "Repair complete: ef_scanned=%d ef_repaired=%d ef_closed=%d "
+        "unk_scanned=%d unk_closed=%d "
+        "phantom_scanned=%d phantom_closed=%d dry_run=%s",
         report.entry_failed_scanned, report.entry_failed_repaired,
+        report.entry_failed_marked_closed,
         report.unknown_duplicates_scanned, report.unknown_duplicates_closed,
+        report.phantom_live_scanned, report.phantom_live_closed,
         report.dry_run,
     )
     return 0
