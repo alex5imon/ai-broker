@@ -337,7 +337,11 @@ class TradingBot:
             # --- 8. Day-scoped flags (persisted via tick_state "__day__") ---
             flags: dict[str, Any] = self._load_day_flags(today_et)
 
-            # --- 9. Daily risk counter reset (only once per day) ---
+            # --- 9. Daily risk counter reset (intra-tick fallback) ---
+            # RiskManager._load_state handles the normal cron-tick day
+            # rollover at construction time. This branch only fires if
+            # the tick itself crosses midnight ET — possible during
+            # overnight maintenance ticks but otherwise dead.
             if today_et != self._risk_manager._trading_day:
                 self._risk_manager.reset_daily()
 

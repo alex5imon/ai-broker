@@ -20,7 +20,12 @@ from trading_bot.constants import (
     GICS_SECTOR,
     TZ_EASTERN,
 )
+from trading_bot.db import repository as repo
 from trading_bot.utils.time import trading_today
+
+# State key for the global RiskManager circuit. Per-strategy circuits
+# (e.g. loss_cooldown) use their own keys via the same table.
+_RISK_STATE_KEY: str = "risk_manager:global"
 
 if TYPE_CHECKING:
     from trading_bot.config import Config
@@ -84,6 +89,220 @@ class RiskManager:
         # reader scanning for object state.
         self._daily_loss_limit_hit: bool = False
         self._commission_stop_active: bool = False
+
+        # Hydrate persisted state from risk_circuit_state. Done last in
+        # __init__ so all defaults are in place before any field is
+        # selectively overwritten. See _load_state for the day-rollover
+        # semantics that distinguish day-scoped from cross-day fields.
+        self._load_state()
+
+    # ------------------------------------------------------------------
+    # State persistence (item 1, risk_infrastructure_gaps.md)
+    # ------------------------------------------------------------------
+
+    def _load_state(self) -> None:
+        """Hydrate fields from the ``risk_circuit_state`` table.
+
+        Cron model: every tick constructs a new RiskManager. Without
+        persistence the daily-loss-limit, drawdown breaker, pause, and
+        commission-stop circuits silently reset to defaults each tick,
+        rendering them inert across the 5-minute boundary.
+
+        Day-rollover semantics:
+        - **Day-scoped** fields (``_daily_pnl_usd``, ``_trade_count``,
+          ``_daily_loss_limit_hit``, ``_commission_stop_active``,
+          ``_commission_cooldown_until``) reset on a new trading day.
+        - **Cross-day** fields (``_is_paused`` + ``_pause_reason`` +
+          ``_pause_until`` if its window straddles a day boundary,
+          ``_drawdown_breaker_active`` + ``_recovery_trades_remaining``
+          + ``_recovery_size_pct``) survive day rollover.
+
+        Always reads ``_daily_pnl_usd`` from today's actual closed
+        trades (``repo.get_daily_pnl_usd``) rather than the stored blob,
+        so the field reflects ground truth even if a tick crashed
+        mid-record.
+
+        Always rebuilds ``_recent_rejections`` from the
+        ``order_rejections`` table within the configured window —
+        ``time.monotonic()`` values are meaningless across processes.
+        """
+        try:
+            with sqlite3.connect(self._db_path) as conn:
+                self._daily_pnl_usd = repo.get_daily_pnl_usd(conn)
+                state_row = repo.load_risk_state(conn, _RISK_STATE_KEY)
+        except Exception:
+            logger.warning(
+                "RiskManager: failed to hydrate persisted state; "
+                "starting from defaults",
+                exc_info=True,
+            )
+            return
+
+        self._hydrate_recent_rejections()
+
+        if state_row is None:
+            return
+
+        blob: dict[str, Any] = state_row.get("state") or {}
+        today: date = datetime.now(tz=ET).date()
+        stored_day_str: str | None = blob.get("trading_day")
+        try:
+            stored_day: date | None = (
+                date.fromisoformat(stored_day_str) if stored_day_str else None
+            )
+        except ValueError:
+            stored_day = None
+
+        same_day: bool = stored_day == today
+
+        # Cross-day fields — restored regardless of day rollover.
+        self._is_paused = bool(blob.get("is_paused", False))
+        self._pause_reason = blob.get("pause_reason")
+        pause_until_iso: str | None = blob.get("pause_until")
+        if pause_until_iso:
+            try:
+                pause_until: datetime = datetime.fromisoformat(pause_until_iso)
+                if pause_until.tzinfo is None:
+                    pause_until = pause_until.replace(tzinfo=ET)
+                self._pause_until = pause_until
+            except ValueError:
+                self._pause_until = None
+        self._drawdown_breaker_active = bool(blob.get("drawdown_breaker_active", False))
+        self._recovery_trades_remaining = int(blob.get("recovery_trades_remaining", 0))
+        self._recovery_size_pct = float(blob.get("recovery_size_pct", 1.0))
+
+        if same_day:
+            # Day-scoped fields restored only on the same trading day.
+            self._trade_count = int(blob.get("trade_count", 0))
+            self._daily_gross_pnl_usd = float(blob.get("daily_gross_pnl_usd", 0.0))
+            self._daily_commissions_usd = float(blob.get("daily_commissions_usd", 0.0))
+            self._daily_loss_limit_hit = bool(blob.get("daily_loss_limit_hit", False))
+            self._commission_stop_active = bool(blob.get("commission_stop_active", False))
+            cooldown_iso: str | None = blob.get("commission_cooldown_until")
+            if cooldown_iso:
+                try:
+                    cooldown_until: datetime = datetime.fromisoformat(cooldown_iso)
+                    if cooldown_until.tzinfo is None:
+                        cooldown_until = cooldown_until.replace(tzinfo=ET)
+                    self._commission_cooldown_until = cooldown_until
+                except ValueError:
+                    self._commission_cooldown_until = None
+            if stored_day is not None:
+                self._trading_day = stored_day
+        else:
+            # New day — day-scoped fields stay at __init__ defaults (zero),
+            # cross-day fields above stay restored. Stamp _trading_day to
+            # today and flush the corrected state so the next tick reads
+            # post-rollover values without redoing this work.
+            self._trading_day = today
+            logger.info(
+                "RiskManager: day rollover detected (stored=%s, today=%s); "
+                "day-scoped counters zeroed, cross-day breakers preserved",
+                stored_day, today,
+            )
+            self._persist_state()
+
+    def _hydrate_recent_rejections(self) -> None:
+        """Repopulate the rejections deque from the ``order_rejections``
+        table within the configured window.
+
+        ``_recent_rejections`` stores ``time.monotonic()`` floats — those
+        are meaningless after a process restart. Convert the table's
+        wallclock timestamps into the current process's monotonic clock
+        so the existing window/cutoff arithmetic in
+        ``check_order_rejections`` keeps working unchanged.
+        """
+        window_minutes: int = int(
+            self._config._get(
+                "risk", "order_rejections", "window_minutes", default=10,
+            )
+        )
+        cutoff_dt: datetime = datetime.now(tz=ET) - timedelta(
+            minutes=window_minutes,
+        )
+        try:
+            with sqlite3.connect(self._db_path) as conn:
+                rows = conn.execute(
+                    "SELECT timestamp FROM order_rejections "
+                    "WHERE timestamp >= ? ORDER BY timestamp ASC",
+                    (cutoff_dt.isoformat(),),
+                ).fetchall()
+        except sqlite3.OperationalError:
+            return
+
+        now_mono: float = time.monotonic()
+        now_wall: datetime = datetime.now(tz=ET)
+        self._recent_rejections.clear()
+        for row in rows:
+            ts_raw = row[0]
+            if not ts_raw:
+                continue
+            try:
+                ts: datetime = datetime.fromisoformat(str(ts_raw))
+            except ValueError:
+                continue
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=ET)
+            age_seconds: float = (now_wall - ts).total_seconds()
+            self._recent_rejections.append(now_mono - age_seconds)
+
+    def _persist_state(self) -> None:
+        """Write the current state back to ``risk_circuit_state``.
+
+        Called from every state-mutating method. ``tripped`` is True
+        when any breaker or pause is active so external monitoring of
+        the table keys off a single bool.
+        """
+        any_active: bool = (
+            self._is_paused
+            or self._drawdown_breaker_active
+            or self._daily_loss_limit_hit
+            or self._commission_stop_active
+        )
+        reason: str | None = None
+        if self._is_paused:
+            reason = self._pause_reason
+        elif self._daily_loss_limit_hit:
+            reason = "daily_loss_limit"
+        elif self._commission_stop_active:
+            reason = "commission_stop"
+        elif self._drawdown_breaker_active:
+            reason = "drawdown_breaker_recovery"
+
+        blob: dict[str, Any] = {
+            "trading_day": self._trading_day.isoformat(),
+            "trade_count": int(self._trade_count),
+            "daily_gross_pnl_usd": float(self._daily_gross_pnl_usd),
+            "daily_commissions_usd": float(self._daily_commissions_usd),
+            "is_paused": bool(self._is_paused),
+            "pause_reason": self._pause_reason,
+            "pause_until": (
+                self._pause_until.isoformat()
+                if self._pause_until is not None else None
+            ),
+            "drawdown_breaker_active": bool(self._drawdown_breaker_active),
+            "recovery_trades_remaining": int(self._recovery_trades_remaining),
+            "recovery_size_pct": float(self._recovery_size_pct),
+            "daily_loss_limit_hit": bool(self._daily_loss_limit_hit),
+            "commission_stop_active": bool(self._commission_stop_active),
+            "commission_cooldown_until": (
+                self._commission_cooldown_until.isoformat()
+                if self._commission_cooldown_until is not None else None
+            ),
+        }
+        try:
+            with sqlite3.connect(self._db_path) as conn:
+                repo.save_risk_state(
+                    conn,
+                    _RISK_STATE_KEY,
+                    tripped=any_active,
+                    reason=reason,
+                    state=blob,
+                )
+        except Exception:
+            logger.exception(
+                "RiskManager: failed to persist risk_circuit_state",
+            )
 
     # ------------------------------------------------------------------
     # Top-level gate
@@ -163,6 +382,7 @@ class RiskManager:
                 limit,
                 self._config.daily_loss_limit_pct * 100,
             )
+            self._persist_state()
         return breached
 
     def check_max_positions(self, current_count: int) -> bool:
@@ -401,6 +621,7 @@ class RiskManager:
             f"Paused until {pause_until.strftime('%Y-%m-%d %H:%M ET')}",
         )
         self._pause_until = pause_until
+        self._persist_state()
 
         # Synchronous send — risk-manager methods run from sync code
         # (``can_trade()``).  Scheduling via ``asyncio.ensure_future`` could be
@@ -465,6 +686,7 @@ class RiskManager:
                 f"{pause_until.strftime('%H:%M ET')}",
             )
             self._pause_until = pause_until
+            self._persist_state()
 
             self._notifier.send_sync(
                 "Order Rejections",
@@ -478,7 +700,12 @@ class RiskManager:
         return False
 
     def record_rejection(self, ticker: str, reason: str) -> None:
-        """Record an order rejection for the sliding-window counter."""
+        """Record an order rejection for the sliding-window counter.
+
+        Persists to ``order_rejections`` so the deque can be rebuilt on
+        the next tick (the in-memory ``time.monotonic()`` values are
+        meaningless across processes — see ``_hydrate_recent_rejections``).
+        """
         self._recent_rejections.append(time.monotonic())
         logger.warning("Order rejection recorded: %s - %s", ticker, reason)
 
@@ -531,6 +758,7 @@ class RiskManager:
                     daily_commissions,
                     daily_gross_pnl,
                 )
+                self._persist_state()
                 return "stop"
             return None
 
@@ -545,6 +773,7 @@ class RiskManager:
                 daily_commissions,
                 daily_gross_pnl,
             )
+            self._persist_state()
             return "stop"
 
         if ratio >= warning_ratio:
@@ -557,6 +786,7 @@ class RiskManager:
                 ratio * 100,
                 cooldown_min,
             )
+            self._persist_state()
             return "warning"
 
         return None
@@ -604,6 +834,8 @@ class RiskManager:
                     self._recovery_size_pct = 1.0
                     logger.info("Drawdown recovery complete - normal sizing resumed")
 
+        self._persist_state()
+
     # ------------------------------------------------------------------
     # Daily lifecycle
     # ------------------------------------------------------------------
@@ -621,6 +853,7 @@ class RiskManager:
         self._recent_rejections.clear()
 
         logger.info("Risk manager daily counters reset for %s", self._trading_day)
+        self._persist_state()
 
     # ------------------------------------------------------------------
     # Pause / resume
@@ -631,6 +864,7 @@ class RiskManager:
         self._is_paused = True
         self._pause_reason = reason
         logger.warning("Trading PAUSED: %s", reason)
+        self._persist_state()
 
     def resume_trading(self) -> None:
         """Resume trading after a pause."""
@@ -641,6 +875,7 @@ class RiskManager:
         self._is_paused = False
         self._pause_reason = None
         self._pause_until = None
+        self._persist_state()
 
     # ------------------------------------------------------------------
     # Kill switch
@@ -677,6 +912,7 @@ class RiskManager:
         # 4. Permanent close-only mode
         self.pause_trading("Kill switch activated - permanent close-only mode")
         self._pause_until = None  # No auto-resume
+        self._persist_state()
 
         logger.critical("Kill switch execution complete")
 

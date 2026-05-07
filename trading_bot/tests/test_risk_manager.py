@@ -348,3 +348,153 @@ class TestDailyReset:
         risk_manager.record_trade(3.0, 0.0)    # winner +3
         # Expected gross profit = 10 + 3 = 13 (losses excluded)
         assert abs(risk_manager._daily_gross_pnl_usd - 13.0) < 0.01
+
+
+# ---------------------------------------------------------------------------
+# Cross-tick state persistence (item 1 — risk_circuit_state)
+# ---------------------------------------------------------------------------
+
+
+class TestStatePersistence:
+    """RiskManager state must survive across the stateless cron tick.
+
+    Pre-fix: every tick constructed a fresh RiskManager with all defaults,
+    silently inerting the daily-loss-limit, drawdown-breaker, pause, and
+    commission-stop circuits. See risk_infrastructure_gaps.md item 1.
+    """
+
+    def test_pause_survives_new_instance(
+        self, config: Config, tmp_db_path: str, mock_notifier
+    ) -> None:
+        rm1 = RiskManager(config, tmp_db_path, mock_notifier)
+        rm1.pause_trading("test pause")
+
+        # Simulate new tick — fresh process, fresh RiskManager.
+        rm2 = RiskManager(config, tmp_db_path, mock_notifier)
+        ok, reason = rm2.can_trade()
+        assert ok is False
+        assert reason == "test pause"
+
+    def test_drawdown_breaker_survives_new_instance(
+        self, config: Config, tmp_db_path: str, mock_notifier
+    ) -> None:
+        rm1 = RiskManager(config, tmp_db_path, mock_notifier)
+        rm1._activate_drawdown_breaker(0.06)
+        assert rm1.drawdown_breaker_active is True
+
+        rm2 = RiskManager(config, tmp_db_path, mock_notifier)
+        assert rm2.drawdown_breaker_active is True
+
+    def test_recovery_trades_remaining_survives_new_instance(
+        self, config: Config, tmp_db_path: str, mock_notifier
+    ) -> None:
+        rm1 = RiskManager(config, tmp_db_path, mock_notifier)
+        rm1._activate_drawdown_breaker(0.06)
+        # Mid-recovery — one winning trade has decremented the counter.
+        rm1.record_trade(5.0, 0.0)
+
+        rm2 = RiskManager(config, tmp_db_path, mock_notifier)
+        # Recovery state, including the decremented counter, persists.
+        assert rm2.drawdown_breaker_active is True
+        assert rm2._recovery_trades_remaining == rm1._recovery_trades_remaining
+
+    def test_daily_loss_limit_hit_survives_within_same_day(
+        self, config: Config, tmp_db_path: str, mock_notifier
+    ) -> None:
+        rm1 = RiskManager(config, tmp_db_path, mock_notifier)
+        rm1.check_daily_loss_limit(-100.0, 1000.0)  # -10% — well past 1% limit
+        ok1, _ = rm1.can_trade()
+        assert ok1 is False
+
+        rm2 = RiskManager(config, tmp_db_path, mock_notifier)
+        ok2, _ = rm2.can_trade()
+        assert ok2 is False, (
+            "daily-loss-limit hit must persist across ticks within the same day"
+        )
+
+    def test_commission_stop_survives_new_instance(
+        self, config: Config, tmp_db_path: str, mock_notifier
+    ) -> None:
+        rm1 = RiskManager(config, tmp_db_path, mock_notifier)
+        # >50% commission ratio — fires commission stop.
+        rm1._trade_count = 5
+        rm1.check_commission_budget(daily_commissions=10.0, daily_gross_pnl=15.0)
+        assert rm1._commission_stop_active is True
+
+        rm2 = RiskManager(config, tmp_db_path, mock_notifier)
+        assert rm2._commission_stop_active is True
+        ok, _ = rm2.can_trade()
+        assert ok is False
+
+    def test_resume_clears_persisted_pause(
+        self, config: Config, tmp_db_path: str, mock_notifier
+    ) -> None:
+        rm1 = RiskManager(config, tmp_db_path, mock_notifier)
+        rm1.pause_trading("temporary")
+
+        rm1.resume_trading()
+
+        rm2 = RiskManager(config, tmp_db_path, mock_notifier)
+        ok, _ = rm2.can_trade()
+        assert ok is True
+        assert rm2.is_paused is False
+
+    def test_day_rollover_zeros_day_scoped_only(
+        self, config: Config, tmp_db_path: str, mock_notifier
+    ) -> None:
+        """A new day must reset trade_count/daily_pnl/daily_loss_limit_hit
+        but preserve the pause/drawdown breaker if they're still active."""
+        rm1 = RiskManager(config, tmp_db_path, mock_notifier)
+        # Set up state: pause active, daily-loss-limit hit, some trade count.
+        rm1.pause_trading("multi-day pause")
+        # Set pause_until to tomorrow so it survives day rollover.
+        rm1._pause_until = datetime.now(tz=ET) + timedelta(days=2)
+        rm1.check_daily_loss_limit(-100.0, 1000.0)
+        rm1._trade_count = 7
+        # Force-persist with the updated pause_until
+        rm1._persist_state()
+
+        # Construct a new instance "tomorrow".
+        from trading_bot.execution import risk_manager as rm_module
+        future = datetime.now(tz=ET) + timedelta(days=1)
+        with patch.object(
+            rm_module, "datetime",
+            new=type("D", (), {
+                "now": staticmethod(lambda tz=None: future),
+                "fromisoformat": datetime.fromisoformat,
+            }),
+        ):
+            rm2 = RiskManager(config, tmp_db_path, mock_notifier)
+
+        # Day-scoped fields zeroed:
+        assert rm2._daily_loss_limit_hit is False
+        assert rm2._trade_count == 0
+        # Cross-day fields preserved:
+        assert rm2.is_paused is True
+        assert rm2._pause_reason == "multi-day pause"
+
+    def test_record_rejection_persists_via_order_rejections_table(
+        self, config: Config, tmp_db_path: str, mock_notifier
+    ) -> None:
+        """The deque uses time.monotonic() which is meaningless across
+        processes. New instance should rebuild the deque from the
+        order_rejections table."""
+        import sqlite3
+
+        rm1 = RiskManager(config, tmp_db_path, mock_notifier)
+        rm1.record_rejection("SPY", "out_of_money")
+        rm1.record_rejection("QQQ", "out_of_money")
+
+        # Sanity: rejections actually landed in the DB.
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM order_rejections"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert count == 2
+
+        # New instance hydrates the deque from the table within window.
+        rm2 = RiskManager(config, tmp_db_path, mock_notifier)
+        assert len(rm2._recent_rejections) == 2
