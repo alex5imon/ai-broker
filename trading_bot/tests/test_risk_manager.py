@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import asyncio
-import time
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import pytest

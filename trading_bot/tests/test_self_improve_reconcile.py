@@ -11,7 +11,6 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-import pytest
 
 from trading_bot.self_improve.reconcile import (
     AlpacaOrderRec,

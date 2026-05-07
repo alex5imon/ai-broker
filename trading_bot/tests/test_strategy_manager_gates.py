@@ -10,7 +10,6 @@ Covers:
 from __future__ import annotations
 
 import sqlite3
-from datetime import date
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 

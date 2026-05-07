@@ -6,11 +6,9 @@ so future migration bumps don't silently regress these tests.
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from pathlib import Path
 
-import pytest
 
 from trading_bot.constants import SCHEMA_VERSION
 from trading_bot.db.migrations import run_migrations

@@ -111,7 +111,7 @@ def monte_carlo(trades: list[dict], initial_cash: float = 1000.0, n_sims: int = 
     print(f"  P50:   ${np.percentile(fv, 50):.2f}  ({100*(np.percentile(fv,50)/initial_cash - 1):+.1f}%)")
     print(f"  P75:   ${np.percentile(fv, 75):.2f}  ({100*(np.percentile(fv,75)/initial_cash - 1):+.1f}%)")
     print(f"  P95:   ${np.percentile(fv, 95):.2f}  ({100*(np.percentile(fv,95)/initial_cash - 1):+.1f}%)")
-    print(f"\nMax drawdown distribution:")
+    print("\nMax drawdown distribution:")
     print(f"  P5  (best):  {100*np.percentile(dd, 95):.1f}%")
     print(f"  P50:         {100*np.percentile(dd, 50):.1f}%")
     print(f"  P95 (worst): {100*np.percentile(dd, 5):.1f}%")
@@ -126,7 +126,7 @@ def forward_bootstrap(trades: list[dict], initial_cash: float = 1000.0,
     299 trades over 5.7yrs ≈ 52 trades/year ≈ 13 trades/quarter per universe.
     But with 13 tickers the rate is higher. Simulate different horizons.
     """
-    print(f"\n=== FORWARD BOOTSTRAP (bootstrap-with-replacement) ===")
+    print("\n=== FORWARD BOOTSTRAP (bootstrap-with-replacement) ===")
     pnls = np.array([t["pnl_usd"] for t in trades])
     rng = np.random.default_rng(42)
 
@@ -137,7 +137,6 @@ def forward_bootstrap(trades: list[dict], initial_cash: float = 1000.0,
         ])
         p_negative = (final_pnl < 0).mean() * 100
         p_down_5 = (final_pnl < -initial_cash * 0.05).mean() * 100
-        months_approx = n_fwd / 52 * 12 / 13 * 13  # rough month proxy
         print(f"  Forward window of {n_fwd} trades (~{n_fwd/52*12:.0f} months):")
         print(f"    P5:  ${np.percentile(final_pnl, 5):+.2f}")
         print(f"    P50: ${np.percentile(final_pnl, 50):+.2f}")
@@ -150,7 +149,6 @@ def rolling_winrate(trades: list[dict], window: int = 30) -> None:
     print(f"\n=== ROLLING {window}-TRADE WIN RATE ===")
     sorted_t = sorted(trades, key=lambda t: t["exit_time"])
     wins = [1 if t["pnl_usd"] > 0 else 0 for t in sorted_t]
-    pnls = [t["pnl_usd"] for t in sorted_t]
     n = len(wins)
     low = (1.0, -1, "")
     high = (0.0, -1, "")

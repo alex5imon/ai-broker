@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timedelta
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -280,7 +280,7 @@ def _make_evaluator(
     market_data: Any,
     sentiment: Any,
     earnings: Any,
-    
+
     signals: dict[str, Any] | None = None,
 ):
     from trading_bot.strategy.entry import EntryEvaluator

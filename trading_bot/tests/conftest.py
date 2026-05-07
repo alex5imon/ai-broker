@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import sqlite3
-import tempfile
-from datetime import date, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 from zoneinfo import ZoneInfo
@@ -14,7 +12,6 @@ import pandas as pd
 import pytest
 
 from trading_bot.config import Config
-from trading_bot.constants import HoldType, Market, Phase, Exchange
 
 ET = ZoneInfo("US/Eastern")
 

@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 
 from trading_bot.config import Config
-from trading_bot.execution.position_sizer import PositionSize, PositionSizer
+from trading_bot.execution.position_sizer import PositionSizer
 
 
 # ---------------------------------------------------------------------------

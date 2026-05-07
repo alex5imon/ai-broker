@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from datetime import date, datetime, timedelta
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -310,7 +309,8 @@ class TestExitChecking:
             signals={},
             highest_price=11.00,
         )
-        trail_stop = 11.00 * (1.0 - 0.025)  # 10.725
+        # Trail stop = highest_price × (1 - trail_pct) = 11.00 × 0.975 = 10.725.
+        # bar_low=10.70 dips below it, so the trail must fire.
         result = engine._check_trade_exit(
             trade, bar_close=10.60, bar_high=10.80, bar_low=10.70,
             current_time=now, strategy=strat,
@@ -850,7 +850,10 @@ class TestMarketRegime:
 class TestMeanReversionAdaptive:
     """Direct tests on MeanReversionStrategy for the adaptive features."""
 
-    def _strat_with(self, **overrides: Any) -> "MeanReversionStrategy":
+    def _strat_with(self, **overrides: Any) -> Any:
+        # Local import keeps the strategy module out of the test module's
+        # import graph (it pulls heavy strategy deps). Returning ``Any``
+        # avoids needing a TYPE_CHECKING import dance for one helper.
         from trading_bot.strategy.strategies.mean_reversion import MeanReversionStrategy
         cfg: dict[str, Any] = {
             "rsi_period": 14,
@@ -902,7 +905,6 @@ class TestMeanReversionAdaptive:
     def test_let_winners_run_skips_rsi_exit(self) -> None:
         """When let_winners_run is on, evaluate_exit must not fire rsi_normalized
         even if current RSI is clearly above the exit threshold."""
-        from trading_bot.strategy.strategies.mean_reversion import MeanReversionStrategy
         strat = self._strat_with(let_winners_run=True, rsi_exit=40)
 
         # Build a DataFrame where RSI will compute as ~90 (clearly above 40)
@@ -931,7 +933,6 @@ class TestMeanReversionAdaptive:
 
     def test_rsi_exit_fires_when_let_winners_run_disabled(self) -> None:
         """Control: with let_winners_run off, rsi_normalized should fire."""
-        from trading_bot.strategy.strategies.mean_reversion import MeanReversionStrategy
         # take_profit_pct very large so fallback target doesn't short-circuit
         strat = self._strat_with(
             let_winners_run=False, rsi_exit=40, take_profit_pct=10.0,

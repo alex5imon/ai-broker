@@ -10,7 +10,6 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from trading_bot.execution.vol_target import (
-    VolTargetResult,
     load_recent_trade_returns,
     vol_target_multiplier,
 )
@@ -159,7 +158,7 @@ class TestStrategyBaseVolMultiplier:
     def _seed_trades(
         self, conn: sqlite3.Connection, strategy_id: str, returns: list[float]
     ) -> None:
-        from datetime import datetime, timedelta
+        from datetime import timedelta
         base = datetime(2026, 1, 1, 10, 0, 0)
         for i, r in enumerate(returns):
             entry = 100.0

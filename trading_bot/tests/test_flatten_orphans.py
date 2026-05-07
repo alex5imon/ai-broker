@@ -13,7 +13,6 @@ from dataclasses import dataclass
 
 import pytest
 
-from datetime import datetime
 from unittest.mock import MagicMock
 
 from trading_bot.self_improve.flatten_orphans import (

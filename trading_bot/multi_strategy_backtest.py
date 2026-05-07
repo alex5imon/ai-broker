@@ -1630,7 +1630,6 @@ class MultiStrategyBacktester:
             )
 
         EXEC_START = time(9, 35)
-        EXEC_END = time(15, 50)
         WIND_DOWN = time(15, 50)
         LOOKBACK_BARS: int = 80
 
