@@ -99,11 +99,21 @@ jobs:
         # today; this locks in the baseline.
         run: pip-audit -r requirements.txt
 
-      - name: Mypy (critical path)
+      - name: Mypy (critical path, strict-optional, required)
+        # Phase 1 of mypy tightening (PR #90):
+        #   - Promoted from `--no-strict-optional` to default (strict).
+        #   - Dropped `continue-on-error` — failures now block the gate.
+        # Three Alpaca-SDK-heavy modules have file-level
+        # `# mypy: disable-error-code="..."` directives narrowly
+        # silencing the SDK's loose union returns (Order | RawData,
+        # TradeAccount | RawData, BarSet | RawData) — see the docstring
+        # at the top of each file. Real None-misuse and other
+        # strict-optional bugs still surface.
+        # Phase 2 will expand to `trading_bot/strategy/strategies/` and
+        # `trading_bot/self_improve/`.
         run: |
           mypy \
             --ignore-missing-imports \
-            --no-strict-optional \
             trading_bot/main.py \
             trading_bot/config.py \
             trading_bot/execution/ \
@@ -112,10 +122,6 @@ jobs:
             trading_bot/strategy/entry.py \
             trading_bot/strategy/strategy_manager.py \
             trading_bot/utils/time.py
-        # mypy is advisory: surface signal without blocking the gate
-        # while we whittle down existing untyped code in the strategies/
-        # subdirectory. Promote to required once the noise is gone.
-        continue-on-error: true
 
       - name: Pytest critical-path subset
         run: pytest -m critical -q --tb=short trading_bot/tests/

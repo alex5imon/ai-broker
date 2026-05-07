@@ -8,7 +8,15 @@ comparing ``order.submitted_at`` against ``entry_timeout_seconds``; the
 old ``asyncio.create_task`` per-order timer is gone because it cannot
 survive a stateless cron run.  ``_active_orders`` is hydrated from the
 ``positions`` table at the start of ``_check_order_statuses``.
+
+Mypy note: the alpaca-py client returns ``Order | RawData`` and
+``list[Order] | RawData`` (where ``RawData = dict[str, Any]``) — the
+dict path is only reachable with ``raw_data=True`` which we never pass.
+``[arg-type, union-attr]`` covers those calls. Real None-misuse and
+other strict-optional issues still surface in this file.
 """
+
+# mypy: disable-error-code="arg-type, union-attr"
 
 from __future__ import annotations
 

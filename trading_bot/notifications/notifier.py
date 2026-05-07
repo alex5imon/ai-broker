@@ -157,7 +157,7 @@ class Notifier:
         ticker: str,
         side: str,
         price: float,
-        qty: int,
+        qty: float,
         reason: str,
     ) -> None:
         title: str = f"\U0001f4c8 [TRADE ENTRY] {ticker}"

@@ -111,9 +111,12 @@ class EarningsCalendar:
 
         try:
             loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+            # Pin a non-None local so the lambda closure preserves the
+            # type narrowing from the `if self._client is None` guard above.
+            client = self._client
             result: dict[str, Any] = await loop.run_in_executor(
                 None,
-                lambda: self._client.earnings_calendar(
+                lambda: client.earnings_calendar(
                     _from=from_date, to=to_date, symbol=""
                 ),
             )

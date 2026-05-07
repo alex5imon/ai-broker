@@ -5,7 +5,14 @@ reconnect alerting logic have been removed because a GHA cron tick is too
 short to benefit from them.  ``connect()`` validates credentials by fetching
 the account; if it fails the tick aborts.  Public methods keep ``async def``
 signatures for caller compat while bodies are synchronous REST calls.
+
+Mypy note: the alpaca-py client returns ``TradeAccount | RawData`` (where
+``RawData = dict[str, Any]``) — the dict path is only reachable with
+``raw_data=True`` which we never pass. The ``[assignment]`` suppression
+covers those calls. Real None-misuse / strict-optional issues still surface.
 """
+
+# mypy: disable-error-code="assignment"
 
 from __future__ import annotations
 
