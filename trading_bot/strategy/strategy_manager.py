@@ -7,7 +7,7 @@ import logging
 import sqlite3
 from dataclasses import replace
 from datetime import datetime
-from typing import Any
+from typing import Any, NamedTuple
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -63,6 +63,30 @@ def _is_alpaca_position_not_found(exc: Any) -> bool:
     if str(_ALPACA_POSITION_NOT_FOUND_CODE) in text:
         return True
     return False
+
+
+class AlpacaPositionCheck(NamedTuple):
+    """Outcome of probing Alpaca for a position before a drain SELL.
+
+    The drain loop must verify Alpaca state before submitting any
+    exit — DB qty can drift from broker truth (manual flatten,
+    broker-side stop fill not yet recorded, state-recovery race,
+    partial fills mid-tick). Submitting a SELL for the DB qty when
+    Alpaca holds less opens a short for the difference.
+
+    INVARIANT: drain SELL qty MUST be ``min(db_qty, abs(alpaca_qty))``
+    when ``verdict == "OK"``. Re-fetch Alpaca on every iteration of
+    the drain loop — the DB is the bot's intent, not the broker's
+    truth.
+
+    ``alpaca_qty`` is signed (positive = long, negative = short, 0 =
+    not held). Only meaningful when ``verdict == "OK"`` — for
+    NOT_HELD / OPPOSITE_SIDE / UNKNOWN it's set to 0.0 as a safe
+    default and the caller doesn't read it.
+    """
+
+    verdict: str
+    alpaca_qty: float
 
 
 class StrategyManager:
@@ -442,16 +466,17 @@ class StrategyManager:
             if qty <= 0:
                 continue
 
-            # Verify the position is actually held on Alpaca before
-            # submitting a SELL. The DB qty can drift from broker truth
-            # (manual flatten, broker-side stop fill not yet recorded,
-            # state-recovery race). Submitting blind opens a NEW position
-            # in the OPPOSITE direction — exactly the
-            # 2026-04-30 incident where a SELL drained against an
-            # already-flat sleeve and built an unbounded short.
+            # INVARIANT: re-fetch Alpaca qty before EACH SELL. The DB
+            # is the bot's intent; the broker is truth. DB qty drifts
+            # via manual flatten, broker-side stop fills not yet
+            # written back, state-recovery races, and partial fills
+            # mid-tick. Submitting a SELL for the DB qty when Alpaca
+            # holds less closes the long *and* opens a short for the
+            # difference — the 2026-04-30 incident class. Drain SELL
+            # qty must be bounded by Alpaca's position size.
             position_id: int | None = pos.get("id")
             check = self._check_alpaca_position(ticker, db_qty=qty)
-            if check == "NOT_HELD":
+            if check.verdict == "NOT_HELD":
                 logger.warning(
                     "Drain skip: %s strategy=%s DB qty=%+.4f but Alpaca "
                     "holds 0 — DB drift; marking position CLOSED instead "
@@ -461,15 +486,16 @@ class StrategyManager:
                 if position_id is not None:
                     self._mark_position_closed(position_id)
                 continue
-            if check == "OPPOSITE_SIDE":
+            if check.verdict == "OPPOSITE_SIDE":
                 logger.critical(
                     "Drain REFUSING %s strategy=%s: DB qty=%+.4f but Alpaca "
-                    "holds the opposite side. Will not submit a drain order "
-                    "that would deepen the position. Manual reconcile needed.",
-                    ticker, sid or "<none>", qty,
+                    "holds %+.4f (opposite side). Will not submit a drain "
+                    "order that would deepen the position. Manual reconcile "
+                    "needed.",
+                    ticker, sid or "<none>", qty, check.alpaca_qty,
                 )
                 continue
-            if check == "UNKNOWN":
+            if check.verdict == "UNKNOWN":
                 # Transient Alpaca lookup failure (5xx, network, rate
                 # limit, malformed response). Do NOT mark the DB row
                 # CLOSED — that permanently drops a possibly-real
@@ -481,11 +507,37 @@ class StrategyManager:
                     ticker, sid or "<none>",
                 )
                 continue
-            # check == "OK" — Alpaca confirms a same-side position.
+            # check.verdict == "OK" — Alpaca confirms a same-side position.
+            # Bound the SELL by what Alpaca actually holds. If DB says
+            # +10 and Alpaca holds +5 (e.g. external partial flatten),
+            # SELL 5 — never overshoot into a short. We never SELL
+            # *more* than the DB recorded either, because the DB is
+            # what the bot considers "ours to drain"; the rest is
+            # someone else's position to handle.
+            qty_to_sell: float = min(qty, abs(check.alpaca_qty))
+            if qty_to_sell <= 0:
+                # Defensive: NOT_HELD already covers alpaca_qty=0; this
+                # only fires if check.alpaca_qty came back as something
+                # exotic (NaN-ish, negative same-sign rounding). Log
+                # and skip rather than submit a zero-qty order.
+                logger.warning(
+                    "Drain skip: %s strategy=%s — computed qty_to_sell=%.4f "
+                    "(db=%+.4f, alpaca=%+.4f); refusing to submit",
+                    ticker, sid or "<none>",
+                    qty_to_sell, qty, check.alpaca_qty,
+                )
+                continue
+
+            if qty_to_sell < qty:
+                logger.warning(
+                    "Drain partial: %s strategy=%s DB qty=%+.4f but Alpaca "
+                    "holds %+.4f — SELL bounded by broker truth (%.4f)",
+                    ticker, sid or "<none>", qty, check.alpaca_qty, qty_to_sell,
+                )
 
             logger.warning(
                 "Draining orphan position: ticker=%s strategy=%s qty=%.4f",
-                ticker, sid or "<none>", qty,
+                ticker, sid or "<none>", qty_to_sell,
             )
 
             if self._dry_run:
@@ -494,7 +546,7 @@ class StrategyManager:
             try:
                 exit_order_id: str | None = await self._order_manager.place_exit(
                     ticker=ticker,
-                    qty=qty,
+                    qty=qty_to_sell,
                     reason=f"orphan_sleeve_drain:{sid or 'unknown'}",
                     is_emergency=False,
                 )
@@ -511,20 +563,18 @@ class StrategyManager:
 
         return closed
 
-    def _check_alpaca_position(self, ticker: str, *, db_qty: float) -> str:
+    def _check_alpaca_position(
+        self, ticker: str, *, db_qty: float,
+    ) -> AlpacaPositionCheck:
         """Probe Alpaca for the current position on ``ticker``.
 
-        Returns one of:
-          - ``"NOT_HELD"`` — Alpaca confirmed no position (HTTP 404 or
-            Alpaca error code 40410000). Caller should mark DB CLOSED.
-          - ``"OPPOSITE_SIDE"`` — Alpaca holds a position on the opposite
-            sign of ``db_qty``. A drain SELL on an already-short position
-            would deepen the short. Caller should REFUSE.
-          - ``"OK"`` — Alpaca holds a same-sign position. Drain may proceed.
-          - ``"UNKNOWN"`` — Lookup failed for a non-deterministic reason
-            (5xx, network, rate-limit, parse failure). Caller MUST NOT
-            mark CLOSED — a transient broker outage would silently drop
-            real positions out of the monitoring loop.
+        Returns an :class:`AlpacaPositionCheck` — see its docstring for
+        the per-verdict invariants. ``alpaca_qty`` is meaningful only
+        when ``verdict == "OK"`` and lets the caller bound the drain
+        SELL by what the broker actually holds (the partial-drain case
+        — DB says +10, Alpaca holds +5 — was the latent half of the
+        2026-04-30 incident; without the cap, a SELL 10 would close
+        the long *and* open a short for the missing 5).
         """
         from alpaca.common.exceptions import APIError
 
@@ -539,7 +589,7 @@ class StrategyManager:
             # mark the DB row CLOSED. Anything else (5xx, 429, schema
             # drift) is transient and should NOT mutate state.
             if _is_alpaca_position_not_found(exc):
-                return "NOT_HELD"
+                return AlpacaPositionCheck("NOT_HELD", 0.0)
             logger.warning(
                 "Alpaca position lookup for %s returned APIError "
                 "(status=%s, code=%s) — treating as UNKNOWN",
@@ -547,19 +597,19 @@ class StrategyManager:
                 getattr(exc, "status_code", None),
                 _safe_apierror_code(exc),
             )
-            return "UNKNOWN"
+            return AlpacaPositionCheck("UNKNOWN", 0.0)
         except Exception:
             logger.warning(
                 "Alpaca position lookup for %s failed unexpectedly — "
                 "treating as UNKNOWN", ticker, exc_info=True,
             )
-            return "UNKNOWN"
+            return AlpacaPositionCheck("UNKNOWN", 0.0)
 
         if alpaca_qty == 0:
-            return "NOT_HELD"
+            return AlpacaPositionCheck("NOT_HELD", 0.0)
         if (db_qty > 0) != (alpaca_qty > 0):
-            return "OPPOSITE_SIDE"
-        return "OK"
+            return AlpacaPositionCheck("OPPOSITE_SIDE", alpaca_qty)
+        return AlpacaPositionCheck("OK", alpaca_qty)
 
     def _mark_position_closed(self, position_id: int) -> None:
         """Update positions.status = 'CLOSED' for a single row."""
