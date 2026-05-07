@@ -6,11 +6,17 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from trading_bot.constants import TZ_EASTERN
 from trading_bot.self_improve.postmortem import (
     StrategyStats,
     compute_window_stats,
     summarize_all,
 )
+
+
+def _et_iso(dt: datetime) -> str:
+    """Render *dt* in the ET-aware ISO format used by production writers."""
+    return dt.astimezone(TZ_EASTERN).isoformat()
 
 
 def _insert_trade(
@@ -37,10 +43,10 @@ def _insert_trade(
         """,
         (
             ticker,
-            entry_time.strftime("%Y-%m-%d %H:%M:%S"),
+            _et_iso(entry_time),
             entry_price,
             quantity,
-            exit_time.strftime("%Y-%m-%d %H:%M:%S") if exit_time else None,
+            _et_iso(exit_time) if exit_time else None,
             exit_price,
             exit_reason,
             net_pnl,

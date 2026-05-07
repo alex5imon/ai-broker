@@ -28,7 +28,8 @@ import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Iterable
+
+from trading_bot.constants import TZ_EASTERN
 
 logger = logging.getLogger(__name__)
 
@@ -253,16 +254,23 @@ def insert_backfilled_trade(
     gross_pnl = (exit_fill.filled_avg_price - position.entry_price) * position.quantity
     exit_reason = _infer_exit_reason(exit_fill.order_id, position)
     note = f"{BACKFILL_MARKER_PREFIX}{position.position_id}"
-    entry_time_str = position.entry_time.strftime("%Y-%m-%d %H:%M:%S")
-    exit_time_str = exit_fill.filled_at.strftime("%Y-%m-%d %H:%M:%S")
+    # Match the live writer's storage format: ET-aware ISO. Without
+    # the astimezone(ET) conversion, exit_time would land here as UTC
+    # (Alpaca returns filled_at in UTC) — that diverges from
+    # repository._now_eastern_iso() and breaks
+    # substr(exit_time, 1, 10) ET-date extraction in the reporting
+    # path. See performance.py module docstring for the invariant.
+    entry_time_str = position.entry_time.astimezone(TZ_EASTERN).isoformat()
+    exit_time_str = exit_fill.filled_at.astimezone(TZ_EASTERN).isoformat()
 
     # Match the reconciliation_mismatch row by (ticker, entry_time prefix,
-    # exit_reason='reconciliation_mismatch', null exit_price). Entry-time
-    # comparison uses a substring match because the live writer stamps a
-    # tz-aware ISO string while we built ours via strftime — exact equality
-    # would never match. The seconds-precision substring is precise enough
-    # to disambiguate (a strategy doesn't open two positions on the same
-    # ticker in the same second).
+    # exit_reason='reconciliation_mismatch', null exit_price). Both sides
+    # are now ET-aware ISO. Compare on the first 19 chars
+    # (``YYYY-MM-DDTHH:MM:SS``) so microsecond precision and offset
+    # variation (writer vs reader rounding, DST flips) don't cause a
+    # false miss. A strategy never opens two positions on the same
+    # ticker in the same second, so 19-char precision disambiguates.
+    entry_time_match = entry_time_str[:19]
     existing = conn.execute(
         """
         SELECT id FROM trades
@@ -272,7 +280,7 @@ def insert_backfilled_trade(
            AND exit_price IS NULL
          ORDER BY id DESC LIMIT 1
         """,
-        (position.ticker, entry_time_str),
+        (position.ticker, entry_time_match),
     ).fetchone()
 
     if existing is not None:

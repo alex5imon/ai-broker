@@ -13,6 +13,8 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
+from trading_bot.constants import TZ_EASTERN
+
 logger = logging.getLogger(__name__)
 
 
@@ -69,7 +71,13 @@ def compute_window_stats(
 
     now_utc = now or datetime.now(timezone.utc)
     cutoff = now_utc - timedelta(days=window_days)
-    cutoff_iso = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+    # ``exit_time`` is stored as ET-aware ISO ("YYYY-MM-DDTHH:MM:SS[.f]±HH:MM")
+    # — see ``repository._now_eastern_iso``. SQLite ``date()`` would
+    # silently re-interpret the offset as UTC, so we extract the ET-local
+    # YYYY-MM-DDTHH:MM:SS prefix via substr and compare against the
+    # cutoff in the same ET-local format. The 19-char prefix avoids the
+    # offset entirely, sidestepping any DST-boundary surprises.
+    cutoff_iso = cutoff.astimezone(TZ_EASTERN).strftime("%Y-%m-%dT%H:%M:%S")
 
     cur = conn.execute(
         """
@@ -78,7 +86,7 @@ def compute_window_stats(
          WHERE strategy_id = ?
            AND exit_time IS NOT NULL
            AND net_pnl IS NOT NULL
-           AND exit_time >= ?
+           AND substr(exit_time, 1, 19) >= ?
         """,
         (strategy_id, cutoff_iso),
     )

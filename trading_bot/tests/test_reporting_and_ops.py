@@ -4,16 +4,16 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
-from datetime import date, datetime, timedelta
-from pathlib import Path
+from datetime import date, datetime
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
-from aiohttp import web
 
 from trading_bot.constants import TZ_EASTERN
+from trading_bot.db import repository
 from trading_bot.health.server import HealthServer
 from trading_bot.log_setup import setup_logging
 from trading_bot.notifications.notifier import Notifier
@@ -118,6 +118,98 @@ def test_daily_metrics_usd_passthrough(tmp_db_path):
     assert m["gross_pnl_usd"] == 10.0
 
 
+def test_daily_metrics_late_evening_ET_exit_lands_on_ET_date(tmp_db_path):
+    """Regression: trades closed in the 20:00-23:59 ET window must land on
+    the ET-local trading date.
+
+    This is the failure mode behind ai-broker#40. ``exit_time`` is stored
+    as ET-aware ISO (``-04:00`` offset). SQLite's built-in ``date(t)``
+    silently converts to UTC before extracting the date, so 22:00 ET on
+    2026-05-06 (= 02:00 UTC on 2026-05-07) gets bucketed under the wrong
+    day and silently drops out of that day's metrics.
+
+    The fix is ``substr(exit_time, 1, 10)`` — first 10 chars of an
+    ET-aware ISO are always the ET-local YYYY-MM-DD.
+    """
+    pc = PerformanceCalculator(tmp_db_path)
+    # 22:00 ET on a fixed date — well past the 20:00 ET threshold where
+    # the UTC-conversion bug fires.
+    et_date_str = "2026-05-06"
+    late_et_iso = f"{et_date_str}T22:00:00-04:00"
+
+    _seed_trade(tmp_db_path, ticker="A", exit_time=late_et_iso,
+                pnl_usd=10.0, gross_pnl=10.0)
+    _seed_trade(tmp_db_path, ticker="B", exit_time=late_et_iso,
+                pnl_usd=-3.0, gross_pnl=-3.0)
+
+    m = pc.calculate_daily_metrics(et_date_str)
+    assert m["total_trades"] == 2, (
+        "Late-ET-evening trades must count under their ET-local date. "
+        "If this fails, the read query likely went back to using "
+        "SQLite's date(...) on a tz-aware ISO string."
+    )
+    assert m["wins"] == 1
+    assert m["losses"] == 1
+
+
+_ET_ISO_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d+)?"            # optional microseconds
+    r"[+\-]\d{2}:\d{2}$"     # ±HH:MM offset (never naive, never Z)
+)
+
+
+def test_repository_now_eastern_iso_emits_et_aware_iso():
+    """The canonical timestamp helper used by every live writer must
+    emit ET-aware ISO (``YYYY-MM-DDTHH:MM:SS[.ffffff]±HH:MM``). This is
+    the anchor for the ``substr(exit_time, 1, 10)`` ET-date extraction
+    in ``performance.py`` — if this drifts (e.g. someone "simplifies"
+    it to ``strftime('%Y-%m-%d %H:%M:%S')``), every read query that
+    relies on the offset suffix breaks silently and this test fails
+    fast.
+    """
+    # Sample a few times — the offset is constant within a session but
+    # microseconds vary, so a single call can mask a regex bug that
+    # only triggers when the fractional-second branch is hit.
+    samples = [repository._now_eastern_iso() for _ in range(5)]
+    for ts in samples:
+        assert _ET_ISO_RE.match(ts), (
+            f"repository._now_eastern_iso() emitted {ts!r}, which is not "
+            "ET-aware ISO. See performance.py module docstring for the "
+            "invariant."
+        )
+
+
+def test_trades_table_format_invariant_round_trip(tmp_db_path):
+    """Round-trip a value emitted by ``_now_eastern_iso`` through SQLite
+    and read it back. SQLite stores TEXT verbatim, so this guards
+    against any future change that converts/normalises the column on
+    write or read (e.g. a wrapper function, a custom adapter, or a
+    schema change to ``DATETIME`` type affinity that would coerce
+    the stored value).
+    """
+    et_iso = repository._now_eastern_iso()
+    _seed_trade(tmp_db_path, ticker="A", exit_time=et_iso,
+                pnl_usd=1.0, gross_pnl=1.0)
+
+    with sqlite3.connect(tmp_db_path) as conn:
+        rows = conn.execute(
+            "SELECT entry_time, exit_time FROM trades "
+            "WHERE entry_time IS NOT NULL AND exit_time IS NOT NULL"
+        ).fetchall()
+
+    assert rows, "expected the seeded row"
+    for entry_time, exit_time in rows:
+        assert _ET_ISO_RE.match(entry_time), (
+            f"entry_time {entry_time!r} did not survive SQLite round-trip "
+            "as ET-aware ISO — see performance.py module docstring."
+        )
+        assert _ET_ISO_RE.match(exit_time), (
+            f"exit_time {exit_time!r} did not survive SQLite round-trip "
+            "as ET-aware ISO — see performance.py module docstring."
+        )
+
+
 def test_intraday_drawdown():
     trades = [
         {"pnl_usd": 10.0},   # cumulative 10, peak 10
@@ -150,11 +242,14 @@ def test_period_metrics_aggregates(tmp_db_path):
         tmp_db_path, date_str="2026-04-02", total_trades=2, wins=1, losses=1,
         gross_pnl_usd=5.0, net_pnl_usd=4.50,
     )
-    _seed_trade(tmp_db_path, ticker="A", exit_time="2026-04-01T10:00", pnl_usd=10.0)
-    _seed_trade(tmp_db_path, ticker="B", exit_time="2026-04-01T11:00", pnl_usd=2.0)
-    _seed_trade(tmp_db_path, ticker="C", exit_time="2026-04-01T12:00", pnl_usd=-1.0)
-    _seed_trade(tmp_db_path, ticker="D", exit_time="2026-04-02T10:00", pnl_usd=5.0)
-    _seed_trade(tmp_db_path, ticker="E", exit_time="2026-04-02T11:00", pnl_usd=-1.0)
+    # Use the production ET-aware ISO format (YYYY-MM-DDTHH:MM:SS-HH:MM)
+    # to match the invariant asserted by
+    # ``test_trades_table_format_invariant_live_writers``.
+    _seed_trade(tmp_db_path, ticker="A", exit_time="2026-04-01T10:00:00-04:00", pnl_usd=10.0)
+    _seed_trade(tmp_db_path, ticker="B", exit_time="2026-04-01T11:00:00-04:00", pnl_usd=2.0)
+    _seed_trade(tmp_db_path, ticker="C", exit_time="2026-04-01T12:00:00-04:00", pnl_usd=-1.0)
+    _seed_trade(tmp_db_path, ticker="D", exit_time="2026-04-02T10:00:00-04:00", pnl_usd=5.0)
+    _seed_trade(tmp_db_path, ticker="E", exit_time="2026-04-02T11:00:00-04:00", pnl_usd=-1.0)
 
     m = pc.calculate_period_metrics("2026-04-01", "2026-04-02")
     assert m["trading_days"] == 2
