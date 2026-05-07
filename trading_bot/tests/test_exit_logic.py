@@ -4,14 +4,13 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from typing import Any
-from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from trading_bot.config import Config
-from trading_bot.constants import ExitReason, HoldType
-from trading_bot.strategy.exit import ExitDecision, ExitManager
+from trading_bot.constants import ExitReason
+from trading_bot.strategy.exit import ExitManager
 
 pytestmark = pytest.mark.critical
 

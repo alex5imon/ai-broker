@@ -322,7 +322,8 @@ def _notif_config(**overrides) -> dict:
 @pytest.mark.asyncio
 async def test_notifier_send_success():
     n = Notifier(_notif_config())
-    resp = MagicMock(); resp.status_code = 200
+    resp = MagicMock()
+    resp.status_code = 200
     n._session.post = MagicMock(return_value=resp)
     await n.send("title", "msg", priority=3, tags=["x"])
     n._session.post.assert_called_once()
@@ -331,7 +332,8 @@ async def test_notifier_send_success():
 @pytest.mark.asyncio
 async def test_notifier_rate_limit_drops():
     n = Notifier(_notif_config(rate_limit_per_minute=1))
-    resp = MagicMock(); resp.status_code = 200
+    resp = MagicMock()
+    resp.status_code = 200
     n._session.post = MagicMock(return_value=resp)
     await n.send("t", "m1")
     await n.send("t", "m2")  # over limit
@@ -341,7 +343,8 @@ async def test_notifier_rate_limit_drops():
 @pytest.mark.asyncio
 async def test_notifier_handles_http_error():
     n = Notifier(_notif_config())
-    resp = MagicMock(); resp.status_code = 500
+    resp = MagicMock()
+    resp.status_code = 500
     n._session.post = MagicMock(return_value=resp)
     await n.send("t", "m")
     assert n._consecutive_failures == 1
@@ -364,7 +367,8 @@ async def test_notifier_lifecycle():
 @pytest.mark.asyncio
 async def test_notifier_convenience_methods_call_send():
     n = Notifier(_notif_config())
-    resp = MagicMock(); resp.status_code = 200
+    resp = MagicMock()
+    resp.status_code = 200
     n._session.post = MagicMock(return_value=resp)
     await n.trade_entry("SPY", "BUY", 100.0, 10, "rsi_oversold")
     await n.position_closed("SPY", 5.0, "1h", "take_profit")

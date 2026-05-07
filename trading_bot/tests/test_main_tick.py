@@ -6,10 +6,9 @@ through a single deterministic tick without hitting Alpaca."""
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
-from zoneinfo import ZoneInfo
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
