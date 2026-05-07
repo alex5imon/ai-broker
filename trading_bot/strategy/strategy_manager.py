@@ -617,17 +617,75 @@ class StrategyManager:
         return AlpacaPositionCheck("OK", alpaca_qty)
 
     def _mark_position_closed(self, position_id: int) -> None:
-        """Update positions.status = 'CLOSED' for a single row."""
+        """Mark a drained orphan CLOSED *and* write a backfill-eligible
+        trades row.
+
+        The orphan-drain ``NOT_HELD`` branch fires when the DB believes
+        we hold a position but Alpaca holds zero. Without writing a
+        trades row, the position's P&L is silently dropped from
+        ``daily_summaries`` and the self-improvement postmortem.
+
+        Mirrors ``gateway/recovery.py:_close_db_position``: stamps
+        ``exit_reason='reconciliation_mismatch'`` and leaves
+        ``exit_price``/``net_pnl`` NULL so the nightly
+        ``alpaca_backfill`` job can pair it with the actual Alpaca exit
+        fill via the matcher in
+        ``self_improve/alpaca_backfill.insert_backfilled_trade``.
+
+        Both writes go through ``with conn:`` so the UPDATE+INSERT either
+        commit together or roll back together — never leave a CLOSED
+        position with no audit trail.
+        """
         now_str: str = datetime.now(tz=ET).isoformat()
         try:
             conn: sqlite3.Connection = sqlite3.connect(self._db_path)
+            conn.row_factory = sqlite3.Row
             try:
-                conn.execute(
-                    "UPDATE positions SET status = 'CLOSED', updated_at = ? "
-                    "WHERE id = ? AND status NOT IN ('CLOSED', 'ENTRY_FAILED')",
-                    (now_str, position_id),
-                )
-                conn.commit()
+                with conn:
+                    cur = conn.execute(
+                        "UPDATE positions SET status = 'CLOSED', updated_at = ? "
+                        "WHERE id = ? AND status NOT IN ('CLOSED', 'ENTRY_FAILED')",
+                        (now_str, position_id),
+                    )
+                    if cur.rowcount == 0:
+                        # Already terminal — nothing to backfill.
+                        return
+                    row = conn.execute(
+                        "SELECT * FROM positions WHERE id = ?",
+                        (position_id,),
+                    ).fetchone()
+                    if row is None:
+                        return
+                    qty: float = float(row["quantity"] or 0)
+                    entry_side: str = "BUY" if qty >= 0 else "SELL"
+                    conn.execute(
+                        "INSERT INTO trades "
+                        "(ticker, exchange, currency, side, entry_time, "
+                        " entry_price, quantity, exit_time, exit_reason, "
+                        " hold_type, phase, strategy_id, notes) "
+                        "VALUES (:ticker, :exchange, :currency, :side, "
+                        "        :entry_time, :entry_price, :quantity, "
+                        "        :exit_time, :exit_reason, :hold_type, "
+                        "        :phase, :strategy_id, :notes)",
+                        {
+                            "ticker": row["ticker"],
+                            "exchange": row["exchange"],
+                            "currency": row["currency"],
+                            "side": entry_side,
+                            "entry_time": row["entry_time"],
+                            "entry_price": row["entry_price"],
+                            "quantity": abs(qty),
+                            "exit_time": now_str,
+                            "exit_reason": "reconciliation_mismatch",
+                            "hold_type": row["hold_type"],
+                            "phase": row["phase"],
+                            "strategy_id": row["strategy_id"] or "unknown",
+                            "notes": (
+                                "orphan_sleeve_drain: Alpaca holds 0; "
+                                "exit_price/net_pnl pending alpaca_backfill"
+                            ),
+                        },
+                    )
             finally:
                 conn.close()
         except Exception:
