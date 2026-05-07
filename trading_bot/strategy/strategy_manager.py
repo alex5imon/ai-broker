@@ -179,6 +179,20 @@ class StrategyManager:
                 (1.0 - event_mult) * 100,
             )
 
+        # Cross-strategy Alpaca collision guard. The per-strategy
+        # virtual_portfolio.get_open_positions only sees its own sleeve's
+        # holdings — but Alpaca rejects a BUY (code 40310000, "potential
+        # wash trade detected") whenever an opposite-side stop is on the
+        # books for the same ticker, including a stop placed by a
+        # different sleeve's prior entry. Hit twice on 2026-05-07 19:45
+        # UTC: overnight_drift tried SPY/QQQ that mean_reversion already
+        # held earlier in the day. Fetch live positions once per scan and
+        # skip any candidate Alpaca already holds. Fails open on lookup
+        # error — same posture as regime_filter / sentiment.
+        live_alpaca_tickers: frozenset[str] | None = (
+            await self._fetch_live_alpaca_tickers()
+        )
+
         for ticker in watchlist:
             can_trade, reason = self._risk_manager.can_trade()
             if not can_trade:
@@ -245,6 +259,22 @@ class StrategyManager:
 
                 # Don't double up on same ticker in same strategy
                 if any(p["ticker"] == ticker for p in open_positions):
+                    continue
+
+                # Cross-strategy: Alpaca already holds the ticker (under
+                # another sleeve, or a manual position). Submitting a BUY
+                # here would be rejected as a wash trade by Alpaca's
+                # opposite-side-stop check. See ``_fetch_live_alpaca_tickers``
+                # for the data source and the 2026-05-07 incident notes.
+                if (
+                    live_alpaca_tickers is not None
+                    and ticker in live_alpaca_tickers
+                ):
+                    logger.info(
+                        "[%s] %s already held at Alpaca by another "
+                        "sleeve — skipping (cross-strategy collision)",
+                        strategy.strategy_id, ticker,
+                    )
                     continue
 
                 # 2026-04-29 incident dedup: rejected entries get stamped
@@ -567,6 +597,39 @@ class StrategyManager:
             closed += 1
 
         return closed
+
+    async def _fetch_live_alpaca_tickers(self) -> frozenset[str] | None:
+        """Live tickers Alpaca currently holds (long or short, qty != 0).
+
+        Returns ``None`` when the lookup fails — callers must fail open
+        rather than block legitimate entries on a transient broker error.
+        Returns ``frozenset()`` (empty, not ``None``) when Alpaca reports
+        no positions; the empty case still means "we know there's no
+        collision" and should be treated as a clean signal.
+        """
+        try:
+            positions = await self._order_manager._gw.get_positions()
+        except Exception:
+            logger.warning(
+                "Alpaca get_positions failed during entry scan — "
+                "skipping cross-strategy collision guard for this tick",
+                exc_info=True,
+            )
+            return None
+
+        held: set[str] = set()
+        for pos in positions or ():
+            symbol = getattr(pos, "symbol", None)
+            qty_raw = getattr(pos, "qty", None)
+            if not symbol:
+                continue
+            try:
+                qty = float(qty_raw) if qty_raw is not None else 0.0
+            except (TypeError, ValueError):
+                continue
+            if qty != 0.0:
+                held.add(symbol)
+        return frozenset(held)
 
     def _check_alpaca_position(
         self, ticker: str, *, db_qty: float,
