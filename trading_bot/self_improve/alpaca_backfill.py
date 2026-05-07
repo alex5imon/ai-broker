@@ -28,7 +28,6 @@ import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Iterable
 
 from trading_bot.constants import TZ_EASTERN
 

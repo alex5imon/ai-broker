@@ -4,16 +4,16 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
-from datetime import date, datetime, timedelta
-from pathlib import Path
+from datetime import date, datetime
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
-from aiohttp import web
 
 from trading_bot.constants import TZ_EASTERN
+from trading_bot.db import repository
 from trading_bot.health.server import HealthServer
 from trading_bot.log_setup import setup_logging
 from trading_bot.notifications.notifier import Notifier
@@ -152,31 +152,43 @@ def test_daily_metrics_late_evening_ET_exit_lands_on_ET_date(tmp_db_path):
     assert m["losses"] == 1
 
 
-def test_trades_table_format_invariant(tmp_db_path):
-    """All ``trades.entry_time`` / ``exit_time`` writers must produce
-    ET-aware ISO. This invariant is what makes the
-    ``substr(..., 1, 10)`` ET-date extraction robust across DST and
-    avoids the silent ``date()`` UTC conversion described in
-    ``performance.py``'s module docstring.
+_ET_ISO_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d+)?"            # optional microseconds
+    r"[+\-]\d{2}:\d{2}$"     # ±HH:MM offset (never naive, never Z)
+)
 
-    The live writer (``repository._now_eastern_iso``) uses
-    ``datetime.now(TZ_EASTERN).isoformat()`` which always emits
-    ``YYYY-MM-DDTHH:MM:SS[.ffffff]±HH:MM``. The backfill writer
-    (``alpaca_backfill.py``) was historically a different format and is
-    now aligned. This test seeds the canonical format and asserts the
-    invariant via a regex — if a future writer drifts back to e.g.
-    ``strftime('%Y-%m-%d %H:%M:%S')`` (naive, no T separator, no
-    offset), this fails fast.
+
+def test_repository_now_eastern_iso_emits_et_aware_iso():
+    """The canonical timestamp helper used by every live writer must
+    emit ET-aware ISO (``YYYY-MM-DDTHH:MM:SS[.ffffff]±HH:MM``). This is
+    the anchor for the ``substr(exit_time, 1, 10)`` ET-date extraction
+    in ``performance.py`` — if this drifts (e.g. someone "simplifies"
+    it to ``strftime('%Y-%m-%d %H:%M:%S')``), every read query that
+    relies on the offset suffix breaks silently and this test fails
+    fast.
     """
-    import re
+    # Sample a few times — the offset is constant within a session but
+    # microseconds vary, so a single call can mask a regex bug that
+    # only triggers when the fractional-second branch is hit.
+    samples = [repository._now_eastern_iso() for _ in range(5)]
+    for ts in samples:
+        assert _ET_ISO_RE.match(ts), (
+            f"repository._now_eastern_iso() emitted {ts!r}, which is not "
+            "ET-aware ISO. See performance.py module docstring for the "
+            "invariant."
+        )
 
-    iso_re = re.compile(
-        r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
-        r"(?:\.\d+)?"            # optional microseconds
-        r"[+\-]\d{2}:\d{2}$"     # ±HH:MM offset (never naive, never Z)
-    )
 
-    et_iso = datetime.now(tz=ET).isoformat()
+def test_trades_table_format_invariant_round_trip(tmp_db_path):
+    """Round-trip a value emitted by ``_now_eastern_iso`` through SQLite
+    and read it back. SQLite stores TEXT verbatim, so this guards
+    against any future change that converts/normalises the column on
+    write or read (e.g. a wrapper function, a custom adapter, or a
+    schema change to ``DATETIME`` type affinity that would coerce
+    the stored value).
+    """
+    et_iso = repository._now_eastern_iso()
     _seed_trade(tmp_db_path, ticker="A", exit_time=et_iso,
                 pnl_usd=1.0, gross_pnl=1.0)
 
@@ -188,13 +200,13 @@ def test_trades_table_format_invariant(tmp_db_path):
 
     assert rows, "expected the seeded row"
     for entry_time, exit_time in rows:
-        assert iso_re.match(entry_time), (
-            f"entry_time {entry_time!r} is not ET-aware ISO — see "
-            "performance.py module docstring for the invariant."
+        assert _ET_ISO_RE.match(entry_time), (
+            f"entry_time {entry_time!r} did not survive SQLite round-trip "
+            "as ET-aware ISO — see performance.py module docstring."
         )
-        assert iso_re.match(exit_time), (
-            f"exit_time {exit_time!r} is not ET-aware ISO — see "
-            "performance.py module docstring for the invariant."
+        assert _ET_ISO_RE.match(exit_time), (
+            f"exit_time {exit_time!r} did not survive SQLite round-trip "
+            "as ET-aware ISO — see performance.py module docstring."
         )
 
 
@@ -230,11 +242,14 @@ def test_period_metrics_aggregates(tmp_db_path):
         tmp_db_path, date_str="2026-04-02", total_trades=2, wins=1, losses=1,
         gross_pnl_usd=5.0, net_pnl_usd=4.50,
     )
-    _seed_trade(tmp_db_path, ticker="A", exit_time="2026-04-01T10:00", pnl_usd=10.0)
-    _seed_trade(tmp_db_path, ticker="B", exit_time="2026-04-01T11:00", pnl_usd=2.0)
-    _seed_trade(tmp_db_path, ticker="C", exit_time="2026-04-01T12:00", pnl_usd=-1.0)
-    _seed_trade(tmp_db_path, ticker="D", exit_time="2026-04-02T10:00", pnl_usd=5.0)
-    _seed_trade(tmp_db_path, ticker="E", exit_time="2026-04-02T11:00", pnl_usd=-1.0)
+    # Use the production ET-aware ISO format (YYYY-MM-DDTHH:MM:SS-HH:MM)
+    # to match the invariant asserted by
+    # ``test_trades_table_format_invariant_live_writers``.
+    _seed_trade(tmp_db_path, ticker="A", exit_time="2026-04-01T10:00:00-04:00", pnl_usd=10.0)
+    _seed_trade(tmp_db_path, ticker="B", exit_time="2026-04-01T11:00:00-04:00", pnl_usd=2.0)
+    _seed_trade(tmp_db_path, ticker="C", exit_time="2026-04-01T12:00:00-04:00", pnl_usd=-1.0)
+    _seed_trade(tmp_db_path, ticker="D", exit_time="2026-04-02T10:00:00-04:00", pnl_usd=5.0)
+    _seed_trade(tmp_db_path, ticker="E", exit_time="2026-04-02T11:00:00-04:00", pnl_usd=-1.0)
 
     m = pc.calculate_period_metrics("2026-04-01", "2026-04-02")
     assert m["trading_days"] == 2
