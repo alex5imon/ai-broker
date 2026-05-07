@@ -1,0 +1,35 @@
+# Coverage configuration for the production trading_bot package.
+#
+# Scope: live-tick + execution + risk + db + reporting + self_improve.
+# Excluded: tests themselves (always 100% by definition), the offline
+# multi-strategy backtester (research code; unit tests cover the pieces
+# that matter, but the full backtester is exercised end-to-end by the
+# weekly walkforward instead), and the historical-data loaders (one-shot
+# CLIs run by hand).
+#
+# Baseline at PR #88 (2026-05-08): TOTAL 74%. The coverage workflow
+# gates on `--cov-fail-under=73` to allow 1pp of slack for small
+# refactors while still catching "shipped a feature without tests".
+
+[run]
+source = trading_bot
+omit =
+    trading_bot/tests/*
+    trading_bot/multi_strategy_backtest.py
+    trading_bot/data/sp500_loader.py
+    trading_bot/data/spy_intraday_loader.py
+    trading_bot/data/alpaca_downloader.py
+
+[report]
+# Lines that don't need to count against coverage:
+#   - explicit `pragma: no cover` markers
+#   - main-script entry points
+#   - NotImplementedError stubs (abstract method placeholders)
+#   - protocol method bodies (`...`)
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
+    raise NotImplementedError
+    \.\.\.
+show_missing = true
+skip_covered = true

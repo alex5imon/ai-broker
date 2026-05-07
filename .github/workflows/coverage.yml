@@ -1,0 +1,72 @@
+name: coverage
+
+# Test-coverage gate.
+#
+# Runs the full pytest suite under coverage and fails if line coverage
+# drops below the pinned threshold (73% as of 2026-05-08, 1pp slack
+# below the 74% baseline). Catches the "shipped a feature without
+# tests" failure mode that ruff/bandit can't see.
+#
+# The static-checks workflow runs the fast `-m critical` subset for
+# sub-60s feedback. This workflow runs the full suite (~30s on the
+# Linux runner) and is the slower-but-thorough sibling. Both run on
+# push/PR.
+#
+# Coverage scope is defined in `.coveragerc`. Backtester / historical
+# data loaders are intentionally excluded — research code, not the
+# live tick path.
+#
+# To raise the threshold: cherry-pick a coverage-improving PR, confirm
+# the new TOTAL on main, then bump `--cov-fail-under` to one pp below
+# the new floor.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install deps
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Pytest with coverage gate
+        # Threshold tracks the baseline minus 1pp of slack. If a PR
+        # legitimately can't hit 73% (e.g. removing a heavily-tested
+        # module), drop the threshold in the same PR.
+        run: |
+          pytest trading_bot/tests/ \
+            --cov \
+            --cov-config=.coveragerc \
+            --cov-report=term \
+            --cov-report=xml \
+            --cov-fail-under=73
+
+      - name: Upload coverage XML
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: coverage-${{ github.run_id }}
+          path: coverage.xml
+          retention-days: 14
+          if-no-files-found: ignore
