@@ -232,6 +232,72 @@ class OrderManager:
                 if oid is not None:
                     self._alpaca_to_trade[str(oid)] = trade_id
 
+    def _sweep_uninitiated_pending_entries(self, timeout_seconds: int) -> None:
+        """Mark ghost ENTRY_PENDING rows as ENTRY_FAILED.
+
+        A row with ``status='ENTRY_PENDING'`` and ``alpaca_order_id IS
+        NULL`` is the survivor of a crash between the
+        ``_create_position_record`` INSERT and the ``submit_order`` call.
+        The normal timeout sweep at ``_check_order_statuses`` keys off
+        ``alpaca_entry_order_id`` and would skip these rows forever,
+        permanently consuming a position slot.
+
+        Apply a generous 2× timeout window to avoid racing a slow Alpaca
+        round-trip on a concurrent tick. Anything older is either crashed
+        or stuck and is safe to fail.
+        """
+        cutoff: datetime = datetime.now(tz=ET) - timedelta(
+            seconds=timeout_seconds * 2,
+        )
+        try:
+            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
+            try:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT id, ticker, entry_time FROM positions "
+                    "WHERE status = ? AND alpaca_order_id IS NULL",
+                    (PositionStatus.ENTRY_PENDING.value,),
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.OperationalError:
+            logger.warning(
+                "uninitiated-entry sweep: positions table unreadable",
+                exc_info=True,
+            )
+            return
+
+        for row in rows:
+            entry_time_raw = row["entry_time"]
+            if not entry_time_raw:
+                continue
+            try:
+                entry_time: datetime = datetime.fromisoformat(str(entry_time_raw))
+            except ValueError:
+                logger.warning(
+                    "uninitiated-entry sweep: unparseable entry_time %r "
+                    "for trade_id=%d",
+                    entry_time_raw, int(row["id"]),
+                )
+                continue
+            if entry_time.tzinfo is None:
+                entry_time = entry_time.replace(tzinfo=ET)
+            if entry_time > cutoff:
+                # Recent — submit may still be in flight. Skip.
+                continue
+
+            trade_id: int = int(row["id"])
+            logger.warning(
+                "uninitiated-entry sweep: marking trade_id=%d ticker=%s "
+                "ENTRY_FAILED (status=ENTRY_PENDING but alpaca_order_id "
+                "is NULL; entry_time=%s, age > %ds)",
+                trade_id, row["ticker"], entry_time.isoformat(),
+                timeout_seconds * 2,
+            )
+            self._update_position_status(trade_id, PositionStatus.ENTRY_FAILED)
+            # Drop from the in-memory map if hydration loaded it.
+            self._active_orders.pop(trade_id, None)
+
     async def _check_order_statuses(self) -> None:
         """Check status of all tracked orders via Alpaca API.
 
@@ -245,6 +311,7 @@ class OrderManager:
         timeout_seconds: int = int(
             self._config._get("entry", "entry_timeout_seconds", default=300)
         )
+        self._sweep_uninitiated_pending_entries(timeout_seconds)
         min_fill_pct: float = float(
             self._config._get("entry", "partial_fill_min_pct", default=0.50)
         )
