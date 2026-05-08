@@ -73,6 +73,16 @@ jobs:
         # creep back.
         run: ruff check .
 
+      - name: Vulture (dead code, high confidence)
+        # 80%+ confidence threshold — vulture is noisy below that on a
+        # codebase with reflection-style accessors and test-only entry
+        # points. The 100% finding (`what_to_show` in market_data) and
+        # the placeholder `_check_correlation` were both removed
+        # 2026-05-08; this gate keeps similar dead code from creeping
+        # back. Tests are excluded — pytest fixtures and parametrize
+        # produce false positives.
+        run: vulture trading_bot/ --min-confidence 80 --exclude trading_bot/tests
+
       - name: Bandit (MEDIUM+HIGH severity)
         # MEDIUM+HIGH gate: catches eval/exec, subprocess shell=True,
         # weak crypto, hardcoded passwords, pickle on untrusted data,

@@ -232,7 +232,6 @@ class MarketDataManager:
         exchange: str = "US",
         bar_size: str = "1 min",
         duration: str = "1 D",
-        what_to_show: str = "TRADES",
     ) -> list[dict[str, Any]]:
         """Fetch historical bars from Alpaca (synchronous under the async wrapper)."""
         timeframe: TimeFrame = self._parse_bar_size(bar_size)

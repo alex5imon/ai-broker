@@ -266,16 +266,13 @@ class EntryEvaluator:
                 f"{sector_count}/{max_sector}"
             )
 
-        # -- 14. Correlation check (skip if no positions open) ---------------
-        # Correlation is checked at portfolio level; we log but do not
-        # block in Phase 1 with max 2 positions (low overlap risk).
-        # The check is here for Phase 2/3 readiness.
-        if open_count > 0:
-            corr_ok, corr_reason = self._check_correlation(ticker)
-            if not corr_ok:
-                rejections.append(corr_reason)
+        # (Correlation check was removed — it always returned True/no-block,
+        # so the body produced no behavior. Sector exposure check above
+        # already covers the within-sector overlap case for Phase 1. Real
+        # return-based correlation is a Phase 2+ feature; reintroduce
+        # then with actual blocking logic and tests.)
 
-        # -- 15. Daily trade count -------------------------------------------
+        # -- 14. Daily trade count -------------------------------------------
         max_daily: int = self._config.get_max_daily_trades()
         daily_count: int = self._get_daily_trade_count()
         if daily_count >= max_daily:
@@ -517,44 +514,6 @@ class EntryEvaluator:
             if GICS_SECTOR.get(pos_ticker, "") == sector:
                 count += 1
         return count
-
-    def _check_correlation(self, ticker: str) -> tuple[bool, str]:
-        """Check correlation with existing open positions.
-
-        Uses the configured correlation threshold (0.85).  For Phase 1
-        with max 2 positions this is a lightweight check -- we compare
-        sectors as a proxy.  Full return-correlation requires historical
-        data and will be implemented for Phase 2+.
-        """
-        sector: str = GICS_SECTOR.get(ticker, "Unknown")
-
-        try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-            conn.row_factory = sqlite3.Row
-            positions: list[dict[str, Any]] = repo.get_open_positions(conn)
-            conn.close()
-        except sqlite3.Error:
-            logger.exception("Error checking correlation")
-            return True, ""
-
-        for pos in positions:
-            pos_ticker: str = pos.get("ticker", "")
-            pos_sector: str = GICS_SECTOR.get(pos_ticker, "Unknown")
-            # Same sector is a proxy for high correlation at Phase 1 scale.
-            # Sector exposure is checked separately; this is an additional
-            # safeguard for within-sector pairs.
-            if pos_sector == sector and pos_sector != "Unknown":
-                logger.debug(
-                    "%s and %s are in the same sector (%s); flagging correlation",
-                    ticker,
-                    pos_ticker,
-                    sector,
-                )
-                # We do not block here -- sector exposure check handles limits.
-                # This method is a placeholder for Phase 2+ return-based
-                # correlation analysis.
-
-        return True, ""
 
     def _get_daily_trade_count(self) -> int:
         """Get today's trade count from the DB."""
