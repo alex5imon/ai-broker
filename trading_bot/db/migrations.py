@@ -276,12 +276,12 @@ def _migration_v8(conn: sqlite3.Connection) -> None:
 
     if target_ids:
         # IN (?,?,?…) with positional binds — no string interpolation of
-        # row data.
+        # row data. `placeholders` is purely literal `?` characters.
         placeholders: str = ",".join("?" for _ in target_ids)
         conn.execute(
             f"UPDATE positions SET status = 'ENTRY_FAILED', "
             f"updated_at = datetime('now') "
-            f"WHERE id IN ({placeholders})",
+            f"WHERE id IN ({placeholders})",  # nosec B608
             target_ids,
         )
     logger.info(

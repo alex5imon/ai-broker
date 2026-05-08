@@ -269,7 +269,11 @@ def update_position(conn: sqlite3.Connection, position_id: int, updates: dict[st
         return
 
     set_parts.append("updated_at = datetime('now')")
-    sql: str = f"UPDATE positions SET {', '.join(set_parts)} WHERE id = :_id"
+    # `set_parts` is built from the `allowed_columns` allowlist above
+    # (every other key is rejected with a warning). Values are bound
+    # via named placeholders in `params`. No user input reaches the
+    # SQL string.
+    sql: str = f"UPDATE positions SET {', '.join(set_parts)} WHERE id = :_id"  # nosec B608
     conn.execute(sql, params)
     conn.commit()
     logger.debug("Updated position id=%d fields=%s", position_id, list(updates.keys()))

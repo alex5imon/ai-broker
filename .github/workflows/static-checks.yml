@@ -3,9 +3,12 @@ name: static-checks
 # Cheap static guards on the live trading path.
 #
 #   1. scripts/check_live_path.sh — bans sync client.submit_order() in
-#      async execution code, and bans naive date.today() / datetime.now()
-#      in live-path modules. Encodes lessons from PR #52, #56, and the
-#      overnight_drift naive-date fix.
+#      async execution code, naive date.today() / datetime.now() in
+#      live-path modules, and equality comparisons on money-typed
+#      variables (price/pnl/cash/qty/...) where float drift makes
+#      `pnl == 0` mis-classify a scratch trade as a tiny win/loss.
+#      Encodes lessons from PR #52, #56, the overnight_drift naive-date
+#      fix, and the loss_cooldown scratch-trade epsilon.
 #   2. ruff check across the whole repo. Cleaned up 2026-05-07 (PR after
 #      #83); this gate keeps the noise from creeping back.
 #   3. bandit -lll — HIGH-severity security findings only (eval, exec,
@@ -70,13 +73,16 @@ jobs:
         # creep back.
         run: ruff check .
 
-      - name: Bandit (HIGH severity)
-        # HIGH-only gate: eval/exec, subprocess shell=True, weak crypto,
-        # hardcoded passwords, pickle on untrusted data. MEDIUM is
-        # currently noisy (parameterised SQL with f-string placeholders
-        # for `?,?,?`, intentional 0.0.0.0 health bind) and would
-        # require ~6 #nosec annotations to clean — separate task.
-        run: bandit -r trading_bot/ -lll -q
+      - name: Bandit (MEDIUM+HIGH severity)
+        # MEDIUM+HIGH gate: catches eval/exec, subprocess shell=True,
+        # weak crypto, hardcoded passwords, pickle on untrusted data,
+        # AND parameterised SQL string-construction (B608). The five
+        # B608 sites here use `placeholders` built from a hardcoded
+        # column allowlist or literal `?` characters with values bound
+        # via the second arg — annotated with `# nosec B608` plus a
+        # comment justifying each. Plus one B104 (intentional 0.0.0.0
+        # health bind for the GHA runner).
+        run: bandit -r trading_bot/ -ll -q
 
       - name: pip-audit
         # Hard gate on known-vulnerable dependency versions. No findings

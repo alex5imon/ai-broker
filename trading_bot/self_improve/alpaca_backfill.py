@@ -103,6 +103,10 @@ def _parse_iso(value: str | None) -> datetime | None:
 
 def load_candidates(conn: sqlite3.Connection) -> list[ClosedPositionRow]:
     """Closed positions with a strategy_id, not yet backfilled."""
+    # `BACKFILL_MARKER_PREFIX` is a hardcoded module-level constant, not
+    # user input. Concatenating it into the SQL is safe; the alternative
+    # (passing it as a parameter) would require SQLite to recompute the
+    # `||` for every row in the EXISTS subquery.
     cur = conn.execute(
         f"""
         SELECT p.id, p.ticker, p.exchange, p.currency, p.strategy_id,
@@ -118,7 +122,7 @@ def load_candidates(conn: sqlite3.Connection) -> list[ClosedPositionRow]:
                   WHERE t.notes = '{BACKFILL_MARKER_PREFIX}' || p.id
                )
          ORDER BY p.entry_time
-        """
+        """  # nosec B608
     )
     out: list[ClosedPositionRow] = []
     for row in cur.fetchall():

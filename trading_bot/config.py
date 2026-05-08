@@ -440,7 +440,11 @@ class Config:
 
     @property
     def health_host(self) -> str:
-        return str(self._get("health", "host", default="0.0.0.0"))
+        # 0.0.0.0 is intentional: the health endpoint is bound for the
+        # GHA runner and external monitoring (heartbeat workflow). The
+        # endpoint serves no auth and only exposes status — bandit B104
+        # is a false positive in this deployment shape.
+        return str(self._get("health", "host", default="0.0.0.0"))  # nosec B104
 
     @property
     def health_port(self) -> int:
@@ -629,9 +633,13 @@ class Config:
         try:
             conn = sqlite3.connect(db_path)
             try:
+                # `placeholders` is a fixed sequence of literal `?`
+                # characters keyed off the count of `date_strs`. The
+                # actual values are bound parameterised via the second
+                # argument — no user input reaches the SQL string.
                 placeholders = ",".join("?" * len(date_strs))
                 rows = conn.execute(
-                    f"SELECT date FROM daily_summaries WHERE date IN ({placeholders})",
+                    f"SELECT date FROM daily_summaries WHERE date IN ({placeholders})",  # nosec B608
                     date_strs,
                 ).fetchall()
             finally:
