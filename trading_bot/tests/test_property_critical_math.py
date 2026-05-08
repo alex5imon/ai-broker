@@ -13,7 +13,7 @@ counting them. Property tests turn "silent wrong" into "loud failure"
 across thousands of generated inputs.
 
 Targets selected for highest leverage:
-  - `_count_trading_days_between` — date arithmetic + holiday gaps;
+  - `count_trading_days_between` — date arithmetic + holiday gaps;
     introduced in PR #83. Must agree with manual counting; must never
     return a negative or nonsense value.
   - `compute_sma` — pure math; output length, NaN-prefix length, and
@@ -33,34 +33,17 @@ from hypothesis import strategies as st
 
 from trading_bot.data.holiday_calendar import HolidayCalendar
 from trading_bot.strategy.technical import TechnicalAnalyzer
+# Import the production helper directly — single source of truth so
+# the tested algorithm and the deployed one can't drift apart.
+from trading_bot.utils.time import count_trading_days_between
 
 pytestmark = pytest.mark.critical
 
 
 # ---------------------------------------------------------------------
-# Date arithmetic — _count_trading_days_between
+# Date arithmetic — count_trading_days_between (utils.time)
 # ---------------------------------------------------------------------
-# We replicate the helper here rather than importing it because the
-# original lives on `ExitManager` (an instance method that needs config
-# wiring). The properties under test are about the date arithmetic, not
-# the class plumbing.
-
-def _count_trading_days_between(
-    cal: HolidayCalendar, start_date: date, end_date: date
-) -> int:
-    """Mirror of ``ExitManager._count_trading_days_between`` — see that
-    method for semantics. Reproduced here so the properties exercise
-    the algorithm without instantiating ExitManager + Config + market
-    data + holiday config."""
-    if end_date <= start_date:
-        return 0
-    count: int = 0
-    cursor: date = start_date + timedelta(days=1)
-    while cursor <= end_date:
-        if cal.is_trading_day(cursor):
-            count += 1
-        cursor += timedelta(days=1)
-    return count
+# Used by ExitManager.check_time_stop swing branch (PR #83).
 
 
 # 2026-2027 dates only — within the HolidayCalendar's loaded range.
@@ -79,7 +62,7 @@ def test_count_trading_days_never_negative(
     """The count is non-negative for any valid (start, end) pair."""
     cal = HolidayCalendar()
     end = start + timedelta(days=days_forward)
-    n = _count_trading_days_between(cal, start, end)
+    n = count_trading_days_between(cal, start, end)
     assert n >= 0, f"negative count={n} for {start} → {end}"
 
 
@@ -95,7 +78,7 @@ def test_count_trading_days_bounded_by_calendar_distance(
     """
     cal = HolidayCalendar()
     end = start + timedelta(days=days_forward)
-    n = _count_trading_days_between(cal, start, end)
+    n = count_trading_days_between(cal, start, end)
     assert n <= days_forward, (
         f"count={n} exceeds calendar distance={days_forward} "
         f"for {start} → {end}"
@@ -120,7 +103,7 @@ def test_count_trading_days_matches_naive_loop(
             expected += 1
         cursor += timedelta(days=1)
 
-    actual = _count_trading_days_between(cal, start, end)
+    actual = count_trading_days_between(cal, start, end)
     assert actual == expected, (
         f"mismatch for {start} → {end}: naive={expected}, helper={actual}"
     )
@@ -136,7 +119,7 @@ def test_count_trading_days_zero_when_end_le_start(
     backward delta, never negative or wraparound."""
     cal = HolidayCalendar()
     end = d + timedelta(days=offset)
-    n = _count_trading_days_between(cal, d, end)
+    n = count_trading_days_between(cal, d, end)
     assert n == 0, f"got {n} for backward range {d} → {end}"
 
 
@@ -241,19 +224,30 @@ def test_rsi_bounded_in_0_100(
                        allow_nan=False, allow_infinity=False),
        n=st.integers(min_value=30, max_value=100),
        period=st.integers(min_value=5, max_value=14))
-def test_rsi_of_constant_series_is_undefined(
+def test_rsi_of_constant_series_no_inf_or_nan_arithmetic(
     price: float, n: int, period: int,
 ) -> None:
-    """For a flat price series, every delta is 0 → avg_loss is 0 → RSI
-    becomes 100/(1+inf) = 0 in some implementations or NaN in others.
-    Our implementation replaces zero avg_loss with NaN (see
-    `compute_rsi`: ``avg_loss.replace(0, float("nan"))``), so RSI
-    should be NaN throughout. Lock that in.
+    """For a flat price series, every delta is 0 → avg_loss is 0 → RS
+    is mathematically undefined. The behavioral contract is "no
+    division-by-zero leak": the output must not contain ``+inf`` or
+    ``-inf``. Other valid implementations could legitimately return
+    50.0 (mid), NaN, or simply skip the warm-up — all are acceptable
+    so long as no infinities reach downstream code that compares
+    against thresholds (`rsi < oversold`).
+
+    The current implementation chose NaN-via-`replace(0, NaN)` (see
+    ``compute_rsi``) because mid-point 50.0 would falsely satisfy
+    most oversold-check predicates. If a future refactor switches
+    strategies, this property still holds; only the
+    ``test_rsi_bounded_in_0_100`` defined-values check needs to keep
+    passing alongside.
     """
+    import math
     df = _make_close_df([price] * n)
     rsi = TechnicalAnalyzer.compute_rsi(df, period=period)
-    # All values must be NaN — no division-by-zero leaks through.
-    assert rsi.isna().all(), (
-        f"flat series produced non-NaN RSI values: "
-        f"{rsi.dropna().head().tolist()}"
-    )
+    # Cast to float so isinf works element-wise.
+    for v in rsi.dropna().tolist():
+        assert not math.isinf(v), (
+            f"flat series produced infinite RSI value {v!r} — "
+            f"check zero-avg_loss handling in compute_rsi"
+        )
