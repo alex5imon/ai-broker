@@ -123,6 +123,15 @@ fi
 # Allow `<= 0`, `>= 0`, `> 0`, `< 0` — those are direction checks, not
 # exact-value checks. Allow `is None` / `is not None` (no equality).
 echo "[live-path] Rule 3 — no equality on money-typed variables"
+# Word-boundary semantics worth pinning down for future readers:
+# `\b(qty)` does NOT match `alpaca_qty` because `_` is a word
+# character in regex — there's no word boundary between `_` and `q`,
+# so a prefix-underscored compound name is safely ignored. Suffix
+# patterns DO match: `qty_open` triggers via `\b(qty)[a-z_]*`.
+# That asymmetry is intentional; renaming a variable to add a new
+# trailing word shouldn't accidentally bypass the gate, but adding
+# a namespace prefix (a common pattern for SDK-derived values like
+# `alpaca_qty`) shouldn't create false-positives.
 MONEY_VARS='price|pnl|cash|qty|quantity|equity|amount|balance|cost|fees|commission|exit_price|entry_price|stop_price|target_price|net_pnl'
 MONEY_HITS=""
 for path in "${LIVE_PATHS[@]}"; do

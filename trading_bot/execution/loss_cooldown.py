@@ -26,10 +26,13 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 ET: ZoneInfo = TZ_EASTERN
 
-# Tolerance for "scratch trade" (P&L exactly zero). The P&L float
-# accumulator can drift to ±1e-15 from rounding, so a strict ``== 0``
-# would mis-classify those as tiny wins/losses and wrongly advance the
-# loss-streak counter.
+# Tolerance for "scratch trade" (P&L exactly zero). 1e-9 sits well
+# above the floating-point accumulator noise floor (~1e-15 from share
+# × price arithmetic) and well below any plausible real P&L — even at
+# fractional-share sizing the smallest meaningful P&L is on the order
+# of 1e-4 USD (1/1,000,000-share × $100). A strict ``== 0`` would
+# mis-classify ±1e-15 noise as a tiny win/loss and wrongly advance
+# the loss-streak counter.
 _SCRATCH_EPSILON: float = 1e-9
 
 

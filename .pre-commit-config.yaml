@@ -34,12 +34,13 @@ repos:
         pass_filenames: false
 
       - id: bandit
-        name: bandit (HIGH severity)
+        name: bandit (MEDIUM+HIGH severity)
         description: |
-          HIGH-severity security findings only. Matches static-checks
-          job step 3. MEDIUM is on a separate path; promote when the
-          known false-positives are individually nosec-annotated.
-        entry: bandit -r trading_bot/ -lll -q
+          MEDIUM+HIGH severity gate. Mirrors the static-checks workflow
+          exactly — the 6 known MEDIUM false-positives (B104 health
+          bind + 5× B608 parameterised-SQL) are annotated `# nosec`
+          inline. Local and CI gates run identical bandit invocations.
+        entry: bandit -r trading_bot/ -ll -q
         language: system
         pass_filenames: false
         always_run: true
