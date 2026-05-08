@@ -7,9 +7,12 @@
 # weekly walkforward instead), and the historical-data loaders (one-shot
 # CLIs run by hand).
 #
-# Baseline at PR #88 (2026-05-08): TOTAL 74%. The coverage workflow
-# gates on `--cov-fail-under=73` to allow 1pp of slack for small
-# refactors while still catching "shipped a feature without tests".
+# Baseline at PR #88 (2026-05-08): TOTAL 72.21% on the CI runner
+# (ubuntu-latest + Python 3.12). The coverage workflow gates on
+# `--cov-fail-under=71` to allow 1pp of slack for small refactors
+# while still catching "shipped a feature without tests". Local
+# macOS/Python 3.14 reads ~1.5pp higher because of platform-specific
+# code paths and stdlib differences — CI is the source of truth.
 
 [run]
 source = trading_bot

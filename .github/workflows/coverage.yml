@@ -3,9 +3,12 @@ name: coverage
 # Test-coverage gate.
 #
 # Runs the full pytest suite under coverage and fails if line coverage
-# drops below the pinned threshold (73% as of 2026-05-08, 1pp slack
-# below the 74% baseline). Catches the "shipped a feature without
-# tests" failure mode that ruff/bandit can't see.
+# drops below the pinned threshold (71% as of 2026-05-08, 1pp slack
+# below the 72.21% CI baseline on ubuntu-latest + Python 3.12). Local
+# macOS/Python 3.14 reads ~1.5pp higher because of platform-specific
+# code paths and stdlib differences — the CI runner is the source of
+# truth. Catches the "shipped a feature without tests" failure mode
+# that ruff/bandit can't see.
 #
 # The static-checks workflow runs the fast `-m critical` subset for
 # sub-60s feedback. This workflow runs the full suite (~30s on the
@@ -51,16 +54,17 @@ jobs:
           pip install -r requirements-dev.txt
 
       - name: Pytest with coverage gate
-        # Threshold tracks the baseline minus 1pp of slack. If a PR
-        # legitimately can't hit 73% (e.g. removing a heavily-tested
-        # module), drop the threshold in the same PR.
+        # Threshold tracks the CI baseline (72.21% on ubuntu-latest +
+        # Python 3.12) minus 1pp of slack. If a PR legitimately can't
+        # hit 71% (e.g. removing a heavily-tested module), drop the
+        # threshold in the same PR.
         run: |
           pytest trading_bot/tests/ \
             --cov \
             --cov-config=.coveragerc \
             --cov-report=term \
             --cov-report=xml \
-            --cov-fail-under=73
+            --cov-fail-under=71
 
       - name: Upload coverage XML
         if: always()
