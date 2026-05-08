@@ -15,6 +15,13 @@
 source = trading_bot
 omit =
     trading_bot/tests/*
+    # `multi_strategy_backtest.py` is excluded from the denominator
+    # but unit tests still import its `_size_by_risk` helper directly
+    # (`test_sizing_properties.py`). Those lines DO execute under
+    # coverage; they just don't count toward the trading_bot total.
+    # Net effect: the headline percentage flatters slightly. When
+    # raising the threshold, drop the omit ad-hoc to see the
+    # unflattered number for helpers actually exercised by tests.
     trading_bot/multi_strategy_backtest.py
     trading_bot/data/sp500_loader.py
     trading_bot/data/spy_intraday_loader.py
