@@ -8,7 +8,15 @@ Public methods that were async remain ``async def`` for caller compatibility;
 their bodies are now synchronous.  A new ``refresh_quotes(tickers)`` method
 bulk-fetches latest quotes via REST and updates the subscription cache; the
 tick orchestrator should call it once per tick before strategy evaluation.
+
+Mypy note: the alpaca-py request/response types accept ``DataFeed | None``
+for the ``feed`` kwarg (we pass a string that the SDK accepts at runtime
+via its custom ``__init__``) and return ``BarSet | RawData``. The
+``[arg-type, union-attr]`` suppression covers those calls. Real None
+issues still surface.
 """
+
+# mypy: disable-error-code="arg-type, union-attr"
 
 from __future__ import annotations
 

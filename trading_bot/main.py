@@ -560,7 +560,7 @@ class TradingBot:
         """Scan active watchlist for entry signals and place orders."""
         # Delegate to multi-strategy manager if enabled
         if self._strategy_manager is not None:
-            watchlist: list[str] = (
+            ms_watchlist: list[str] = (
                 self._active_watchlist.get(market) or self._config.get_watchlist(market)
             )
             # NOTE: ``_get_account_equity_usd`` returns USD on Alpaca
@@ -569,18 +569,18 @@ class TradingBot:
             # broader rename that also touches the daily_summaries DB
             # column. Pass through as USD here for the new
             # StrategyManager API.
-            account_equity_usd: float | None = await self._get_account_equity_usd()
-            if account_equity_usd is None:
+            ms_equity_usd: float | None = await self._get_account_equity_usd()
+            if ms_equity_usd is None:
                 logger.warning(
                     "Skipping entry scan for %s — equity unavailable",
                     market.value,
                 )
                 return
             await self._strategy_manager.scan_for_entries(
-                watchlist=watchlist,
+                watchlist=ms_watchlist,
                 get_5min_bars=self._get_5min_bars,
                 get_daily_bars=self._get_daily_bars,
-                account_equity_usd=account_equity_usd,
+                account_equity_usd=ms_equity_usd,
             )
             return
 
@@ -597,14 +597,14 @@ class TradingBot:
         if not watchlist:
             return
 
-        account_equity_usd_opt: float | None = await self._get_account_equity_usd()
-        if account_equity_usd_opt is None:
+        equity_opt: float | None = await self._get_account_equity_usd()
+        if equity_opt is None:
             logger.warning(
                 "Skipping entry scan for %s — equity unavailable",
                 market.value,
             )
             return
-        account_equity_usd: float = account_equity_usd_opt
+        account_equity_usd: float = equity_opt
 
         # Update risk manager with today's P&L
         self._risk_manager.check_daily_loss_limit(
@@ -916,11 +916,30 @@ class TradingBot:
                 else:
                     limit_price = current_price
 
+                # `exit_decision.reason` is `ExitReason | None`. Every
+                # production code path that produces `should_exit=True`
+                # also sets a reason (stop_loss / take_profit / time_stop
+                # / kill_switch / drawdown_breaker / daily_limit). A None
+                # here is a programming error — assert loudly so the bug
+                # surfaces in tests/CI rather than landing in the DB as
+                # a silent "strategy_exit" sentinel that breaks
+                # downstream filtering and reporting.
+                if exit_decision.reason is None:
+                    logger.error(
+                        "BUG: should_exit=True but reason=None for %s — "
+                        "see trading_bot/strategy/exit.py producers",
+                        ticker,
+                    )
+                    raise RuntimeError(
+                        f"Exit decision for {ticker} has should_exit=True "
+                        f"with no reason set"
+                    )
+                reason_str: str = exit_decision.reason.value
                 order_id: str | None = await self._order_manager.place_limit_exit(
                     ticker=ticker,
                     qty=qty,
                     limit_price=limit_price,
-                    reason=exit_decision.reason,
+                    reason=reason_str,
                 )
                 if order_id is None:
                     logger.warning(
@@ -1044,10 +1063,10 @@ class TradingBot:
             )
 
             if self._dry_run:
-                current_price: float | None = self._market_data.get_latest_price(ticker)
+                dry_run_price: float | None = self._market_data.get_latest_price(ticker)
                 logger.info(
                     "[DRY RUN] Would wind-down: SELL %.6f %s @ %.4f",
-                    qty, ticker, current_price or 0.0,
+                    qty, ticker, dry_run_price or 0.0,
                 )
                 continue
 

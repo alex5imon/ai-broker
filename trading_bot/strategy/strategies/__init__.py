@@ -42,8 +42,12 @@ def create_strategies(
         cls: type[StrategyBase] | None = STRATEGY_REGISTRY.get(sid)
         if cls is None:
             continue
+        # Each concrete subclass overrides `__init__` to take
+        # (config, db_path, vol_target_config) — narrower than the base
+        # class signature mypy sees. The registry pattern is the only
+        # caller, so the kwargs are guaranteed to match.
         strategies.append(
-            cls(
+            cls(  # type: ignore[call-arg]
                 config=cfg,
                 db_path=db_path,
                 vol_target_config=vol_target_config,
