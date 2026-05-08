@@ -8,6 +8,10 @@ __pycache__/
 *.db-wal
 *.plist
 .pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
 *.egg-info/
 /data/
 /backtest_data/

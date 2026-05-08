@@ -1,0 +1,45 @@
+# Coverage configuration for the production trading_bot package.
+#
+# Scope: live-tick + execution + risk + db + reporting + self_improve.
+# Excluded: tests themselves (always 100% by definition), the offline
+# multi-strategy backtester (research code; unit tests cover the pieces
+# that matter, but the full backtester is exercised end-to-end by the
+# weekly walkforward instead), and the historical-data loaders (one-shot
+# CLIs run by hand).
+#
+# Baseline at PR #88 (2026-05-08): TOTAL 72.21% on the CI runner
+# (ubuntu-latest + Python 3.12). The coverage workflow gates on
+# `--cov-fail-under=71` to allow 1pp of slack for small refactors
+# while still catching "shipped a feature without tests". Local
+# macOS/Python 3.14 reads ~1.5pp higher because of platform-specific
+# code paths and stdlib differences — CI is the source of truth.
+
+[run]
+source = trading_bot
+omit =
+    trading_bot/tests/*
+    # `multi_strategy_backtest.py` is excluded from the denominator
+    # but unit tests still import its `_size_by_risk` helper directly
+    # (`test_sizing_properties.py`). Those lines DO execute under
+    # coverage; they just don't count toward the trading_bot total.
+    # Net effect: the headline percentage flatters slightly. When
+    # raising the threshold, drop the omit ad-hoc to see the
+    # unflattered number for helpers actually exercised by tests.
+    trading_bot/multi_strategy_backtest.py
+    trading_bot/data/sp500_loader.py
+    trading_bot/data/spy_intraday_loader.py
+    trading_bot/data/alpaca_downloader.py
+
+[report]
+# Lines that don't need to count against coverage:
+#   - explicit `pragma: no cover` markers
+#   - main-script entry points
+#   - NotImplementedError stubs (abstract method placeholders)
+#   - protocol method bodies (`...`)
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
+    raise NotImplementedError
+    \.\.\.
+show_missing = true
+skip_covered = true
