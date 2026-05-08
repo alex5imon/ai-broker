@@ -916,15 +916,25 @@ class TradingBot:
                 else:
                     limit_price = current_price
 
-                # `exit_decision.reason` is `ExitReason | None`; when
-                # `should_exit=True` the caller above always sets it,
-                # but mypy can't infer that. Stringify and substitute a
-                # safe default for the never-expected None branch.
-                reason_str: str = (
-                    exit_decision.reason.value
-                    if exit_decision.reason is not None
-                    else "strategy_exit"
-                )
+                # `exit_decision.reason` is `ExitReason | None`. Every
+                # production code path that produces `should_exit=True`
+                # also sets a reason (stop_loss / take_profit / time_stop
+                # / kill_switch / drawdown_breaker / daily_limit). A None
+                # here is a programming error — assert loudly so the bug
+                # surfaces in tests/CI rather than landing in the DB as
+                # a silent "strategy_exit" sentinel that breaks
+                # downstream filtering and reporting.
+                if exit_decision.reason is None:
+                    logger.error(
+                        "BUG: should_exit=True but reason=None for %s — "
+                        "see trading_bot/strategy/exit.py producers",
+                        ticker,
+                    )
+                    raise RuntimeError(
+                        f"Exit decision for {ticker} has should_exit=True "
+                        f"with no reason set"
+                    )
+                reason_str: str = exit_decision.reason.value
                 order_id: str | None = await self._order_manager.place_limit_exit(
                     ticker=ticker,
                     qty=qty,

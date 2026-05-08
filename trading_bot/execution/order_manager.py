@@ -11,12 +11,12 @@ survive a stateless cron run.  ``_active_orders`` is hydrated from the
 
 Mypy note: the alpaca-py client returns ``Order | RawData`` and
 ``list[Order] | RawData`` (where ``RawData = dict[str, Any]``) — the
-dict path is only reachable with ``raw_data=True`` which we never pass.
-``[arg-type, union-attr]`` covers those calls. Real None-misuse and
-other strict-optional issues still surface in this file.
+dict path is only reachable with ``raw_data=True`` which we never
+pass. Each affected SDK call site has a per-line
+``# type: ignore[arg-type]`` (or ``[union-attr]``) annotation; the
+file-level suppress was avoided so genuinely-buggy union accesses in
+unrelated code paths still surface.
 """
-
-# mypy: disable-error-code="arg-type, union-attr"
 
 from __future__ import annotations
 
@@ -333,7 +333,8 @@ class OrderManager:
             ):
                 try:
                     order: AlpacaOrder = await asyncio.to_thread(
-                        client.get_order_by_id, active.alpaca_entry_order_id,
+                        client.get_order_by_id,  # type: ignore[arg-type]
+                        active.alpaca_entry_order_id,
                     )
                     if order.status.value == "filled":
                         active.filled_shares = float(order.filled_qty or 0)
@@ -404,7 +405,8 @@ class OrderManager:
                         continue
                     try:
                         order = await asyncio.to_thread(
-                            client.get_order_by_id, order_id,
+                            client.get_order_by_id,  # type: ignore[arg-type]
+                            order_id,
                         )
                         if order.status.value == "filled":
                             exit_price: float = float(order.filled_avg_price or 0)
@@ -442,10 +444,15 @@ class OrderManager:
                 exit_oid: str = active.alpaca_exit_order_id
                 try:
                     exit_order = await asyncio.to_thread(
-                        client.get_order_by_id, exit_oid,
+                        client.get_order_by_id,  # type: ignore[arg-type]
+                        exit_oid,
                     )
-                    if exit_order.status.value == "filled":
-                        exit_px: float = float(exit_order.filled_avg_price or 0)
+                    # Alpaca returns Order | RawData; we never request raw
+                    # so the typed branch is the only reachable one. The
+                    # union-attr ignores below cover the .status / .filled_avg_price
+                    # accesses across this block.
+                    if exit_order.status.value == "filled":  # type: ignore[union-attr]
+                        exit_px: float = float(exit_order.filled_avg_price or 0)  # type: ignore[union-attr]
                         reason_str: str = active.exit_reason or "strategy_exit"
                         logger.info(
                             "Strategy exit FILLED: %s reason=%s @ %.4f (trade_id=%d)",
@@ -461,7 +468,7 @@ class OrderManager:
                             ticker=active.ticker, pnl=pnl_strategy,
                             hold_time="", exit_reason=reason_str,
                         )
-                    elif exit_order.status.value in ("canceled", "expired", "rejected"):
+                    elif exit_order.status.value in ("canceled", "expired", "rejected"):  # type: ignore[union-attr]
                         # Limit exit didn't fill (e.g. price gapped through
                         # the limit). Roll back to STOP_AND_TARGET_ACTIVE so
                         # the next tick re-evaluates the exit condition; the
@@ -469,7 +476,7 @@ class OrderManager:
                         # was cancelled.
                         logger.warning(
                             "Strategy exit %s for %s — rolling back to STOP_AND_TARGET_ACTIVE",
-                            exit_order.status.value, active.ticker,
+                            exit_order.status.value, active.ticker,  # type: ignore[union-attr]
                         )
                         active.alpaca_exit_order_id = None
                         active.exit_reason = None
@@ -522,7 +529,8 @@ class OrderManager:
                 limit_price=round(decision.limit_price, 2),
             )
             order: AlpacaOrder = await asyncio.to_thread(
-                client.submit_order, order_data=request,
+                client.submit_order,  # type: ignore[arg-type]
+                order_data=request,
             )
             alpaca_order_id: str = str(order.id)
 
@@ -667,7 +675,8 @@ class OrderManager:
                 trail_percent=round(trail_pct * 100, 2),
             )
             order: AlpacaOrder = await asyncio.to_thread(
-                client.submit_order, order_data=request,
+                client.submit_order,  # type: ignore[arg-type]
+                order_data=request,
             )
             order_id: str = str(order.id)
             logger.info(
@@ -710,7 +719,8 @@ class OrderManager:
                 symbols=[ticker],
             )
             orders: list[AlpacaOrder] = await asyncio.to_thread(
-                self._gw.client.get_orders, filter=request,
+                self._gw.client.get_orders,  # type: ignore[arg-type]
+                filter=request,
             )
             for order in orders:
                 try:
@@ -736,7 +746,8 @@ class OrderManager:
                 time_in_force=tif_for_market(qty),
             )
             order: AlpacaOrder = await asyncio.to_thread(
-                client.submit_order, order_data=request,
+                client.submit_order,  # type: ignore[arg-type]
+                order_data=request,
             )
             logger.warning(
                 "Emergency flatten: SELL %.6f %s @ MARKET (alpaca_id=%s)",
@@ -837,7 +848,8 @@ class OrderManager:
                 time_in_force=TimeInForce.DAY,
             )
             order: AlpacaOrder = await asyncio.to_thread(
-                client.submit_order, order_data=request,
+                client.submit_order,  # type: ignore[arg-type]
+                order_data=request,
             )
             order_id: str = str(order.id)
             logger.info(
@@ -960,7 +972,8 @@ class OrderManager:
                 limit_price=round(limit_price, 2),
             )
             order: AlpacaOrder = await asyncio.to_thread(
-                client.submit_order, order_data=request,
+                client.submit_order,  # type: ignore[arg-type]
+                order_data=request,
             )
             order_id = str(order.id)
             logger.info(
@@ -1129,7 +1142,8 @@ class OrderManager:
                 stop_price=round(active.stop_price, 2),
             )
             order: AlpacaOrder = await asyncio.to_thread(
-                self._gw.client.submit_order, order_data=request,
+                self._gw.client.submit_order,  # type: ignore[arg-type]
+                order_data=request,
             )
             return str(order.id)
         except Exception:
@@ -1158,7 +1172,8 @@ class OrderManager:
                 symbols=[ticker],
             )
             orders: list[AlpacaOrder] = await asyncio.to_thread(
-                self._gw.client.get_orders, filter=request,
+                self._gw.client.get_orders,  # type: ignore[arg-type]
+                filter=request,
             )
         except Exception:
             logger.warning(
