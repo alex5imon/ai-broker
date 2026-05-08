@@ -17,6 +17,7 @@ from trading_bot.config import Config
 from trading_bot.constants import TZ_EASTERN, ExitReason, HoldType
 from trading_bot.data.holiday_calendar import HolidayCalendar
 from trading_bot.data.market_data import MarketDataManager
+from trading_bot.utils.time import count_trading_days_between
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -189,41 +190,13 @@ class ExitManager:
         # session-aligned rather than UTC-anchored.
         entry_date: date = entry_time.astimezone(ET).date()
         current_date: date = current_time.astimezone(ET).date()
-        elapsed_trading_days: int = self._count_trading_days_between(
-            entry_date, current_date,
+        # The trading-day count helper lives in `utils.time` so the
+        # property tests can exercise it without ExitManager's full
+        # constructor dependency chain. See PR #89.
+        elapsed_trading_days: int = count_trading_days_between(
+            self._holiday_calendar, entry_date, current_date,
         )
         return elapsed_trading_days >= max_days
-
-    def _count_trading_days_between(
-        self,
-        start_date: date,
-        end_date: date,
-    ) -> int:
-        """Count NYSE trading days strictly between *start_date* (entry)
-        and *end_date* (now), exclusive of the entry date and inclusive
-        of any session ending on or before *end_date*.
-
-        Examples (no holidays, no weekends shown):
-        - entry Mon, now Mon → 0 (same session, intraday — the swing
-          branch shouldn't fire).
-        - entry Mon, now Tue → 1.
-        - entry Thu, now Mon → 2 (Fri + Mon).
-        - entry Thu, now Tue → 3 (Fri + Mon + Tue).
-
-        Returns 0 when ``end_date <= start_date``. The walk is bounded
-        by calendar-day distance so a corrupted timestamp can't loop
-        forever.
-        """
-        if end_date <= start_date:
-            return 0
-        cal: HolidayCalendar = self._holiday_calendar
-        count: int = 0
-        cursor: date = start_date + timedelta(days=1)
-        while cursor <= end_date:
-            if cal.is_trading_day(cursor):
-                count += 1
-            cursor += timedelta(days=1)
-        return count
 
     # ------------------------------------------------------------------
     # Composite exit evaluation
