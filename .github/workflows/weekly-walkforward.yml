@@ -2,8 +2,13 @@ name: weekly-walkforward
 
 # Weekly statistical-significance check for the active strategy stack.
 # Runs the multi-strategy walkforward backtest with bootstrap CIs over
-# the last ~3 years of intraday bars (the regime the live bot trades in)
+# the last ~2 years of intraday bars (the regime the live bot trades in)
 # and gates on the synthetic _portfolio strategy's PF CI lower bound.
+#
+# Universe and window were trimmed 2026-05-11 after the 2026-05-10 run
+# was cancelled by the 60-min job timeout. Dropped XLU/XLRE/XLC/XLB
+# (lowest-volume sectors) and shortened the window from 3y to 2y to
+# fit comfortably under the runtime cap.
 #
 # Healthy run → upload report as artifact only.
 # Degraded run (CI lower bound < 1.0) → also open a draft PR with the
@@ -31,7 +36,7 @@ permissions:
 jobs:
   walkforward:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
         with:
@@ -49,11 +54,12 @@ jobs:
       - name: Compute date window
         id: dates
         run: |
-          # Last ~3 calendar years ending yesterday. Aligns with the
+          # Last ~2 calendar years ending yesterday. Aligns with the
           # regime-matched walkforward methodology in
-          # memory/feedback_regime_matched_walkforward.md.
+          # memory/feedback_regime_matched_walkforward.md. Trimmed from
+          # 3y to 2y on 2026-05-11 after a 60-min timeout cancellation.
           BT_TO=$(date -u -d "yesterday" +%Y-%m-%d)
-          BT_FROM=$(date -u -d "3 years ago" +%Y-%m-%d)
+          BT_FROM=$(date -u -d "2 years ago" +%Y-%m-%d)
           REPORT_DATE=$(date -u +%Y-%m-%d)
           echo "bt_from=${BT_FROM}" >> "$GITHUB_OUTPUT"
           echo "bt_to=${BT_TO}" >> "$GITHUB_OUTPUT"
@@ -72,7 +78,7 @@ jobs:
           python -m trading_bot.data.alpaca_downloader \
             --from "${{ steps.dates.outputs.bt_from }}" \
             --to "${{ steps.dates.outputs.bt_to }}" \
-            --tickers SPY QQQ XLF XLK XLE XLV XLI XLY XLP XLU XLB XLRE XLC
+            --tickers SPY QQQ XLF XLK XLE XLV XLI XLY XLP
 
       - name: Run walkforward
         env:
@@ -86,7 +92,7 @@ jobs:
             --from "${{ steps.dates.outputs.bt_from }}" \
             --to "${{ steps.dates.outputs.bt_to }}" \
             --multi-intraday \
-            --tickers SPY,QQQ,XLF,XLK,XLE,XLV,XLI,XLY,XLP,XLU,XLB,XLRE,XLC \
+            --tickers SPY,QQQ,XLF,XLK,XLE,XLV,XLI,XLY,XLP \
             --walkforward --wf-window 90 --wf-step 90 --wf-bootstrap 1000
 
       - name: Health check + report
