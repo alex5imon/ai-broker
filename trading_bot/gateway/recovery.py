@@ -285,6 +285,68 @@ class StateRecovery:
             self._close_db_position(db_row["id"], "reconciliation_mismatch")
             result.positions_closed_mismatch.append(ticker)
 
+    # NYSE close = 16:00 ET. DAY stop orders expire at the bell, which
+    # means the close-of-day bot tick (cron fires at 20:00 UTC = 16:00 ET)
+    # sees an empty open-orders list for those tickers and would replace
+    # every fractional position's stop. Alpaca then defers the
+    # post-close-submitted stop to the next trading session's pre-market
+    # open (~04:00 ET), where it becomes a phantom that holds the qty
+    # and blocks the next morning's strategy exit (observed 2026-05-08
+    # XLF/XLC, 2026-05-11 09:30 ET overnight_drift exit rejections).
+    #
+    # Skip placing emergency stops once we're inside the close window;
+    # the next session's first tick (09:30 ET) will re-attach a fresh
+    # stop in a window where Alpaca submits it immediately.
+    _STOP_VERIFY_CUTOFF_HHMM: int = 15 * 60 + 55  # 15:55 ET, used by fallback
+    # Minimum seconds before next close required for a DAY stop to make
+    # it onto the book before Alpaca defers it to the next session.
+    _STOP_VERIFY_CLOSE_BUFFER_SEC: int = 300  # 5 minutes
+
+    async def _inside_stop_placement_window(self) -> bool:
+        """Return True when emergency-stop placement is safe.
+
+        Primary: consult Alpaca's clock (`is_open` + `next_close`). This
+        handles early-close days (Thanksgiving Friday 13:00 ET, Christmas
+        Eve 13:00 ET, July 3 etc.) correctly — the fixed 15:55 cutoff
+        would happily place a stop at 13:30 on an early-close day, which
+        Alpaca would then defer to the next session and produce the same
+        phantom-stop bug this gate exists to prevent.
+
+        Fallback: fixed ET time gate (09:30 ≤ now_et < 15:55). Used only
+        when the clock call fails or returns an unrecognised shape — keeps
+        the safety net functional even if Alpaca's /v2/clock endpoint
+        flakes briefly.
+        """
+        # Primary path: Alpaca clock.
+        try:
+            clock = await asyncio.to_thread(self._gw.client.get_clock)
+            is_open = getattr(clock, "is_open", None)
+            # Strict bool check defends against test gateways whose
+            # `get_clock` auto-mocks attributes to MagicMock objects —
+            # would otherwise read as truthy and let placement proceed.
+            if isinstance(is_open, bool):
+                if not is_open:
+                    return False
+                next_close = getattr(clock, "next_close", None)
+                if isinstance(next_close, datetime):
+                    if next_close.tzinfo is None:
+                        next_close = next_close.replace(tzinfo=ET)
+                    seconds_to_close = (
+                        next_close - self._now_fn()
+                    ).total_seconds()
+                    if seconds_to_close < self._STOP_VERIFY_CLOSE_BUFFER_SEC:
+                        return False
+                return True
+        except Exception:
+            logger.debug(
+                "AlpacaClock unavailable; falling back to fixed time gate",
+                exc_info=True,
+            )
+        # Fallback path: fixed time gate.
+        now_et: datetime = self._now_fn()
+        hhmm: int = now_et.hour * 60 + now_et.minute
+        return 9 * 60 + 30 <= hhmm < self._STOP_VERIFY_CUTOFF_HHMM
+
     async def _verify_stop_orders(
         self,
         alpaca_positions: list[AlpacaPosition],
@@ -292,6 +354,11 @@ class StateRecovery:
         result: RecoveryResult,
     ) -> None:
         """Ensure every open position has an active stop-loss order."""
+        if not await self._inside_stop_placement_window():
+            # Outside the safe window — defer. Don't even iterate, so
+            # the run summary doesn't report "would have placed X stops".
+            return
+
         tickers_with_stops: set[str] = set()
         for order in alpaca_orders:
             if order.type and order.type.value in ("stop", "trailing_stop"):

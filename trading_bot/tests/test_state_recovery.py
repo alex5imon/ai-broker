@@ -268,7 +268,10 @@ class TestStateRecovery:
         pos = _alpaca_position("PLTR", qty=100, avg_entry_price=10.0)
         gw = self._make_gateway(positions=[pos], orders=[])
 
-        recovery = _make_recovery(gw, tmp_db_path, mock_notifier)
+        # Pin the clock to mid-session (11:00 ET) so the new
+        # close-window gate doesn't skip placement.
+        mid_session = datetime(2026, 5, 11, 11, 0, tzinfo=ET)
+        recovery = _make_recovery(gw, tmp_db_path, mock_notifier, now=mid_session)
         result = await recovery.recover()
 
         assert "PLTR" in result.stops_placed
@@ -284,11 +287,189 @@ class TestStateRecovery:
         pos = _alpaca_position("PLTR", qty=100, avg_entry_price=0.0)
         gw = self._make_gateway(positions=[pos], orders=[])
 
-        recovery = _make_recovery(gw, tmp_db_path, mock_notifier)
+        mid_session = datetime(2026, 5, 11, 11, 0, tzinfo=ET)
+        recovery = _make_recovery(gw, tmp_db_path, mock_notifier, now=mid_session)
         await recovery.recover()
 
         # Stop should NOT be submitted when avg_cost is 0
         gw.client.submit_order.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stop_verify_skipped_at_close_of_day_tick(
+        self, tmp_db_path: str, mock_notifier
+    ) -> None:
+        """Regression for 2026-05-08 phantom-stop bug.
+
+        At the 16:00 ET (= 20:00 UTC) close-of-day tick, the existing
+        DAY stops have JUST expired at the bell. _verify_stop_orders
+        would see them missing and submit fresh stops — which Alpaca
+        defers to the next session's pre-market open, where they hold
+        the qty and block the morning exit.
+
+        The gate must skip _place_emergency_stop in the close window.
+        Next morning's first tick will re-attach a fresh stop in a
+        window where Alpaca submits it immediately.
+        """
+        pos = _alpaca_position("XLF", qty=1.989, avg_entry_price=51.28)
+        gw = self._make_gateway(positions=[pos], orders=[])
+
+        # 16:00 ET exactly — the cron tick that caused the regression.
+        close_tick = datetime(2026, 5, 8, 16, 0, tzinfo=ET)
+        recovery = _make_recovery(gw, tmp_db_path, mock_notifier, now=close_tick)
+        result = await recovery.recover()
+
+        gw.client.submit_order.assert_not_called(), (
+            "no stop must be submitted at the close-of-day tick — "
+            "Alpaca defers post-close DAY orders to next session, "
+            "creating phantom stops that block morning exits"
+        )
+        assert "XLF" not in result.stops_placed
+
+    @pytest.mark.asyncio
+    async def test_stop_verify_skipped_just_before_close(
+        self, tmp_db_path: str, mock_notifier
+    ) -> None:
+        """15:55 ET is the cutoff — at or after, defer to next session."""
+        pos = _alpaca_position("XLF", qty=1.989, avg_entry_price=51.28)
+        gw = self._make_gateway(positions=[pos], orders=[])
+
+        just_before_close = datetime(2026, 5, 8, 15, 55, tzinfo=ET)
+        recovery = _make_recovery(
+            gw, tmp_db_path, mock_notifier, now=just_before_close,
+        )
+        await recovery.recover()
+        gw.client.submit_order.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stop_verify_skipped_pre_market(
+        self, tmp_db_path: str, mock_notifier
+    ) -> None:
+        """Pre-market (e.g., 08:00 ET) is also outside the safe window.
+        DAY stops placed pre-market would still be queued before the
+        regular session starts.
+        """
+        pos = _alpaca_position("XLF", qty=1.989, avg_entry_price=51.28)
+        gw = self._make_gateway(positions=[pos], orders=[])
+        pre_market = datetime(2026, 5, 8, 8, 0, tzinfo=ET)
+        recovery = _make_recovery(gw, tmp_db_path, mock_notifier, now=pre_market)
+        await recovery.recover()
+        gw.client.submit_order.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stop_verify_active_at_market_open(
+        self, tmp_db_path: str, mock_notifier
+    ) -> None:
+        """09:30 ET is the open — the first valid window for stop placement.
+        This is the morning tick that re-attaches the stop the close-of-day
+        skipper deferred.
+        """
+        pos = _alpaca_position("XLF", qty=1.989, avg_entry_price=51.28)
+        gw = self._make_gateway(positions=[pos], orders=[])
+        market_open = datetime(2026, 5, 8, 9, 30, tzinfo=ET)
+        recovery = _make_recovery(gw, tmp_db_path, mock_notifier, now=market_open)
+        result = await recovery.recover()
+
+        assert "XLF" in result.stops_placed
+        gw.client.submit_order.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stop_verify_uses_alpaca_clock_when_closed(
+        self, tmp_db_path: str, mock_notifier
+    ) -> None:
+        """When Alpaca's clock reports is_open=False, defer regardless of
+        wall-clock time. Closes the early-close-day gap that the fixed
+        15:55 ET cutoff couldn't see (Thanksgiving Friday closes 13:00 ET,
+        the bot's 14:00 tick would otherwise place a stop that Alpaca
+        queues until the next session).
+        """
+        pos = _alpaca_position("XLF", qty=1.989, avg_entry_price=51.28)
+        gw = self._make_gateway(positions=[pos], orders=[])
+
+        # Wall clock says 14:00 ET — inside the fixed time gate's safe
+        # window. But Alpaca's clock says the market is closed (e.g.,
+        # early-close day post-13:00).
+        clock = MagicMock()
+        clock.is_open = False
+        clock.next_close = None
+        gw.client.get_clock = MagicMock(return_value=clock)
+
+        wall_clock = datetime(2026, 11, 28, 14, 0, tzinfo=ET)  # Thxgv Fri
+        recovery = _make_recovery(gw, tmp_db_path, mock_notifier, now=wall_clock)
+        await recovery.recover()
+
+        gw.client.submit_order.assert_not_called(), (
+            "AlpacaClock.is_open=False must override the fixed time gate "
+            "— early-close days would otherwise reproduce the phantom-stop bug"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_verify_uses_alpaca_clock_near_close(
+        self, tmp_db_path: str, mock_notifier
+    ) -> None:
+        """When market is open but ``next_close`` is within the 5-min
+        buffer, defer. Catches the boundary case where Alpaca would still
+        queue a DAY order rather than submit it before close.
+        """
+        pos = _alpaca_position("XLF", qty=1.989, avg_entry_price=51.28)
+        gw = self._make_gateway(positions=[pos], orders=[])
+
+        wall_clock = datetime(2026, 5, 8, 15, 57, tzinfo=ET)
+        # Clock says open, but next_close is 3 min away — below the 5-min
+        # safety buffer.
+        clock = MagicMock()
+        clock.is_open = True
+        clock.next_close = datetime(2026, 5, 8, 16, 0, tzinfo=ET)
+        gw.client.get_clock = MagicMock(return_value=clock)
+
+        recovery = _make_recovery(gw, tmp_db_path, mock_notifier, now=wall_clock)
+        await recovery.recover()
+
+        gw.client.submit_order.assert_not_called(), (
+            "within 5 min of close — DAY stop would be queued for next "
+            "session, must defer"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_verify_active_when_clock_open_and_buffer_safe(
+        self, tmp_db_path: str, mock_notifier
+    ) -> None:
+        """Clock says open + plenty of time before close → place the stop."""
+        pos = _alpaca_position("XLF", qty=1.989, avg_entry_price=51.28)
+        gw = self._make_gateway(positions=[pos], orders=[])
+
+        wall_clock = datetime(2026, 5, 8, 11, 0, tzinfo=ET)
+        clock = MagicMock()
+        clock.is_open = True
+        clock.next_close = datetime(2026, 5, 8, 16, 0, tzinfo=ET)
+        gw.client.get_clock = MagicMock(return_value=clock)
+
+        recovery = _make_recovery(gw, tmp_db_path, mock_notifier, now=wall_clock)
+        result = await recovery.recover()
+
+        assert "XLF" in result.stops_placed
+        gw.client.submit_order.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stop_verify_falls_back_when_clock_unavailable(
+        self, tmp_db_path: str, mock_notifier
+    ) -> None:
+        """If Alpaca's clock endpoint flakes, fall back to the fixed time
+        gate so the safety net still works (and we don't accidentally
+        gate-everything when the clock call errors).
+        """
+        pos = _alpaca_position("XLF", qty=1.989, avg_entry_price=51.28)
+        gw = self._make_gateway(positions=[pos], orders=[])
+
+        # Clock call raises.
+        gw.client.get_clock = MagicMock(side_effect=RuntimeError("clock 503"))
+
+        # Wall clock at 11:00 ET — inside the fallback safe window.
+        wall_clock = datetime(2026, 5, 8, 11, 0, tzinfo=ET)
+        recovery = _make_recovery(gw, tmp_db_path, mock_notifier, now=wall_clock)
+        result = await recovery.recover()
+
+        assert "XLF" in result.stops_placed
+        gw.client.submit_order.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_no_discrepancy_clean_state(
