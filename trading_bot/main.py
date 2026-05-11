@@ -611,6 +611,25 @@ class TradingBot:
             self._risk_manager.daily_pnl_usd, account_equity_usd
         )
 
+        # Drawdown breaker: 5-day rolling drawdown threshold. Returns
+        # True only on the activation tick (the breaker state then
+        # blocks subsequent entries via can_trade()). On activation,
+        # also force-flatten existing positions: the >5% drawdown that
+        # tripped the breaker is precisely the signal that our model
+        # is mispricing risk, so trusting the existing stops to behave
+        # is the assumption we shouldn't make.
+        try:
+            breaker_just_tripped: bool = self._risk_manager.check_drawdown_breaker(
+                account_equity_usd,
+            )
+        except Exception:
+            logger.exception(
+                "Drawdown breaker check raised — failing open (entries unblocked)",
+            )
+            breaker_just_tripped = False
+        if breaker_just_tripped:
+            await self._risk_manager.handle_drawdown_breaker_flatten(self._gateway)
+
         exchange_str: str = "US"
 
         for ticker in watchlist:

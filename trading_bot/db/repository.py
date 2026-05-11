@@ -106,36 +106,12 @@ def save_trade(conn: sqlite3.Connection, trade: dict[str, Any]) -> int:
     return trade_id
 
 
-def update_trade_exit(conn: sqlite3.Connection, trade_id: int, exit_data: dict[str, Any]) -> None:
-    """Update an existing trade with exit information."""
-    _ensure_row_factory(conn)
-    conn.execute(
-        """
-        UPDATE trades SET
-            exit_time       = :exit_time,
-            exit_price      = :exit_price,
-            exit_reason     = :exit_reason,
-            gross_pnl       = :gross_pnl,
-            commission      = :commission,
-            net_pnl         = :net_pnl,
-            pnl_usd         = :pnl_usd,
-            slippage_bps    = :slippage_bps
-        WHERE id = :id
-        """,
-        {
-            "id": trade_id,
-            "exit_time": exit_data["exit_time"],
-            "exit_price": exit_data["exit_price"],
-            "exit_reason": exit_data["exit_reason"],
-            "gross_pnl": exit_data.get("gross_pnl"),
-            "commission": exit_data.get("commission"),
-            "net_pnl": exit_data.get("net_pnl"),
-            "pnl_usd": exit_data.get("pnl_usd"),
-            "slippage_bps": exit_data.get("slippage_bps"),
-        },
-    )
-    conn.commit()
-    logger.debug("Updated trade id=%d exit_reason=%s", trade_id, exit_data["exit_reason"])
+# NOTE: A standalone ``update_trade_exit`` helper was deleted on
+# 2026-05-11 (item 10 of the trading-path correctness pass). It had no
+# production callers and referenced a non-existent ``commission``
+# column — every invocation would have raised OperationalError. The
+# inline path in ``_close_position`` is the single authoritative writer
+# of trade-exit rows and already performs a ``rowcount`` check.
 
 
 # ---------------------------------------------------------------------------
@@ -859,50 +835,58 @@ def save_risk_state(
 
     When *tripped* flips from False to True, ``tripped_at`` is set to *now*.
     When it flips back to False, ``tripped_at`` and ``reason`` are cleared.
+
+    The read-modify-write (preserving the original ``tripped_at`` across
+    updates) is wrapped in a ``BEGIN IMMEDIATE`` transaction so a
+    concurrent manual tick and scheduled tick can't interleave between
+    the SELECT and the UPSERT and lose the original timestamp.
     """
     _ensure_row_factory(conn)
-    prior = conn.execute(
-        "SELECT tripped FROM risk_circuit_state WHERE key = ?",
-        (key,),
-    ).fetchone()
     now: str = _now_eastern_iso()
     state_json: str = json.dumps(state or {}, sort_keys=True)
 
-    if tripped:
-        # Preserve the original tripped_at on an update; only stamp it on first trip.
-        tripped_at: str | None = now
-        if prior is not None and int(prior["tripped"]) == 1:
-            existing = conn.execute(
-                "SELECT tripped_at FROM risk_circuit_state WHERE key = ?",
-                (key,),
-            ).fetchone()
-            if existing and existing["tripped_at"]:
-                tripped_at = existing["tripped_at"]
-    else:
-        tripped_at = None
-        reason = None
+    # Take a write lock immediately so the prior-state read sees a
+    # consistent snapshot relative to the upsert below.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        prior = conn.execute(
+            "SELECT tripped, tripped_at FROM risk_circuit_state WHERE key = ?",
+            (key,),
+        ).fetchone()
 
-    conn.execute(
-        """
-        INSERT INTO risk_circuit_state (key, tripped, tripped_at, reason, state_json, updated_at)
-        VALUES (:key, :tripped, :tripped_at, :reason, :state_json, :now)
-        ON CONFLICT(key) DO UPDATE SET
-            tripped     = excluded.tripped,
-            tripped_at  = excluded.tripped_at,
-            reason      = excluded.reason,
-            state_json  = excluded.state_json,
-            updated_at  = excluded.updated_at
-        """,
-        {
-            "key": key,
-            "tripped": 1 if tripped else 0,
-            "tripped_at": tripped_at,
-            "reason": reason,
-            "state_json": state_json,
-            "now": now,
-        },
-    )
-    conn.commit()
+        if tripped:
+            # Preserve the original tripped_at on an update; only stamp on first trip.
+            tripped_at: str | None = now
+            if prior is not None and int(prior["tripped"]) == 1 and prior["tripped_at"]:
+                tripped_at = prior["tripped_at"]
+        else:
+            tripped_at = None
+            reason = None
+
+        conn.execute(
+            """
+            INSERT INTO risk_circuit_state (key, tripped, tripped_at, reason, state_json, updated_at)
+            VALUES (:key, :tripped, :tripped_at, :reason, :state_json, :now)
+            ON CONFLICT(key) DO UPDATE SET
+                tripped     = excluded.tripped,
+                tripped_at  = excluded.tripped_at,
+                reason      = excluded.reason,
+                state_json  = excluded.state_json,
+                updated_at  = excluded.updated_at
+            """,
+            {
+                "key": key,
+                "tripped": 1 if tripped else 0,
+                "tripped_at": tripped_at,
+                "reason": reason,
+                "state_json": state_json,
+                "now": now,
+            },
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def load_risk_state(

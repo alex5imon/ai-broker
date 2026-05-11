@@ -445,6 +445,7 @@ def _alpaca_open_stop(
     qty: float = 10.0,
     side: str = "sell",
     order_type: str = "stop",
+    stop_price: float | None = None,
 ):
     """Mock an open Alpaca order shaped like get_orders(status=OPEN) returns."""
     o = MagicMock()
@@ -455,6 +456,7 @@ def _alpaca_open_stop(
     o.side.value = side
     o.order_type = MagicMock()
     o.order_type.value = order_type
+    o.stop_price = stop_price
     return o
 
 
@@ -505,6 +507,7 @@ class TestB6_TransitionToOpenRecoversFromStopAttachResponseLoss:
             order_id="recovered-stop",
             symbol=decision.ticker,
             qty=float(decision.shares),
+            stop_price=decision.stop_price,
         )
         om._gw.client.get_orders = MagicMock(return_value=[recovered])
 
@@ -603,16 +606,26 @@ class TestB6_TransitionToOpenRecoversFromStopAttachResponseLoss:
         om._place_standalone_stop = _fail_stop_submit  # type: ignore[assignment]
         wrong_qty = _alpaca_open_stop(
             order_id="wrong-qty", symbol=decision.ticker, qty=5.0,
+            stop_price=decision.stop_price,
         )
         wrong_side = _alpaca_open_stop(
             order_id="wrong-side", symbol=decision.ticker, qty=10.0, side="buy",
+            stop_price=decision.stop_price,
         )
         wrong_type = _alpaca_open_stop(
             order_id="wrong-type", symbol=decision.ticker, qty=10.0,
-            order_type="limit",
+            order_type="limit", stop_price=decision.stop_price,
+        )
+        # Item 13 (correctness pass): a stop with the right qty + side +
+        # type but a *different* stop price (e.g. a stale bracket leg)
+        # must NOT be adopted. Phase-3 will run up to 8 positions; the
+        # risk of accidental adoption rises with order density.
+        wrong_stop_price = _alpaca_open_stop(
+            order_id="wrong-stop-price", symbol=decision.ticker, qty=10.0,
+            stop_price=(decision.stop_price or 0.0) + 1.00,
         )
         om._gw.client.get_orders = MagicMock(
-            return_value=[wrong_qty, wrong_side, wrong_type],
+            return_value=[wrong_qty, wrong_side, wrong_type, wrong_stop_price],
         )
         om._gw.client.submit_order = MagicMock(return_value=_alpaca_order())
 

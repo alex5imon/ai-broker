@@ -1057,7 +1057,7 @@ class OrderManager:
             # been observed to silently fail on the same SDK paths), check
             # whether a matching stop is already live at Alpaca and adopt it.
             recovered_stop_id = await self._find_existing_stop(
-                active.ticker, filled_qty,
+                active.ticker, filled_qty, stop_price=active.stop_price,
             )
             if recovered_stop_id is not None:
                 logger.warning(
@@ -1154,7 +1154,7 @@ class OrderManager:
             return None
 
     async def _find_existing_stop(
-        self, ticker: str, qty: float,
+        self, ticker: str, qty: float, *, stop_price: float | None = None,
     ) -> str | None:
         """Look up an open SELL stop on ``ticker`` matching ``qty`` at Alpaca.
 
@@ -1163,6 +1163,14 @@ class OrderManager:
         the order has actually been accepted by the broker, so the bot
         thinks the stop placement failed when it succeeded. Adopting the
         live order is preferable to emergency-flattening a real position.
+
+        When ``stop_price`` is provided, additionally requires the order's
+        stop price to match within 2 cents (Alpaca prices arrive as floats
+        or strings; the tolerance covers rounding). This prevents adopting
+        an unrelated stop on the same ticker — a real risk under Phase-3
+        with eight concurrent positions where a partially-cancelled bracket
+        leg and a newly-submitted stop could legitimately coexist briefly.
+
         Returns the matching order id or None.
         """
         try:
@@ -1201,6 +1209,15 @@ class OrderManager:
                 continue
             if abs(order_qty - qty) > 1e-6:
                 continue
+            if stop_price is not None:
+                try:
+                    order_stop: float = float(
+                        getattr(order, "stop_price", 0) or 0,
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if abs(order_stop - stop_price) > 0.02:
+                    continue
             return str(order.id)
         return None
 

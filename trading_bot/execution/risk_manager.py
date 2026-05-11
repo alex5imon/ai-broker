@@ -926,6 +926,54 @@ class RiskManager:
         logger.critical("Kill switch execution complete")
 
     # ------------------------------------------------------------------
+    # Drawdown breaker — flatten on trip
+    # ------------------------------------------------------------------
+
+    async def handle_drawdown_breaker_flatten(
+        self, gateway: GatewayConnection,
+    ) -> None:
+        """Force-flatten all open positions when the drawdown breaker trips.
+
+        Symmetric with :meth:`handle_kill_switch` but milder: drawdown
+        already pauses trading via :meth:`_activate_drawdown_breaker`;
+        this additionally removes existing risk because our edge
+        assumptions have just been falsified by a >5% drawdown from the
+        rolling peak. Leaving stops to handle remaining positions assumes
+        the same model that just produced the drawdown will execute
+        cleanly — precisely the assumption we shouldn't make.
+
+        Only call this on the activation tick (when ``check_drawdown_breaker``
+        returns ``True``).
+        """
+        logger.critical(
+            "DRAWDOWN BREAKER FLATTEN: closing all positions + cancelling orders",
+        )
+        try:
+            await asyncio.to_thread(
+                gateway.client.close_all_positions, cancel_orders=True,
+            )
+            logger.info(
+                "Drawdown breaker flatten: closed all positions and cancelled all orders",
+            )
+        except Exception:
+            logger.exception("Drawdown breaker flatten: error flattening positions")
+
+        try:
+            self._notifier.send_sync(
+                "\U0001f4c9 [DRAWDOWN BREAKER] Positions flattened",
+                "Open positions force-closed and pending orders cancelled.",
+                priority=int(
+                    self._config._get(
+                        "notifications", "priorities", "drawdown_breaker",
+                        default=5,
+                    )
+                ),
+                tags=["chart_with_downwards_trend"],
+            )
+        except Exception:
+            logger.exception("Drawdown breaker flatten: notification failed")
+
+    # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
 
