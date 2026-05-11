@@ -7,6 +7,14 @@ Usage::
 Downloads 1-min intraday bars for each trading day and daily bars (120-day
 lookback) for all watchlist tickers. Results are saved to the same parquet
 cache used by the backtester (``data/cache/{TICKER}/{DATE}_{type}.parquet``).
+
+Pass ``--full-daily-history`` to write a per-trading-day daily parquet
+across the full range (one file per trading day, each carrying the last
+``lookback_days`` of trading-day bars ending on that date) instead of the
+default behaviour of saving a single daily file at the endpoint. This is
+required for multi-year backtests / walkforward windows where the regime
+filter needs a continuous daily history to calibrate against, not just the
+last 120 days before the run.
 """
 
 from __future__ import annotations
@@ -171,17 +179,119 @@ async def download_daily_bars(
     return df, "downloaded"
 
 
+async def download_daily_history(
+    client: StockHistoricalDataClient,
+    ticker: str,
+    from_date: date,
+    to_date: date,
+    config: Config,
+    lookback_days: int = 120,
+    feed: str = "iex",
+) -> tuple[int, int, int]:
+    """Download a full daily history and emit one cached parquet per trading day.
+
+    Fetches a single Alpaca daily-bars request covering
+    ``[from_date - buffer, to_date]`` and, for every trading day ``D`` in
+    ``[from_date, to_date]``, writes ``<TICKER>/<D>_daily.parquet`` containing
+    the last ``lookback_days`` trading-day bars ending on ``D``. Days that
+    already have a cached file are skipped (idempotent).
+
+    Returns ``(written, skipped, requests_made)`` so callers can update
+    progress counters and rate-limit windows.
+    """
+    trading_days: list[date] = _get_trading_days(from_date, to_date, config)
+    if not trading_days:
+        return 0, 0, 0
+
+    targets: list[date] = [
+        d for d in trading_days if load_cached(ticker, d, "daily") is None
+    ]
+    skipped: int = len(trading_days) - len(targets)
+    if not targets:
+        logger.debug(
+            "All %d daily files already cached for %s", len(trading_days), ticker,
+        )
+        return 0, skipped, 0
+
+    # Fetch enough calendar days to cover ``lookback_days`` trading days plus
+    # holidays/weekends. ``lookback_days * 1.5 + 30`` is generous; the cost is
+    # one extra Alpaca request slice, not per-day requests.
+    buffer_days: int = int(lookback_days * 1.5) + 30
+    request_start: datetime = datetime(
+        from_date.year, from_date.month, from_date.day, tzinfo=TZ_UTC,
+    ) - timedelta(days=buffer_days)
+    request_end: datetime = datetime(
+        to_date.year, to_date.month, to_date.day,
+        23, 59, 59, tzinfo=TZ_UTC,
+    )
+
+    try:
+        from alpaca.data.enums import DataFeed, Adjustment
+        feed_enum = DataFeed.IEX if feed.lower() == "iex" else DataFeed.SIP
+
+        request = StockBarsRequest(
+            symbol_or_symbols=ticker,
+            timeframe=TimeFrame(1, TimeFrameUnit.Day),
+            start=request_start,
+            end=request_end,
+            feed=feed_enum,
+            adjustment=Adjustment.ALL,
+        )
+        response = client.get_stock_bars(request)
+        bars = response.data.get(ticker, [])
+    except Exception:
+        logger.exception(
+            "Failed to download daily history for %s (%s to %s)",
+            ticker, request_start.date(), request_end.date(),
+        )
+        return 0, skipped, 1
+
+    if not bars:
+        logger.warning(
+            "Empty daily history for %s (%s to %s)",
+            ticker, request_start.date(), request_end.date(),
+        )
+        return 0, skipped, 1
+
+    df_full: pd.DataFrame = _bars_to_df(bars)
+    # Per-bar trading day, tz-normalised to UTC date for inclusive comparison.
+    bar_dates = df_full.index.tz_convert(TZ_UTC).date
+
+    written: int = 0
+    for d in targets:
+        mask = bar_dates <= d
+        df_slice: pd.DataFrame = df_full.loc[mask]
+        if df_slice.empty:
+            continue
+        if len(df_slice) > lookback_days:
+            df_slice = df_slice.iloc[-lookback_days:]
+        save_to_cache(ticker, d, "daily", df_slice)
+        written += 1
+
+    logger.info(
+        "Daily history for %s: %d written, %d skipped (cached) — 1 API request",
+        ticker, written, skipped,
+    )
+    return written, skipped, 1
+
+
 async def download_all(
     config: Config,
     tickers: list[str],
     from_date: date,
     to_date: date,
     rate_limit_per_min: int = 180,
+    full_daily_history: bool = False,
 ) -> dict[str, int]:
     """Download intraday + daily bars for all tickers across the date range.
 
     Respects Alpaca's free-tier rate limit (~200 req/min).
     Returns a dict of status counts.
+
+    When ``full_daily_history`` is True, daily bars are saved as one parquet
+    per trading day across ``[from_date, to_date]`` (see
+    :func:`download_daily_history`). Otherwise a single 120-day file is saved
+    at the endpoint, matching the legacy single-tick consumption pattern.
     """
     api_key: str = os.environ.get("ALPACA_API_KEY", "")
     secret_key: str = os.environ.get("ALPACA_SECRET_KEY", "")
@@ -204,14 +314,28 @@ async def download_all(
     request_count: int = 0
     window_start: float = time.monotonic()
 
+    stats.setdefault("daily_written", 0)
+    stats.setdefault("daily_skipped", 0)
+
     for ticker in tickers:
-        # Download daily bars once per ticker (for the last trading day, covers lookback)
-        _, daily_status = await download_daily_bars(
-            client, ticker, to_date, lookback_days=120, feed=feed,
-        )
-        stats[daily_status] = stats.get(daily_status, 0) + 1
-        if daily_status == "downloaded":
-            request_count += 1
+        if full_daily_history:
+            written, skipped, reqs = await download_daily_history(
+                client, ticker, from_date, to_date, config,
+                lookback_days=120, feed=feed,
+            )
+            stats["daily_written"] += written
+            stats["daily_skipped"] += skipped
+            request_count += reqs
+        else:
+            # Legacy single-file path: one daily parquet per ticker, anchored
+            # on ``to_date`` with 120-day lookback. Sufficient for the live
+            # bot's single-tick read.
+            _, daily_status = await download_daily_bars(
+                client, ticker, to_date, lookback_days=120, feed=feed,
+            )
+            stats[daily_status] = stats.get(daily_status, 0) + 1
+            if daily_status == "downloaded":
+                request_count += 1
 
         for day in trading_days:
             # Rate limiting
@@ -254,6 +378,15 @@ async def main() -> None:
     parser.add_argument("--to", dest="to_date", required=True, help="End date (YYYY-MM-DD)")
     parser.add_argument("--config", default="config.yaml", help="Config file path")
     parser.add_argument("--tickers", nargs="*", help="Override tickers (default: watchlist from config)")
+    parser.add_argument(
+        "--full-daily-history",
+        action="store_true",
+        help=(
+            "Write one daily parquet per trading day across [from, to] "
+            "(needed for multi-year backtests where the regime filter "
+            "must calibrate against more than the last 120 days)."
+        ),
+    )
     args = parser.parse_args()
 
     from dotenv import load_dotenv
@@ -269,7 +402,10 @@ async def main() -> None:
         raw = config._raw.get("watchlist", {})
         tickers = list(raw.get("us", []))
 
-    stats = await download_all(config, tickers, d_from, d_to)
+    stats = await download_all(
+        config, tickers, d_from, d_to,
+        full_daily_history=args.full_daily_history,
+    )
     print(f"\nDownload complete: {stats}")
     print(f"Log file: {log_path}")
 

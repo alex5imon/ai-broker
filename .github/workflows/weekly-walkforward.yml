@@ -75,10 +75,17 @@ jobs:
           ALPACA_LIVE_SECRET: ${{ secrets.ALPACA_LIVE_SECRET }}
         run: |
           # Cache miss is OK — the downloader skips dates already cached.
+          # --full-daily-history writes one daily parquet per trading day so
+          # the regime filter calibration in run_multi_ticker_intraday can
+          # see a continuous SPY history across every walkforward window,
+          # not just the last 120 days before the run. Without it, the first
+          # 90-day window only sees ~12 SMA-eligible bars (see memory:
+          # feedback_daily_cache_regime_trap).
           python -m trading_bot.data.alpaca_downloader \
             --from "${{ steps.dates.outputs.bt_from }}" \
             --to "${{ steps.dates.outputs.bt_to }}" \
-            --tickers SPY QQQ XLF XLK XLE XLV XLI XLY XLP
+            --tickers SPY QQQ XLF XLK XLE XLV XLI XLY XLP \
+            --full-daily-history
 
       - name: Run walkforward
         env:

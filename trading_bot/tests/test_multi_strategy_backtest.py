@@ -507,6 +507,140 @@ class TestAlpacaDownloader:
             assert d.weekday() < 5
         assert len(days) == 5  # Mon-Fri
 
+    def test_download_daily_history_writes_per_day_files(
+        self,
+        tmp_path: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``--full-daily-history`` should emit one parquet per trading day.
+
+        Mocks the Alpaca client to return one bar per weekday, then verifies
+        that ``download_daily_history`` writes a separate file at every
+        target trading day whose slice is bounded by that day and capped at
+        ``lookback_days``.
+        """
+        import asyncio
+
+        from trading_bot.data import alpaca_downloader
+        from trading_bot import data_cache
+
+        # Redirect the cache directory at the source of truth in ``data_cache``
+        # so both ``save_to_cache`` writes and ``load_cached`` reads agree.
+        monkeypatch.setattr(data_cache, "_CACHE_DIR", tmp_path / "cache")
+
+        from_date = date(2026, 1, 5)   # Monday
+        to_date = date(2026, 1, 9)     # Friday → 5 trading days
+
+        # Build 150 daily bars ending at to_date so each per-day slice can
+        # be capped at lookback_days=120.
+        n_bars = 150
+        bars = []
+        for i in range(n_bars):
+            bar_day = to_date - timedelta(days=n_bars - 1 - i)
+            bar = MagicMock()
+            bar.timestamp = datetime(
+                bar_day.year, bar_day.month, bar_day.day, 0, 0, 0, tzinfo=TZ_UTC,
+            )
+            bar.open = 400.0 + i * 0.1
+            bar.high = 401.0 + i * 0.1
+            bar.low = 399.0 + i * 0.1
+            bar.close = 400.5 + i * 0.1
+            bar.volume = 1_000_000
+            bars.append(bar)
+
+        mock_response = MagicMock()
+        mock_response.data = {"SPY": bars}
+
+        client = MagicMock()
+        client.get_stock_bars.return_value = mock_response
+
+        config = Config.load("config.yaml")
+
+        written, skipped, reqs = asyncio.run(
+            alpaca_downloader.download_daily_history(
+                client, "SPY", from_date, to_date, config,
+                lookback_days=120, feed="iex",
+            )
+        )
+
+        assert reqs == 1, "Should issue exactly one Alpaca request"
+        assert skipped == 0, "Fresh cache → nothing skipped"
+        assert written == 5, "One file per trading day Mon-Fri"
+
+        cache_root = tmp_path / "cache" / "SPY"
+        files = sorted(cache_root.glob("*_daily.parquet"))
+        assert len(files) == 5
+        assert files[0].name == "2026-01-05_daily.parquet"
+        assert files[-1].name == "2026-01-09_daily.parquet"
+
+        # Each per-day file must be capped at lookback_days and stop at its
+        # filename date (not bleed in bars from after it).
+        for f in files:
+            df = pd.read_parquet(f)
+            assert len(df) <= 120, f"{f.name} exceeded lookback cap"
+            file_day = date.fromisoformat(f.stem.split("_")[0])
+            max_bar_day = df.index.tz_convert(TZ_UTC).date.max()
+            assert max_bar_day <= file_day, (
+                f"{f.name} contains bars dated after its filename"
+            )
+
+    def test_download_daily_history_skips_cached_days(
+        self,
+        tmp_path: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Idempotency: a second run on a populated cache writes nothing."""
+        import asyncio
+
+        from trading_bot.data import alpaca_downloader
+        from trading_bot import data_cache
+
+        monkeypatch.setattr(data_cache, "_CACHE_DIR", tmp_path / "cache")
+
+        from_date = date(2026, 1, 5)
+        to_date = date(2026, 1, 7)  # 3 trading days
+
+        bars = []
+        for i in range(60):
+            bar_day = to_date - timedelta(days=59 - i)
+            bar = MagicMock()
+            bar.timestamp = datetime(
+                bar_day.year, bar_day.month, bar_day.day, 0, 0, 0, tzinfo=TZ_UTC,
+            )
+            bar.open = 400.0
+            bar.high = 401.0
+            bar.low = 399.0
+            bar.close = 400.5
+            bar.volume = 1_000_000
+            bars.append(bar)
+
+        mock_response = MagicMock()
+        mock_response.data = {"SPY": bars}
+        client = MagicMock()
+        client.get_stock_bars.return_value = mock_response
+
+        config = Config.load("config.yaml")
+
+        # First run populates the cache.
+        asyncio.run(
+            alpaca_downloader.download_daily_history(
+                client, "SPY", from_date, to_date, config,
+            )
+        )
+
+        # Second run: every target is now cached; expect 0 writes and 0
+        # API requests.
+        client.get_stock_bars.reset_mock()
+        written, skipped, reqs = asyncio.run(
+            alpaca_downloader.download_daily_history(
+                client, "SPY", from_date, to_date, config,
+            )
+        )
+        assert written == 0
+        assert skipped == 3
+        assert reqs == 0
+        client.get_stock_bars.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # StrategyResult tests
