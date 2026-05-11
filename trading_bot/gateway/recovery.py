@@ -51,6 +51,9 @@ class RecoveryResult:
     stops_placed: list[str] = field(default_factory=list)
     stale_orders_cancelled: list[str] = field(default_factory=list)
     eod_flatten_orders: list[str] = field(default_factory=list)
+    # Pairs of orphan→canonical position IDs merged by
+    # _heal_unknown_orphans. Format: "TICKER #orphan→#canonical (strategy)".
+    orphans_healed: list[str] = field(default_factory=list)
 
     account_equity: float = 0.0
     settled_cash: float = 0.0
@@ -64,6 +67,7 @@ class RecoveryResult:
             or self.quantities_updated
             or self.stale_orders_cancelled
             or self.eod_flatten_orders
+            or self.orphans_healed
         )
 
     def summary(self) -> str:
@@ -95,6 +99,10 @@ class RecoveryResult:
             lines.append(
                 f"EOD flatten — closing intraday positions: "
                 f"{', '.join(self.eod_flatten_orders)}"
+            )
+        if self.orphans_healed:
+            lines.append(
+                f"Healed orphan attribution: {', '.join(self.orphans_healed)}"
             )
         if not self.has_discrepancies:
             lines.append("No discrepancies found - state is clean.")
@@ -138,27 +146,35 @@ class StateRecovery:
         result.settled_cash = _safe_float(account.get("SettledCash", "0"))
         result.buying_power = _safe_float(account.get("BuyingPower", "0"))
 
-        # 4. Load SQLite open positions
+        # 4. Heal stale orphan attribution. If a previous tick captured
+        #    an Alpaca position as a strategy_id='unknown' orphan AND a
+        #    matching ENTRY_FAILED row exists, merge them so the
+        #    strategy's exit logic sees the position. See
+        #    _heal_unknown_orphans for the match rules.
+        self._heal_unknown_orphans(result)
+
+        # 5. Load SQLite open positions (post-healing so the reconciler
+        #    sees the corrected attribution).
         db_positions: list[dict[str, Any]] = self._load_db_open_positions()
         result.db_open_positions = len(db_positions)
 
-        # 5. Reconcile
+        # 6. Reconcile
         self._reconcile(alpaca_positions, db_positions, result)
 
-        # 6. Verify stop orders
+        # 7. Verify stop orders
         await self._verify_stop_orders(alpaca_positions, alpaca_orders, result)
 
-        # 7. Cancel stale entry orders. Fresh order list because step 6 may
+        # 8. Cancel stale entry orders. Fresh order list because step 7 may
         #    have placed new stops, but those are GTC and not stale.
         await self._cancel_stale_entry_orders(alpaca_orders, result)
 
-        # 8. EOD intraday flatten. Closes intraday-tagged DB positions if the
+        # 9. EOD intraday flatten. Closes intraday-tagged DB positions if the
         #    cron tick lands after the configured cutoff (default 15:55 ET).
         #    Pass open orders for idempotency (skip tickers with a pending
         #    SELL already on the broker).
         await self._eod_intraday_flatten(alpaca_positions, alpaca_orders, result)
 
-        # 9. Log and alert
+        # 10. Log and alert
         logger.info("State recovery complete:\n%s", result.summary())
         if result.has_discrepancies:
             await self._notifier.gateway_alert(
@@ -529,6 +545,243 @@ class StateRecovery:
         finally:
             conn.close()
 
+    # Window for matching an Alpaca-discovered position against a recent
+    # ENTRY_FAILED row. Long enough to absorb the 5-min entry-pending
+    # sweep + reconciliation tick cadence, short enough that we don't
+    # accidentally merge across distinct entries for the same ticker.
+    _ORPHAN_REATTRIBUTION_WINDOW_MIN: int = 30
+    # Wider window for healing already-created 'unknown' orphans on
+    # subsequent ticks — covers overnight gaps when the orphan was
+    # created at the close and the matching ENTRY_FAILED row from a
+    # different strategy is up to a few sessions old.
+    _ORPHAN_HEAL_WINDOW_HOURS: int = 48
+    # Tolerance for entry-price match when reattributing. Limit orders
+    # fill at our exact limit price in normal conditions; allow 1¢ of
+    # rounding/quote-tick drift.
+    _ORPHAN_REATTRIBUTION_PRICE_TOL: float = 0.01
+
+    def _heal_unknown_orphans(self, result: RecoveryResult) -> None:
+        """Reattribute existing ``strategy_id='unknown'`` POSITION_OPEN rows.
+
+        When a previous tick created an orphan from an Alpaca position
+        because the matching local entry had already flipped to
+        ENTRY_FAILED, we can heal the attribution on the next tick by
+        merging the two rows. The ENTRY_FAILED row is the canonical one
+        (it carries the original ``alpaca_order_id`` and the correct
+        strategy_id); we promote it to POSITION_OPEN and close out the
+        unknown orphan with ``exit_reason='reattributed'``.
+
+        Idempotent: safe to call on every tick. If no orphan/ENTRY_FAILED
+        pair matches, this is a no-op.
+        """
+        cutoff: str = (
+            datetime.now(tz=ET) - timedelta(hours=self._ORPHAN_HEAL_WINDOW_HOURS)
+        ).isoformat()
+        conn: sqlite3.Connection = sqlite3.connect(self._db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            # Pull every active orphan in the heal window.
+            orphans = conn.execute(
+                "SELECT id, ticker, quantity, entry_price, entry_time "
+                "FROM positions "
+                "WHERE status = 'POSITION_OPEN' AND strategy_id = 'unknown' "
+                "AND entry_time >= ?",
+                (cutoff,),
+            ).fetchall()
+            if not orphans:
+                return
+            healed: list[str] = []
+            now: str = datetime.now(tz=ET).isoformat()
+            for orphan in orphans:
+                orphan_id: int = int(orphan["id"])
+                # Atomic claim: promote a matching ENTRY_FAILED row to
+                # POSITION_OPEN in a single UPDATE that selects on the
+                # match predicates. If another tick has already claimed
+                # the same ENTRY_FAILED row (status no longer matches),
+                # rowcount = 0 and we skip without producing a duplicate
+                # heal. Without this, the SELECT-then-UPDATE pattern had
+                # a race window where two ticks could both observe the
+                # ENTRY_FAILED row and both attempt to promote it /
+                # close the orphan, inflating the heal count.
+                with conn:
+                    cur = conn.execute(
+                        "UPDATE positions "
+                        "SET status = 'POSITION_OPEN', updated_at = ? "
+                        "WHERE status = 'ENTRY_FAILED' AND ticker = ? "
+                        "AND ABS(quantity - ?) < 1e-6 "
+                        "AND ABS(entry_price - ?) <= ? "
+                        "AND entry_time >= ? "
+                        "AND strategy_id IS NOT NULL AND strategy_id != 'unknown' "
+                        "AND id = ("
+                        "    SELECT id FROM positions "
+                        "    WHERE status = 'ENTRY_FAILED' AND ticker = ? "
+                        "    AND ABS(quantity - ?) < 1e-6 "
+                        "    AND ABS(entry_price - ?) <= ? "
+                        "    AND entry_time >= ? "
+                        "    AND strategy_id IS NOT NULL AND strategy_id != 'unknown' "
+                        "    ORDER BY entry_time DESC LIMIT 1"
+                        ")",
+                        (
+                            now,
+                            orphan["ticker"],
+                            float(orphan["quantity"]),
+                            float(orphan["entry_price"]),
+                            self._ORPHAN_REATTRIBUTION_PRICE_TOL,
+                            cutoff,
+                            orphan["ticker"],
+                            float(orphan["quantity"]),
+                            float(orphan["entry_price"]),
+                            self._ORPHAN_REATTRIBUTION_PRICE_TOL,
+                            cutoff,
+                        ),
+                    )
+                    if cur.rowcount == 0:
+                        # No matching ENTRY_FAILED row (or another tick
+                        # claimed it first). Leave the orphan alone.
+                        continue
+                    # Look up the row we just promoted so we can record
+                    # the canonical id + strategy in the heal summary.
+                    promoted = conn.execute(
+                        "SELECT id, strategy_id FROM positions "
+                        "WHERE ticker = ? AND status = 'POSITION_OPEN' "
+                        "AND ABS(quantity - ?) < 1e-6 "
+                        "AND ABS(entry_price - ?) <= ? "
+                        "AND id != ? "
+                        "AND updated_at = ? "
+                        "ORDER BY id DESC LIMIT 1",
+                        (
+                            orphan["ticker"],
+                            float(orphan["quantity"]),
+                            float(orphan["entry_price"]),
+                            self._ORPHAN_REATTRIBUTION_PRICE_TOL,
+                            orphan_id,
+                            now,
+                        ),
+                    ).fetchone()
+                    if promoted is None:
+                        # Promotion happened but lookup didn't find it
+                        # (extremely unlikely — would indicate concurrent
+                        # mutation). Log and bail without closing the
+                        # orphan, to avoid leaving an open Alpaca holding
+                        # with no DB row.
+                        logger.error(
+                            "Healed orphan attribution: %s promoted but "
+                            "canonical row lookup failed; not closing "
+                            "orphan #%d.",
+                            orphan["ticker"], orphan_id,
+                        )
+                        continue
+                    canonical_id = int(promoted["id"])
+                    strategy_id = str(promoted["strategy_id"])
+                    conn.execute(
+                        "UPDATE positions SET status = 'CLOSED', "
+                        "updated_at = ? WHERE id = ?",
+                        (now, orphan_id),
+                    )
+                healed.append(
+                    f"{orphan['ticker']} #{orphan_id}→#{canonical_id} ({strategy_id})"
+                )
+                logger.warning(
+                    "Healed orphan attribution: %s qty=%.6f price=%.4f "
+                    "— merged unknown #%d into ENTRY_FAILED #%d (strategy=%s).",
+                    orphan["ticker"], float(orphan["quantity"]),
+                    float(orphan["entry_price"]),
+                    orphan_id, canonical_id, strategy_id,
+                )
+            result.orphans_healed.extend(healed)
+        except sqlite3.OperationalError:
+            logger.warning("Could not heal unknown orphans (DB unavailable)")
+        finally:
+            conn.close()
+
+    def _try_reattribute_entry_failed(
+        self,
+        conn: sqlite3.Connection,
+        ticker: str,
+        qty: float,
+        avg_cost: float,
+        now_iso: str,
+    ) -> bool:
+        """Attempt to merge an Alpaca-discovered position into a recent
+        ENTRY_FAILED row instead of creating a new ``strategy_id='unknown'``
+        orphan.
+
+        Returns True if a matching row was reattributed. False otherwise.
+
+        Match criteria (all must hold):
+        - status = 'ENTRY_FAILED'
+        - ticker matches
+        - quantity within 1e-6 (Alpaca fractional precision)
+        - entry_price within ``_ORPHAN_REATTRIBUTION_PRICE_TOL``
+        - row created within ``_ORPHAN_REATTRIBUTION_WINDOW_MIN``
+
+        Rationale: 2026-05-11 XLK fill in 169 ms, but the local 5-min
+        entry-pending sweep timed out anyway and flipped the row to
+        ENTRY_FAILED. The next reconciliation tick then saw the
+        unattached Alpaca position and created a duplicate row with
+        ``strategy_id='unknown'``, silently breaking the overnight_drift
+        exit logic. Treat the ENTRY_FAILED row as the canonical record
+        whenever the Alpaca position is clearly the same entry.
+        """
+        cutoff: str = (
+            datetime.now(tz=ET) - timedelta(minutes=self._ORPHAN_REATTRIBUTION_WINDOW_MIN)
+        ).isoformat()
+        # Atomic claim: single UPDATE filtered on the match predicates,
+        # with rowcount = 0 signalling "nothing to merge". This collapses
+        # the previous SELECT-then-UPDATE pair into a single statement
+        # so two concurrent ticks can't both observe the ENTRY_FAILED
+        # row and both promote it (the second tick's UPDATE would see
+        # status no longer matching 'ENTRY_FAILED' and report 0 rows).
+        with conn:
+            cur = conn.execute(
+                "UPDATE positions "
+                "SET status = 'POSITION_OPEN', updated_at = ? "
+                "WHERE ticker = ? AND status = 'ENTRY_FAILED' "
+                "AND ABS(quantity - ?) < 1e-6 "
+                "AND ABS(entry_price - ?) <= ? "
+                "AND entry_time >= ? "
+                "AND id = ("
+                "    SELECT id FROM positions "
+                "    WHERE ticker = ? AND status = 'ENTRY_FAILED' "
+                "    AND ABS(quantity - ?) < 1e-6 "
+                "    AND ABS(entry_price - ?) <= ? "
+                "    AND entry_time >= ? "
+                "    ORDER BY entry_time DESC LIMIT 1"
+                ")",
+                (
+                    now_iso,
+                    ticker, qty, avg_cost,
+                    self._ORPHAN_REATTRIBUTION_PRICE_TOL, cutoff,
+                    ticker, qty, avg_cost,
+                    self._ORPHAN_REATTRIBUTION_PRICE_TOL, cutoff,
+                ),
+            )
+            if cur.rowcount == 0:
+                return False
+        # Best-effort strategy_id lookup for the log line. The match
+        # criteria are tight enough that the row we just promoted is the
+        # only one fitting the description with updated_at = now_iso.
+        row = conn.execute(
+            "SELECT id, strategy_id FROM positions "
+            "WHERE ticker = ? AND status = 'POSITION_OPEN' "
+            "AND ABS(quantity - ?) < 1e-6 "
+            "AND ABS(entry_price - ?) <= ? "
+            "AND updated_at = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (ticker, qty, avg_cost, self._ORPHAN_REATTRIBUTION_PRICE_TOL, now_iso),
+        ).fetchone()
+        row_id: int = int(row[0]) if row is not None else -1
+        strategy_id: str = (
+            str(row[1]) if row is not None and row[1] is not None else "unknown"
+        )
+        logger.warning(
+            "Reattributed Alpaca position %s (qty=%.6f, price=%.4f) to "
+            "ENTRY_FAILED row #%d (strategy=%s) — entry filled at broker "
+            "but local marker timed out. See feedback_per_strategy_vs_broker_truth.",
+            ticker, qty, avg_cost, row_id, strategy_id,
+        )
+        return True
+
     def _create_db_position(self, ticker: str, pos: AlpacaPosition) -> None:
         now: str = datetime.now(tz=ET).isoformat()
         avg_cost: float = float(pos.avg_entry_price or 0)
@@ -539,6 +792,13 @@ class StateRecovery:
 
         conn: sqlite3.Connection = sqlite3.connect(self._db_path)
         try:
+            # Prefer reattributing a recent ENTRY_FAILED row over creating
+            # a fresh strategy_id='unknown' orphan. Same broker fill,
+            # known strategy attribution.
+            if self._try_reattribute_entry_failed(
+                conn, ticker, qty, avg_cost, now,
+            ):
+                return
             conn.execute(
                 """INSERT INTO positions
                    (ticker, exchange, currency, quantity, entry_price,

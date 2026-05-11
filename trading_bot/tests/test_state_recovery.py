@@ -497,3 +497,358 @@ class TestStateRecovery:
         assert "PLTR" not in result.eod_flatten_orders
         # No new submit_order — only pre-existing orders observed.
         assert gw.client.submit_order.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Orphan-attribution recovery (2026-05-11 XLK regression)
+# ---------------------------------------------------------------------------
+
+
+def _insert_entry_failed(
+    conn: sqlite3.Connection,
+    ticker: str,
+    qty: float,
+    entry_price: float,
+    strategy_id: str = "overnight_drift",
+    minutes_ago: int = 5,
+) -> int:
+    entry_time = (datetime.now(ET) - timedelta(minutes=minutes_ago)).isoformat()
+    cur = conn.execute(
+        """INSERT INTO positions
+           (ticker, exchange, currency, quantity, entry_price, entry_time,
+            status, hold_type, phase, strategy_id, alpaca_order_id)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            ticker, "US", "USD", qty, entry_price, entry_time,
+            "ENTRY_FAILED", "swing", 3, strategy_id, "entry-order-abc",
+        ),
+    )
+    conn.commit()
+    return cur.lastrowid  # type: ignore[return-value]
+
+
+def _insert_unknown_orphan(
+    conn: sqlite3.Connection,
+    ticker: str,
+    qty: float,
+    entry_price: float,
+    minutes_ago: int = 0,
+) -> int:
+    entry_time = (datetime.now(ET) - timedelta(minutes=minutes_ago)).isoformat()
+    cur = conn.execute(
+        """INSERT INTO positions
+           (ticker, exchange, currency, quantity, entry_price, entry_time,
+            status, hold_type, phase, strategy_id)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (
+            ticker, "AssetExchange.ARCA", "USD", qty, entry_price, entry_time,
+            "POSITION_OPEN", "swing", 1, "unknown",
+        ),
+    )
+    conn.commit()
+    return cur.lastrowid  # type: ignore[return-value]
+
+
+class TestOrphanAttributionRecovery:
+    """Regression suite for the 2026-05-11 XLK orphan-attribution bug.
+
+    Symptom: 169 ms Alpaca fill on a fractional overnight_drift entry,
+    5-min local entry-pending sweep flipped the row to ENTRY_FAILED
+    before the fill was observed, then the next reconcile tick saw the
+    unattached Alpaca position and created a duplicate row with
+    strategy_id='unknown'. Overnight_drift's exit logic then refused to
+    fire on the orphan, leaving the position long indefinitely.
+    """
+
+    def _make_gateway(self, positions: list | None = None) -> MagicMock:
+        gw = MagicMock()
+        gw.account_id = "TEST_ACCOUNT"
+        gw.client = MagicMock()
+        gw.get_positions = AsyncMock(return_value=positions or [])
+        gw.get_open_orders = AsyncMock(return_value=[])
+        gw.get_account_summary = AsyncMock(
+            return_value={
+                "NetLiquidation": "100000.0",
+                "SettledCash": "99000.0",
+                "BuyingPower": "99000.0",
+            }
+        )
+        return gw
+
+    @pytest.mark.asyncio
+    async def test_create_db_position_reattributes_to_matching_entry_failed(
+        self, tmp_db_path: str, mock_notifier
+    ):
+        """When Alpaca exposes a position not in the open DB rows but
+        matching a recent ENTRY_FAILED row, _create_db_position must
+        promote the ENTRY_FAILED row instead of inserting a new orphan
+        with strategy_id='unknown'.
+        """
+        conn = sqlite3.connect(tmp_db_path)
+        failed_id = _insert_entry_failed(
+            conn, "XLK", qty=0.3927, entry_price=177.438,
+            strategy_id="overnight_drift", minutes_ago=5,
+        )
+        conn.close()
+
+        pos = _alpaca_position("XLK", qty=0.3927, avg_entry_price=177.438)
+        gw = self._make_gateway(positions=[pos])
+        recovery = _make_recovery(gw, tmp_db_path, mock_notifier)
+        await recovery.recover()
+
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            rows = conn.execute(
+                "SELECT id, status, strategy_id FROM positions "
+                "WHERE ticker = 'XLK' ORDER BY id"
+            ).fetchall()
+        finally:
+            conn.close()
+        # Only ONE XLK row — the ENTRY_FAILED row got promoted, no
+        # new orphan was created.
+        assert len(rows) == 1, (
+            f"expected single reattributed row, got {len(rows)} rows: {rows}"
+        )
+        assert rows[0][0] == failed_id
+        assert rows[0][1] == "POSITION_OPEN"
+        assert rows[0][2] == "overnight_drift", (
+            "strategy attribution must be preserved from the original "
+            "ENTRY_FAILED row, not collapsed to 'unknown'"
+        )
+
+    @pytest.mark.asyncio
+    async def test_create_db_position_no_match_still_creates_unknown_orphan(
+        self, tmp_db_path: str, mock_notifier
+    ):
+        """Negative case: when no ENTRY_FAILED row matches, fall back to
+        the legacy strategy_id='unknown' insert so the position is at
+        least tracked (some other recovery path may attribute it later).
+        """
+        pos = _alpaca_position("XLB", qty=10.0, avg_entry_price=50.0)
+        gw = self._make_gateway(positions=[pos])
+        recovery = _make_recovery(gw, tmp_db_path, mock_notifier)
+        await recovery.recover()
+
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            row = conn.execute(
+                "SELECT status, strategy_id FROM positions WHERE ticker = 'XLB'"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None
+        assert row[0] == "POSITION_OPEN"
+        assert row[1] == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_create_db_position_quantity_mismatch_does_not_merge(
+        self, tmp_db_path: str, mock_notifier
+    ):
+        """Quantity mismatch (e.g. partial fill) must NOT merge — that
+        would attribute the wrong size to the original strategy. Falls
+        through to the unknown-orphan path.
+        """
+        conn = sqlite3.connect(tmp_db_path)
+        _insert_entry_failed(
+            conn, "XLK", qty=0.3927, entry_price=177.438,
+            strategy_id="overnight_drift", minutes_ago=5,
+        )
+        conn.close()
+        # Half-share off — clearly a different fill.
+        pos = _alpaca_position("XLK", qty=0.5, avg_entry_price=177.438)
+        gw = self._make_gateway(positions=[pos])
+        recovery = _make_recovery(gw, tmp_db_path, mock_notifier)
+        await recovery.recover()
+
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            statuses = {
+                row[0]: row[1] for row in conn.execute(
+                    "SELECT status, strategy_id FROM positions "
+                    "WHERE ticker = 'XLK'"
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+        # ENTRY_FAILED still ENTRY_FAILED, plus a new POSITION_OPEN orphan.
+        assert statuses.get("ENTRY_FAILED") == "overnight_drift"
+        assert statuses.get("POSITION_OPEN") == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_create_db_position_stale_entry_failed_does_not_merge(
+        self, tmp_db_path: str, mock_notifier
+    ):
+        """ENTRY_FAILED rows older than the reattribution window must NOT
+        merge — they were genuinely failed entries, not late fills.
+        """
+        conn = sqlite3.connect(tmp_db_path)
+        _insert_entry_failed(
+            conn, "XLK", qty=0.3927, entry_price=177.438,
+            strategy_id="overnight_drift", minutes_ago=120,  # 2h old
+        )
+        conn.close()
+        pos = _alpaca_position("XLK", qty=0.3927, avg_entry_price=177.438)
+        gw = self._make_gateway(positions=[pos])
+        recovery = _make_recovery(gw, tmp_db_path, mock_notifier)
+        await recovery.recover()
+
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            rows = conn.execute(
+                "SELECT status, strategy_id FROM positions "
+                "WHERE ticker = 'XLK'"
+            ).fetchall()
+        finally:
+            conn.close()
+        # Two rows: stale ENTRY_FAILED unchanged + new unknown orphan
+        assert len(rows) == 2
+        statuses = {r[0] for r in rows}
+        assert "ENTRY_FAILED" in statuses
+        assert "POSITION_OPEN" in statuses
+
+    @pytest.mark.asyncio
+    async def test_heal_unknown_orphans_merges_existing_pair(
+        self, tmp_db_path: str, mock_notifier
+    ):
+        """Live-incident-specific case: position #97 already exists in
+        the DB as a strategy_id='unknown' POSITION_OPEN orphan, and
+        position #96 is the matching ENTRY_FAILED row from the prior
+        tick. _heal_unknown_orphans must merge them.
+        """
+        conn = sqlite3.connect(tmp_db_path)
+        failed_id = _insert_entry_failed(
+            conn, "XLK", qty=0.3927, entry_price=177.438,
+            strategy_id="overnight_drift", minutes_ago=15,
+        )
+        orphan_id = _insert_unknown_orphan(
+            conn, "XLK", qty=0.3927, entry_price=177.438, minutes_ago=10,
+        )
+        conn.close()
+
+        # Alpaca still reports the position so the reconciler treats
+        # the now-promoted ENTRY_FAILED row as the canonical match.
+        pos = _alpaca_position("XLK", qty=0.3927, avg_entry_price=177.438)
+        gw = self._make_gateway(positions=[pos])
+        recovery = _make_recovery(gw, tmp_db_path, mock_notifier)
+        result = await recovery.recover()
+
+        assert any("XLK" in s for s in result.orphans_healed), (
+            f"expected orphan heal in result, got {result.orphans_healed}"
+        )
+
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            failed_status = conn.execute(
+                "SELECT status, strategy_id FROM positions WHERE id = ?",
+                (failed_id,),
+            ).fetchone()
+            orphan_status = conn.execute(
+                "SELECT status FROM positions WHERE id = ?", (orphan_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        # ENTRY_FAILED promoted to POSITION_OPEN with original strategy
+        assert failed_status[0] == "POSITION_OPEN"
+        assert failed_status[1] == "overnight_drift"
+        # Orphan row closed out so it doesn't double-count
+        assert orphan_status[0] == "CLOSED"
+
+    @pytest.mark.asyncio
+    async def test_heal_unknown_orphans_idempotent(
+        self, tmp_db_path: str, mock_notifier
+    ):
+        """Running recovery twice must not double-merge or thrash state."""
+        conn = sqlite3.connect(tmp_db_path)
+        _insert_entry_failed(
+            conn, "XLK", qty=0.3927, entry_price=177.438,
+            strategy_id="overnight_drift", minutes_ago=15,
+        )
+        _insert_unknown_orphan(
+            conn, "XLK", qty=0.3927, entry_price=177.438, minutes_ago=10,
+        )
+        conn.close()
+
+        pos = _alpaca_position("XLK", qty=0.3927, avg_entry_price=177.438)
+        gw = self._make_gateway(positions=[pos])
+        recovery = _make_recovery(gw, tmp_db_path, mock_notifier)
+        first = await recovery.recover()
+        second = await recovery.recover()
+
+        assert first.orphans_healed
+        # Second pass: no new healing work to do — the original orphan
+        # is now CLOSED and there's no remaining unknown POSITION_OPEN.
+        assert second.orphans_healed == []
+
+    @pytest.mark.asyncio
+    async def test_heal_unknown_orphans_atomic_under_double_claim(
+        self, tmp_db_path: str, mock_notifier
+    ):
+        """Regression for SELECT-then-UPDATE race in _heal_unknown_orphans.
+
+        The earlier implementation used a SELECT to find an orphan/
+        ENTRY_FAILED pair then a separate UPDATE inside `with conn:`.
+        Two concurrent ticks could both observe the same pair and both
+        attempt the merge, inflating the heal count and (worse) producing
+        a second POSITION_OPEN row from the same broker holding if the
+        ENTRY_FAILED row was already promoted.
+
+        With the atomic single-UPDATE-with-rowcount-check, the second
+        attempt must report no healing and the DB must reflect exactly
+        ONE POSITION_OPEN row for the ticker.
+        """
+        conn = sqlite3.connect(tmp_db_path)
+        failed_id = _insert_entry_failed(
+            conn, "XLK", qty=0.3927, entry_price=177.438,
+            strategy_id="overnight_drift", minutes_ago=15,
+        )
+        orphan_id = _insert_unknown_orphan(
+            conn, "XLK", qty=0.3927, entry_price=177.438, minutes_ago=10,
+        )
+        conn.close()
+
+        pos = _alpaca_position("XLK", qty=0.3927, avg_entry_price=177.438)
+        gw = self._make_gateway(positions=[pos])
+
+        # Simulate two ticks racing against the same state by building
+        # two recovery instances against the same DB path and calling
+        # _heal_unknown_orphans directly twice in sequence. The atomic
+        # UPDATE in the second call must observe status != ENTRY_FAILED
+        # and report no heal.
+        from trading_bot.gateway.recovery import RecoveryResult
+        recovery_a = _make_recovery(gw, tmp_db_path, mock_notifier)
+        recovery_b = _make_recovery(gw, tmp_db_path, mock_notifier)
+
+        result_a = RecoveryResult()
+        result_b = RecoveryResult()
+        recovery_a._heal_unknown_orphans(result_a)
+        recovery_b._heal_unknown_orphans(result_b)
+
+        # First call did the work; second saw a clean DB.
+        assert len(result_a.orphans_healed) == 1
+        assert result_b.orphans_healed == []
+
+        # End-state must have exactly ONE POSITION_OPEN row for XLK —
+        # the promoted ENTRY_FAILED row — and the original orphan must
+        # be CLOSED. No duplicate POSITION_OPEN.
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            rows = conn.execute(
+                "SELECT id, status, strategy_id FROM positions "
+                "WHERE ticker = 'XLK' ORDER BY id"
+            ).fetchall()
+        finally:
+            conn.close()
+        open_rows = [r for r in rows if r[1] == "POSITION_OPEN"]
+        assert len(open_rows) == 1, (
+            f"expected exactly 1 POSITION_OPEN after double-heal, "
+            f"got {len(open_rows)} rows: {rows}"
+        )
+        assert open_rows[0][0] == failed_id
+        assert open_rows[0][2] == "overnight_drift"
+        # Original orphan must be CLOSED.
+        closed_orphan = [
+            r for r in rows if r[0] == orphan_id and r[1] == "CLOSED"
+        ]
+        assert closed_orphan, (
+            f"orphan #{orphan_id} must be CLOSED after heal, got {rows}"
+        )
