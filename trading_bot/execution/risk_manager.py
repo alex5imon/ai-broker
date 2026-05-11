@@ -542,12 +542,24 @@ class RiskManager:
         return self._trade_count >= max_trades
 
     def check_drawdown_breaker(self, account_equity_usd: float) -> bool:
-        """Return ``True`` if 5-day rolling drawdown exceeds 5% from peak.
+        """Return ``True`` only on the *activation* tick.
 
         Reads the last N days of equity from ``daily_summaries`` to find
         the rolling peak.  If the breaker fires, it pauses trading for
         one day and activates the recovery-size regime.
+
+        Idempotency: returns ``False`` immediately when
+        ``_drawdown_breaker_active`` is already set (loaded from
+        ``risk_circuit_state`` at the start of each tick). Without this
+        guard, every subsequent tick while equity stayed below the
+        watermark would re-fire ``handle_drawdown_breaker_flatten`` and
+        retry ``close_all_positions`` against Alpaca — harmless when
+        positions are already flat, but a race risk if a new entry
+        order is in flight on the same tick.
         """
+        if self._drawdown_breaker_active:
+            return False
+
         rolling_days: int = self._config.drawdown_breaker_rolling_days
         threshold_pct: float = self._config.drawdown_breaker_threshold
 
@@ -924,6 +936,54 @@ class RiskManager:
         self._persist_state()
 
         logger.critical("Kill switch execution complete")
+
+    # ------------------------------------------------------------------
+    # Drawdown breaker — flatten on trip
+    # ------------------------------------------------------------------
+
+    async def handle_drawdown_breaker_flatten(
+        self, gateway: GatewayConnection,
+    ) -> None:
+        """Force-flatten all open positions when the drawdown breaker trips.
+
+        Symmetric with :meth:`handle_kill_switch` but milder: drawdown
+        already pauses trading via :meth:`_activate_drawdown_breaker`;
+        this additionally removes existing risk because our edge
+        assumptions have just been falsified by a >5% drawdown from the
+        rolling peak. Leaving stops to handle remaining positions assumes
+        the same model that just produced the drawdown will execute
+        cleanly — precisely the assumption we shouldn't make.
+
+        Only call this on the activation tick (when ``check_drawdown_breaker``
+        returns ``True``).
+        """
+        logger.critical(
+            "DRAWDOWN BREAKER FLATTEN: closing all positions + cancelling orders",
+        )
+        try:
+            await asyncio.to_thread(
+                gateway.client.close_all_positions, cancel_orders=True,
+            )
+            logger.info(
+                "Drawdown breaker flatten: closed all positions and cancelled all orders",
+            )
+        except Exception:
+            logger.exception("Drawdown breaker flatten: error flattening positions")
+
+        try:
+            self._notifier.send_sync(
+                "\U0001f4c9 [DRAWDOWN BREAKER] Positions flattened",
+                "Open positions force-closed and pending orders cancelled.",
+                priority=int(
+                    self._config._get(
+                        "notifications", "priorities", "drawdown_breaker",
+                        default=5,
+                    )
+                ),
+                tags=["chart_with_downwards_trend"],
+            )
+        except Exception:
+            logger.exception("Drawdown breaker flatten: notification failed")
 
     # ------------------------------------------------------------------
     # Properties

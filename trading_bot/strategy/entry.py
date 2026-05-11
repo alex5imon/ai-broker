@@ -382,6 +382,7 @@ class EntryEvaluator:
         atr_rank: float,
         sentiment_size_mult: float,
         phase: Phase,
+        fractional: bool = False,
     ) -> tuple[float, float]:
         """Compute number of shares and position value in local currency.
 
@@ -399,9 +400,18 @@ class EntryEvaluator:
         6. Sentiment no-data reduction
 
         Returns (shares, position_value_in_local_currency).
+
+        Note: production sizing flows through
+        ``PositionSizer.calculate_fractional`` via the multi-strategy
+        path; this legacy helper is retained for the single-strategy
+        codepath and tests. Pass ``fractional=True`` to skip the
+        whole-share floors when callers want Alpaca-fractional sizing.
         """
         if signal_price <= 0 or stop_loss_pct <= 0:
             return 0, 0.0
+
+        def _quantize(qty: float) -> float:
+            return qty if fractional else float(math.floor(qty))
 
         risk_per_trade: float = self._config.get_risk_per_trade()
         max_risk_amount: float = account_equity_usd * risk_per_trade
@@ -410,17 +420,17 @@ class EntryEvaluator:
         if stop_distance <= 0:
             return 0, 0.0
 
-        shares: int = math.floor(max_risk_amount / stop_distance)
+        shares: float = _quantize(max_risk_amount / stop_distance)
 
         # Constraint 1: max position percentage
         max_position_pct: float = self._config.get_max_position_pct()
         max_position_value: float = account_equity_usd * max_position_pct
         if shares * signal_price > max_position_value:
-            shares = math.floor(max_position_value / signal_price)
+            shares = _quantize(max_position_value / signal_price)
 
         # Constraint 2: ATR high-vol reduction
         if atr_rank >= self._atr_high:
-            shares = math.floor(shares * self._atr_high_reduction)
+            shares = _quantize(shares * self._atr_high_reduction)
             logger.info(
                 "%s: ATR rank %.1f >= %.1f; reducing size by %.0f%%",
                 ticker,
@@ -431,7 +441,7 @@ class EntryEvaluator:
 
         # Constraint 3: sentiment no-data reduction
         if sentiment_size_mult < 1.0:
-            shares = math.floor(shares * sentiment_size_mult)
+            shares = _quantize(shares * sentiment_size_mult)
 
         # Constraint 4: minimum position value
         market: Market = Market.US

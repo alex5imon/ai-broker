@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -470,6 +471,17 @@ class StrategyManager:
 
                 # Loss-cooldown bookkeeping — must follow record_exit so the
                 # virtual portfolio's tally is consistent with the tracker's.
+                #
+                # KNOWN LIMITATION (tracked as item #9 in the risk-infra
+                # gaps memo): `current_price` here is the live mid at
+                # signal time, not the actual broker fill price. Under
+                # paper this is harmless; under live the loss-cooldown
+                # threshold will activate slightly later than the real
+                # P&L would justify when slippage is significant.
+                # Fix path is a deferred record_outcome keyed on
+                # exit_order_id (set when the fill is polled in
+                # `_check_order_statuses`) — non-trivial refactor, kept
+                # separate from this correctness pass.
                 if self._loss_cooldown is not None:
                     pnl: float = shares * (current_price - entry_price)
                     self._loss_cooldown.record_outcome(strategy.strategy_id, pnl)
@@ -523,7 +535,7 @@ class StrategyManager:
             # closes the long *and* opens a short for the difference
             # — the 2026-04-30 incident class.
             position_id: int | None = pos.get("id")
-            check = self._check_alpaca_position(ticker, db_qty=qty)
+            check = await self._check_alpaca_position(ticker, db_qty=qty)
             if check.verdict == "NOT_HELD":
                 logger.warning(
                     "Drain skip: %s strategy=%s DB qty=%+.4f but Alpaca "
@@ -659,7 +671,7 @@ class StrategyManager:
                 held.add(symbol)
         return frozenset(held)
 
-    def _check_alpaca_position(
+    async def _check_alpaca_position(
         self, ticker: str, *, db_qty: float,
     ) -> AlpacaPositionCheck:
         """Probe Alpaca for the current position on ``ticker``.
@@ -671,12 +683,17 @@ class StrategyManager:
         — DB says +10, Alpaca holds +5 — was the latent half of the
         2026-04-30 incident; without the cap, a SELL 10 would close
         the long *and* open a short for the missing 5).
+
+        The Alpaca HTTP call is dispatched via ``asyncio.to_thread`` so
+        it doesn't block the asyncio event loop. The 5-min tick cadence
+        tolerated sync blocking, but degraded network would have
+        compounded into watchdog misses.
         """
         from alpaca.common.exceptions import APIError
 
         try:
             client = self._order_manager._gw.client
-            alpaca_pos = client.get_open_position(ticker)
+            alpaca_pos = await asyncio.to_thread(client.get_open_position, ticker)
             alpaca_qty = float(getattr(alpaca_pos, "qty", 0) or 0)
         except APIError as exc:
             # Distinguish "position does not exist" (HTTP 404 / Alpaca
