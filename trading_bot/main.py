@@ -315,9 +315,12 @@ class TradingBot:
             # equity isn't known yet at construction time. After Alpaca
             # connects, refresh from real NetLiquidation so the per-tick
             # phase-aware accessors (max_positions, risk_per_trade_pct,
-            # stop tighter, etc.) match the actual account size.
+            # stop tighter, etc.) match the actual account size. The
+            # fetched equity is also reused by step 9b below — no
+            # second REST call.
+            equity_for_risk: float | None = None
             try:
-                await self._refresh_phase_from_equity()
+                equity_for_risk = await self._refresh_phase_from_equity()
             except Exception:
                 logger.warning("Phase refresh failed (non-fatal)", exc_info=True)
 
@@ -355,7 +358,13 @@ class TradingBot:
             # rolling-drawdown / daily-loss state, and a tripped
             # breaker force-flattens even when no entries are being
             # scanned.
-            equity_for_risk: float | None = await self._get_account_equity_usd()
+            #
+            # Equity reused from step 5c — no extra REST call. If the
+            # equity fetch failed up there (Alpaca outage / transient
+            # 503) we fail OPEN here: skip the checks and warn. A
+            # false-positive force-flatten on a transient API blip is
+            # worse than briefly silencing the breaker; the next tick
+            # (5 min later) will retry.
             if equity_for_risk is None:
                 logger.warning(
                     "Risk circuit check skipped — equity unavailable",
@@ -369,8 +378,13 @@ class TradingBot:
                     logger.exception(
                         "Daily-loss check raised — failing open",
                     )
+                # Pre-init so the variable is defined on every path —
+                # strict mypy flags assign-only-in-try as possibly
+                # undefined, and the False default also makes the
+                # fail-open policy explicit at the declaration site.
+                breaker_just_tripped: bool = False
                 try:
-                    breaker_just_tripped: bool = (
+                    breaker_just_tripped = (
                         self._risk_manager.check_drawdown_breaker(
                             equity_for_risk,
                         )
@@ -380,7 +394,6 @@ class TradingBot:
                         "Drawdown breaker check raised — failing open "
                         "(entries unblocked)",
                     )
-                    breaker_just_tripped = False
                 if breaker_just_tripped:
                     await self._risk_manager.handle_drawdown_breaker_flatten(
                         self._gateway,
@@ -1592,17 +1605,22 @@ class TradingBot:
             logger.warning("get_account_equity_usd failed", exc_info=True)
         return None
 
-    async def _refresh_phase_from_equity(self) -> None:
+    async def _refresh_phase_from_equity(self) -> float | None:
         """Re-resolve the operating phase using the broker's live equity.
 
         ``Config.get_phase`` caches its first answer; the first call
         happens in ``__init__`` before Alpaca is connected, so the cache
         always pinned MICRO. We reset the cache and re-resolve with
         live equity so per-tick phase-aware accessors match reality.
+
+        Returns the fetched equity (USD) so the caller can reuse it
+        for downstream risk checks without issuing a second REST call.
+        Returns ``None`` if the equity fetch failed or returned a
+        non-positive value.
         """
         equity_usd: float | None = await self._get_account_equity_usd()
         if equity_usd is None or equity_usd <= 0:
-            return
+            return None
 
         prior: Phase | None = getattr(self._config, "_phase", None)
         self._config._phase = None
@@ -1617,6 +1635,7 @@ class TradingBot:
                 "Phase resolved: %s (equity=$%.2f)",
                 new_phase.name, equity_usd,
             )
+        return equity_usd
 
     def _count_open_positions(self) -> int:
         """Count non-closed positions in SQLite."""
