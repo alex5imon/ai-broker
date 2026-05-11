@@ -1275,3 +1275,152 @@ class TestPlaceLimitExit:
             ticker="SPY", qty=0, limit_price=100.0, reason="bug",
         )
         assert order_id is None
+
+
+# ---------------------------------------------------------------------------
+# Strategy-exit fill callback (item #9 follow-up)
+# ---------------------------------------------------------------------------
+
+
+class TestStrategyExitFillCallback:
+    """The OrderManager invokes ``exit_fill_callback`` when a strategy-driven
+    exit FILLS — with the actual broker fill price, not the signal-time
+    mid. The callback must NOT fire on cancel/expire/reject, since the
+    position is left open and no realised P&L exists.
+    """
+
+    def _seed_closing_position(
+        self, om: OrderManager, *, exit_oid: str = "exit-1",
+        entry_price: float = 100.0, filled_shares: float = 10.0,
+        strategy_id: str | None = "mean_reversion",
+    ) -> _ActiveOrder:
+        active = _ActiveOrder(
+            trade_id=1,
+            ticker="SPY",
+            exchange="US",
+            alpaca_entry_order_id="entry-1",
+            alpaca_exit_order_id=exit_oid,
+            status=PositionStatus.CLOSING,
+            entry_shares=filled_shares,
+            filled_shares=filled_shares,
+            entry_price=entry_price,
+            stop_price=entry_price * 0.98,
+            target_price=entry_price * 1.04,
+            hold_type="intraday",
+            strategy_id=strategy_id,
+            exit_reason="rsi_normalized",
+        )
+        om._active_orders[1] = active
+        om._update_position_status(1, PositionStatus.CLOSING)
+        return active
+
+    @pytest.mark.asyncio
+    async def test_callback_fires_with_actual_fill_price(
+        self, config, tmp_db_path: str, mock_notifier,
+    ):
+        """Signal-time mid was 95.00; broker filled at 94.85 (15c slippage)
+        — callback must see the slippage-true P&L, not the signal-time one.
+        """
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        # Seed a trades row so _close_position can update it.
+        om._create_position_record(_entry("SPY"))
+        active = self._seed_closing_position(om)
+        active.db_trade_id = 1
+
+        captured: list[tuple[str, str, float, float]] = []
+        om.set_exit_fill_callback(
+            lambda sid, tkr, qty, pnl: captured.append((sid, tkr, qty, pnl)),
+        )
+
+        # Broker fill at 94.85 — 15c worse than the signal mid 95.00.
+        om._gw.client.get_order_by_id = MagicMock(
+            return_value=_alpaca_order(
+                "exit-1", "filled", filled_qty=10.0, filled_avg_price=94.85,
+            ),
+        )
+
+        await om._check_order_statuses()
+
+        assert active.status == PositionStatus.CLOSED
+        assert len(captured) == 1
+        sid, tkr, qty, pnl = captured[0]
+        assert sid == "mean_reversion"
+        assert tkr == "SPY"
+        assert qty == 10.0
+        # Real P&L = (94.85 - 100) * 10 = -51.50, not the -50.00 a
+        # signal-time recording would have produced from mid=95.00.
+        assert pnl == pytest.approx(-51.50, rel=1e-6)
+
+    @pytest.mark.asyncio
+    async def test_callback_not_fired_on_cancelled_exit(
+        self, config, tmp_db_path: str, mock_notifier,
+    ):
+        """A limit exit that gets cancelled rolls back to
+        STOP_AND_TARGET_ACTIVE — the position remains open, so no
+        outcome is recorded.
+        """
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        active = self._seed_closing_position(om)
+
+        captured: list[Any] = []
+        om.set_exit_fill_callback(lambda *args: captured.append(args))
+
+        om._gw.client.get_order_by_id = MagicMock(
+            return_value=_alpaca_order("exit-1", "canceled"),
+        )
+
+        await om._check_order_statuses()
+
+        assert active.status == PositionStatus.STOP_AND_TARGET_ACTIVE
+        assert captured == []
+
+    @pytest.mark.asyncio
+    async def test_callback_skipped_when_strategy_id_unknown(
+        self, config, tmp_db_path: str, mock_notifier,
+    ):
+        """Drain/recovery exits without a sleeve label must not fire the
+        cooldown callback — there's no strategy to charge the loss to.
+        """
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        om._create_position_record(_entry("SPY"))
+        active = self._seed_closing_position(om, strategy_id=None)
+        active.db_trade_id = 1
+
+        captured: list[Any] = []
+        om.set_exit_fill_callback(lambda *args: captured.append(args))
+
+        om._gw.client.get_order_by_id = MagicMock(
+            return_value=_alpaca_order(
+                "exit-1", "filled", filled_qty=10.0, filled_avg_price=99.0,
+            ),
+        )
+
+        await om._check_order_statuses()
+        assert active.status == PositionStatus.CLOSED
+        assert captured == []
+
+    @pytest.mark.asyncio
+    async def test_callback_exception_does_not_crash_status_poll(
+        self, config, tmp_db_path: str, mock_notifier,
+    ):
+        """A misbehaving observer must not derail order-state reconciliation.
+        The fill still completes; the callback failure is logged only.
+        """
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        om._create_position_record(_entry("SPY"))
+        active = self._seed_closing_position(om)
+        active.db_trade_id = 1
+
+        def boom(*_args):
+            raise RuntimeError("tracker offline")
+
+        om.set_exit_fill_callback(boom)
+
+        om._gw.client.get_order_by_id = MagicMock(
+            return_value=_alpaca_order(
+                "exit-1", "filled", filled_qty=10.0, filled_avg_price=99.0,
+            ),
+        )
+
+        await om._check_order_statuses()
+        assert active.status == PositionStatus.CLOSED

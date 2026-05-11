@@ -25,7 +25,7 @@ import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 from zoneinfo import ZoneInfo
 
 from alpaca.trading.client import TradingClient
@@ -55,6 +55,16 @@ if TYPE_CHECKING:
 logger: logging.Logger = logging.getLogger(__name__)
 
 ET: ZoneInfo = TZ_EASTERN
+
+
+# Callback fired when a strategy-driven exit order (place_exit /
+# place_limit_exit) actually FILLS at the broker. Args:
+# (strategy_id, ticker, filled_qty, realized_pnl). The pnl is computed
+# from the real broker fill price, so the loss-cooldown tracker sees
+# slippage-true outcomes rather than signal-time mid-price estimates.
+# Bracket-leg exits (stop/target/trail) intentionally do not fire this
+# callback today — see item #9 follow-up in risk-infrastructure-gaps.
+ExitFillCallback = Callable[[str, str, float, float], None]
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +168,14 @@ class OrderManager:
         # and place_entry constructing the _ActiveOrder. Cleared once the
         # tracker takes ownership.
         self._pending_db_trade_ids: dict[int, int] = {}
+        # Optional observer fired on strategy-driven exit fills, with the
+        # actual broker fill price. StrategyManager wires this to the
+        # loss-cooldown tracker so slippage is reflected in the streak.
+        self._exit_fill_callback: ExitFillCallback | None = None
+
+    def set_exit_fill_callback(self, callback: ExitFillCallback | None) -> None:
+        """Register the strategy-exit fill observer (idempotent)."""
+        self._exit_fill_callback = callback
 
     # ------------------------------------------------------------------
     # Tick-model hydration + status check
@@ -453,21 +471,51 @@ class OrderManager:
                     # accesses across this block.
                     if exit_order.status.value == "filled":  # type: ignore[union-attr]
                         exit_px: float = float(exit_order.filled_avg_price or 0)  # type: ignore[union-attr]
+                        # Prefer the broker's reported filled_qty over the
+                        # cached entry-fill qty so partial-fill exits (rare
+                        # but possible) feed the cooldown tracker the qty
+                        # that actually transacted, not the qty we sent.
+                        filled_exit_qty: float = float(
+                            exit_order.filled_qty or 0  # type: ignore[union-attr]
+                        )
+                        if filled_exit_qty <= 0:
+                            filled_exit_qty = active.filled_shares
                         reason_str: str = active.exit_reason or "strategy_exit"
                         logger.info(
-                            "Strategy exit FILLED: %s reason=%s @ %.4f (trade_id=%d)",
-                            active.ticker, reason_str, exit_px, trade_id,
+                            "Strategy exit FILLED: %s reason=%s @ %.4f qty=%.4f (trade_id=%d)",
+                            active.ticker, reason_str, exit_px,
+                            filled_exit_qty, trade_id,
                         )
                         await self._close_position(
                             trade_id, active, exit_px, reason_str,
                         )
                         pnl_strategy: float = (
-                            (exit_px - active.entry_price) * active.filled_shares
+                            (exit_px - active.entry_price) * filled_exit_qty
                         )
                         await self._notifier.position_closed(
                             ticker=active.ticker, pnl=pnl_strategy,
                             hold_time="", exit_reason=reason_str,
                         )
+                        # Deferred loss-cooldown bookkeeping — keyed on the
+                        # actual broker fill price, not the signal-time mid
+                        # that check_exits had to estimate. Fire only on
+                        # FILL; cancel/expire/reject leaves the position
+                        # open and is handled by the rollback branch below
+                        # without touching the cooldown streak.
+                        cb: ExitFillCallback | None = self._exit_fill_callback
+                        if cb is not None and active.strategy_id:
+                            try:
+                                cb(
+                                    active.strategy_id,
+                                    active.ticker,
+                                    filled_exit_qty,
+                                    pnl_strategy,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "exit_fill_callback raised for %s (trade_id=%d)",
+                                    active.ticker, trade_id,
+                                )
                     elif exit_order.status.value in ("canceled", "expired", "rejected"):  # type: ignore[union-attr]
                         # Limit exit didn't fill (e.g. price gapped through
                         # the limit). Roll back to STOP_AND_TARGET_ACTIVE so

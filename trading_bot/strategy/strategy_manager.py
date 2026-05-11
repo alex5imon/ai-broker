@@ -135,6 +135,23 @@ class StrategyManager:
         # Reset on any success. See `_DB_ERROR_FAIL_CLOSED_THRESHOLD`.
         self._db_error_streak: int = 0
 
+        # Wire the loss-cooldown tracker to the order manager's exit-fill
+        # observer so outcomes are recorded with the actual broker fill
+        # price (slippage-true) rather than the signal-time mid the strategy
+        # saw when emitting the exit. Duck-typed because OrderManager is
+        # passed as ``Any`` to keep test stubs simple.
+        if self._loss_cooldown is not None:
+            setter = getattr(self._order_manager, "set_exit_fill_callback", None)
+            if callable(setter):
+                tracker: LossCooldownTracker = self._loss_cooldown
+
+                def _on_exit_fill(
+                    strategy_id: str, _ticker: str, _qty: float, pnl: float,
+                ) -> None:
+                    tracker.record_outcome(strategy_id, pnl)
+
+                setter(_on_exit_fill)
+
     @property
     def strategies(self) -> list[StrategyBase]:
         return list(self._strategies)
@@ -469,22 +486,11 @@ class StrategyManager:
                 portfolio.record_exit(shares, current_price, entry_price)
                 exits += 1
 
-                # Loss-cooldown bookkeeping — must follow record_exit so the
-                # virtual portfolio's tally is consistent with the tracker's.
-                #
-                # KNOWN LIMITATION (tracked as item #9 in the risk-infra
-                # gaps memo): `current_price` here is the live mid at
-                # signal time, not the actual broker fill price. Under
-                # paper this is harmless; under live the loss-cooldown
-                # threshold will activate slightly later than the real
-                # P&L would justify when slippage is significant.
-                # Fix path is a deferred record_outcome keyed on
-                # exit_order_id (set when the fill is polled in
-                # `_check_order_statuses`) — non-trivial refactor, kept
-                # separate from this correctness pass.
-                if self._loss_cooldown is not None:
-                    pnl: float = shares * (current_price - entry_price)
-                    self._loss_cooldown.record_outcome(strategy.strategy_id, pnl)
+                # Loss-cooldown bookkeeping happens later, when
+                # OrderManager polls the exit order and observes the
+                # actual broker fill price. That callback is registered
+                # in __init__. Recording eagerly here would use the
+                # signal-time mid and miss slippage.
 
         return exits
 
