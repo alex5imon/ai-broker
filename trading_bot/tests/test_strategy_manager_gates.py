@@ -410,10 +410,17 @@ class TestLossCooldownGate:
         order_manager.place_entry.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_check_exits_records_loss_outcome(
+    async def test_check_exits_defers_outcome_to_fill_callback(
         self, market_data, risk_manager, order_manager, sentiment, earnings,
         portfolio_manager, tmp_db_path,
     ):
+        """``check_exits`` must NOT record an outcome eagerly.
+
+        Recording at signal time would use the live mid (``current_price``)
+        and silently miss broker slippage. The tracker is fed by the
+        ``exit_fill_callback`` from OrderManager once the actual fill
+        is polled. Item #9 of the 2026-05-07 risk-infra gaps memo.
+        """
         cfg = _config()
         tracker = LossCooldownTracker(
             db_path=tmp_db_path,
@@ -426,8 +433,6 @@ class TestLossCooldownGate:
         market_data.get_latest_price = MagicMock(return_value=95.0)
 
         strategy = _StubStrategy("stub", None)
-        # Force exit
-        strategy._exit_signal = ExitSignal(should_exit=True, reason="stop_loss")
         strategy.evaluate_exit = lambda *a, **kw: ExitSignal(
             should_exit=True, reason="stop_loss",
         )
@@ -440,12 +445,75 @@ class TestLossCooldownGate:
             earnings=earnings, config=cfg, db_path=tmp_db_path,
             loss_cooldown=tracker,
         )
+        # Broker order goes out twice — but the tracker still sees no
+        # losses until the fill callback fires.
         await sm.check_exits()
-        # First loss recorded; not yet on cooldown (threshold=2)
+        await sm.check_exits()
+        assert order_manager.place_exit.await_count == 2
         assert tracker.is_on_cooldown("stub")[0] is False
-        await sm.check_exits()
-        # Second consecutive loss → cooldown engaged
+
+    @pytest.mark.asyncio
+    async def test_fill_callback_records_actual_pnl(
+        self, market_data, risk_manager, order_manager, sentiment, earnings,
+        portfolio_manager, tmp_db_path,
+    ):
+        """The registered fill callback feeds the tracker the broker P&L.
+
+        Two consecutive losing fills must engage the cooldown — exercising
+        the path that previously fired eagerly from ``check_exits``.
+        """
+        cfg = _config()
+        tracker = LossCooldownTracker(
+            db_path=tmp_db_path,
+            config=LossCooldownConfig(enabled=True, threshold_losses=2),
+        )
+
+        captured: dict[str, Any] = {}
+
+        def fake_set_callback(cb):
+            captured["cb"] = cb
+
+        order_manager.set_exit_fill_callback = MagicMock(
+            side_effect=fake_set_callback,
+        )
+
+        StrategyManager(
+            strategies=[_StubStrategy("stub", None)],
+            portfolio_manager=portfolio_manager,
+            market_data=market_data, order_manager=order_manager,
+            risk_manager=risk_manager, sentiment=sentiment,
+            earnings=earnings, config=cfg, db_path=tmp_db_path,
+            loss_cooldown=tracker,
+        )
+
+        cb = captured.get("cb")
+        assert callable(cb), "StrategyManager must register exit_fill_callback"
+
+        # Simulate two losing strategy-driven exit fills coming back from
+        # _check_order_statuses on subsequent ticks.
+        cb("stub", "SPY", 3.0, -15.30)
+        assert tracker.is_on_cooldown("stub")[0] is False
+        cb("stub", "SPY", 3.0, -8.05)
         assert tracker.is_on_cooldown("stub")[0] is True
+
+    @pytest.mark.asyncio
+    async def test_no_callback_registration_without_loss_cooldown(
+        self, market_data, risk_manager, order_manager, sentiment, earnings,
+        portfolio_manager, tmp_db_path,
+    ):
+        """Without a tracker, the wiring is skipped — OrderManager stays
+        free of a stray reference to a None tracker."""
+        cfg = _config()
+        order_manager.set_exit_fill_callback = MagicMock()
+        StrategyManager(
+            strategies=[_StubStrategy("stub", None)],
+            portfolio_manager=portfolio_manager,
+            market_data=market_data, order_manager=order_manager,
+            risk_manager=risk_manager, sentiment=sentiment,
+            earnings=earnings, config=cfg, db_path=tmp_db_path,
+            loss_cooldown=None,
+        )
+        order_manager.set_exit_fill_callback.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
