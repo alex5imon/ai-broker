@@ -323,6 +323,92 @@ class TestEntryTimeout:
         assert trade_id not in om._active_orders
 
     @pytest.mark.asyncio
+    async def test_timeout_with_broker_position_promotes_to_open(
+        self, config, tmp_db_path: str, mock_notifier
+    ):
+        """Regression for 2026-05-11 XLK order-status lag bug.
+
+        Alpaca filled the order in 169 ms but the bot's 5-min poll
+        returned filled_qty=0 (stale endpoint). _maybe_timeout_entry
+        was about to mark the row ENTRY_FAILED, which then orphaned the
+        real broker-held position. The fix: before declaring failure,
+        consult ``get_open_position`` — if the broker actually holds
+        the qty, promote the row to POSITION_OPEN with the real fill
+        data.
+        """
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        entry_alpaca = _alpaca_order("entry-1", "new")
+        om._gw.client.submit_order = MagicMock(return_value=entry_alpaca)
+        # Use integer-share entry so the _entry helper's int() doesn't
+        # truncate to 0. The broker-side qty/price the consistency check
+        # observes is what matters for the assertion.
+        trade_id = await om.place_entry(_entry(shares=100, price=10.0))
+
+        # Stale order status: still 'new', 0 filled, 10 min old (≥ default
+        # entry_timeout). The broker, however, holds the position.
+        old_submitted = datetime.now(tz=ET) - timedelta(seconds=600)
+        stale_status = _alpaca_order(
+            "entry-1", "new",
+            filled_qty=0.0, filled_avg_price=0.0,
+            submitted_at=old_submitted,
+        )
+        om._gw.client.get_order_by_id = MagicMock(return_value=stale_status)
+        om._gw.client.cancel_order_by_id = MagicMock()
+        om._gw.client.submit_order = MagicMock(
+            return_value=_alpaca_order("stop-1", "new"),
+        )
+
+        # Alpaca position list: position exists at the broker.
+        broker_pos = MagicMock()
+        broker_pos.qty = "100"  # str — matches alpaca-py serialization
+        broker_pos.avg_entry_price = "10.00"
+        om._gw.client.get_open_position = MagicMock(return_value=broker_pos)
+
+        await om._check_order_statuses()
+
+        active = om._active_orders[trade_id]
+        # Promoted to POSITION_OPEN with the broker's qty + avg cost,
+        # not ENTRY_FAILED — order-status lag must not orphan a real fill.
+        assert active.status != PositionStatus.ENTRY_FAILED, (
+            "broker holds the position; row must NOT be marked ENTRY_FAILED"
+        )
+        assert active.filled_shares == pytest.approx(100.0, abs=1e-6)
+        assert active.entry_price == pytest.approx(10.0, abs=0.01)
+
+    @pytest.mark.asyncio
+    async def test_timeout_with_no_broker_position_marks_entry_failed(
+        self, config, tmp_db_path: str, mock_notifier
+    ):
+        """Negative case: timeout fires, order-status is stale, AND the
+        broker has no position — legitimate ENTRY_FAILED path.
+        """
+        from alpaca.common.exceptions import APIError
+
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        entry_alpaca = _alpaca_order("entry-1", "new")
+        om._gw.client.submit_order = MagicMock(return_value=entry_alpaca)
+        trade_id = await om.place_entry(_entry(shares=10, price=100.0))
+
+        old_submitted = datetime.now(tz=ET) - timedelta(seconds=600)
+        stale = _alpaca_order(
+            "entry-1", "new",
+            filled_qty=0.0, filled_avg_price=0.0,
+            submitted_at=old_submitted,
+        )
+        om._gw.client.get_order_by_id = MagicMock(return_value=stale)
+        om._gw.client.cancel_order_by_id = MagicMock()
+        # Production Alpaca raises APIError when no position exists.
+        om._gw.client.get_open_position = MagicMock(
+            side_effect=APIError({"message": "position not found"}),
+        )
+
+        await om._check_order_statuses()
+
+        assert trade_id not in om._active_orders, (
+            "no broker position — legacy ENTRY_FAILED path must fire"
+        )
+
+    @pytest.mark.asyncio
     async def test_recent_pending_order_not_timed_out(
         self, config, tmp_db_path: str, mock_notifier
     ):
@@ -721,6 +807,31 @@ class TestPlaceExit:
         assert order_id is None
         # Emergency exits should fire a notification on failure
         mock_notifier.send.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_place_exit_notifies_on_non_emergency_failure(
+        self, config, tmp_db_path: str, mock_notifier,
+    ):
+        """Regression for 2026-05-08 → 2026-05-11 silent-failure mode.
+
+        overnight_drift's morning exit failed daily with Alpaca's
+        "insufficient qty available" rejection, but the alert path was
+        gated on ``is_emergency=True`` — strategy callers pass False,
+        so nothing ever fired. The position survived multiple sessions
+        with zero operator visibility.
+        """
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        om._gw.client.submit_order = MagicMock(side_effect=RuntimeError("rejected"))
+        om._gw.client.get_orders = MagicMock(return_value=[])
+
+        order_id = await om.place_exit(
+            ticker="XLF", qty=1.989, reason="overnight_exit",
+            is_emergency=False,
+        )
+        assert order_id is None
+        mock_notifier.send.assert_awaited(), (
+            "non-emergency exit failures must still notify — position is stuck"
+        )
 
     @pytest.mark.asyncio
     async def test_place_exit_rejects_non_positive_qty(

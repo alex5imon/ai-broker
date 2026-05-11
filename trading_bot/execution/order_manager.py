@@ -57,6 +57,28 @@ logger: logging.Logger = logging.getLogger(__name__)
 ET: ZoneInfo = TZ_EASTERN
 
 
+def _coerce_broker_qty(value: Any) -> float | None:
+    """Coerce an Alpaca position field to float, or return None.
+
+    Alpaca returns qty/avg_entry_price as strings ("0.3927", "177.438").
+    A defensive coercion: only accept str/int/float so the call site
+    is immune to test gateways that auto-mock attributes with
+    MagicMock objects (which would otherwise yield ``float(MagicMock)
+    == 1.0`` and trick the consistency check into reporting a held
+    position that doesn't exist).
+    """
+    if value is None:
+        return None
+    if not isinstance(value, (str, int, float)):
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 # Callback fired when a strategy-driven exit order (place_exit /
 # place_limit_exit) actually FILLS at the broker. Args:
 # (strategy_id, ticker, filled_qty, realized_pnl). The pnl is computed
@@ -673,6 +695,31 @@ class OrderManager:
             await self.cancel_order(alpaca_order_id)
             await self._transition_to_open(trade_id, active.filled_shares)
         else:
+            # Belt-and-suspenders: before declaring ENTRY_FAILED, ask the
+            # broker directly whether we actually hold the position. The
+            # order-status endpoint can lag the fill by seconds (observed
+            # 2026-05-11: 169 ms fill, 5-min poll still showed
+            # filled_qty=0), which would otherwise orphan a real
+            # position. If the position exists at the broker, treat the
+            # order as filled and transition to POSITION_OPEN with the
+            # actual broker qty + avg cost.
+            broker_qty: float | None = await self._broker_held_qty(active.ticker)
+            if broker_qty is not None and broker_qty > 0:
+                broker_avg: float = await self._broker_avg_entry_price(
+                    active.ticker,
+                ) or active.entry_price
+                logger.warning(
+                    "Entry timeout: order-status lag for %s — broker holds "
+                    "%.6f sh @ $%.4f despite filled_qty=0 on order. "
+                    "Promoting to POSITION_OPEN (trade_id=%d, age=%.0fs).",
+                    active.ticker, broker_qty, broker_avg, trade_id,
+                    age.total_seconds(),
+                )
+                active.filled_shares = broker_qty
+                active.entry_price = broker_avg
+                await self._transition_to_open(trade_id, broker_qty)
+                return
+
             logger.info(
                 "Entry timeout: cancelling %s (filled %.4f/%.4f, age=%.0fs, trade_id=%d)",
                 active.ticker, active.filled_shares, active.entry_shares,
@@ -699,6 +746,34 @@ class OrderManager:
                        f"{active.entry_shares:.4f} after {age.total_seconds():.0f}s",
             )
             del self._active_orders[trade_id]
+
+    async def _broker_held_qty(self, ticker: str) -> float | None:
+        """Return Alpaca-side held qty for ``ticker``, or None on lookup
+        failure / no position. Used by ``_maybe_timeout_entry`` to avoid
+        marking a position ENTRY_FAILED when the broker has actually
+        filled the order but order-status hasn't propagated yet.
+        """
+        try:
+            pos = await asyncio.to_thread(
+                self._gw.client.get_open_position, ticker,  # type: ignore[arg-type]
+            )
+        except Exception:
+            # No open position OR transient error — fall through to the
+            # legacy ENTRY_FAILED path. Don't try to distinguish; the
+            # consistency check is best-effort and should never break
+            # the timeout path.
+            return None
+        return _coerce_broker_qty(getattr(pos, "qty", None))
+
+    async def _broker_avg_entry_price(self, ticker: str) -> float | None:
+        """Mirror of _broker_held_qty for the broker's avg entry price."""
+        try:
+            pos = await asyncio.to_thread(
+                self._gw.client.get_open_position, ticker,  # type: ignore[arg-type]
+            )
+        except Exception:
+            return None
+        return _coerce_broker_qty(getattr(pos, "avg_entry_price", None))
 
     # ------------------------------------------------------------------
     # Stop / Target / Trailing
@@ -920,18 +995,28 @@ class OrderManager:
                     matching_trade_id, PositionStatus.CLOSING,
                 )
             return order_id
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "CRITICAL: Failed to place strategy exit for %s (qty=%s, reason=%s)",
                 ticker, qty, reason,
             )
-            if is_emergency:
-                await self._notifier.send(
-                    "Strategy Exit Failed",
-                    f"Failed to exit {qty} {ticker} (reason={reason}). Manual review required.",
-                    priority=4,
-                    tags=["warning"],
-                )
+            # Always notify — every place_exit caller intends to actually
+            # close a real position, so a failure means the position is
+            # stuck. Today's silent failure mode (2026-05-08 → 2026-05-11
+            # daily "insufficient qty" rejections, no alert ever fired)
+            # showed that the prior is_emergency-only path was too
+            # restrictive. is_emergency now only escalates priority.
+            priority: int = 5 if is_emergency else 4
+            await self._notifier.send(
+                "Strategy Exit Failed",
+                (
+                    f"Failed to exit {qty} {ticker} (reason={reason}). "
+                    f"Position remains long at the broker. Manual review "
+                    f"required. Error: {type(exc).__name__}: {exc}"
+                ),
+                priority=priority,
+                tags=["warning"],
+            )
             return None
 
     async def place_limit_exit(
