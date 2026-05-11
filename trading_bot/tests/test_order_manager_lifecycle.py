@@ -1424,3 +1424,109 @@ class TestStrategyExitFillCallback:
 
         await om._check_order_statuses()
         assert active.status == PositionStatus.CLOSED
+
+    @pytest.mark.asyncio
+    async def test_partial_fill_uses_broker_qty_for_callback_and_db(
+        self, config, tmp_db_path: str, mock_notifier,
+    ):
+        """A partial-fill exit must report the same qty-true P&L to both
+        the cooldown callback AND the trades-table row. Previously,
+        ``_close_position`` recomputed using ``active.filled_shares``
+        while the callback used ``exit_order.filled_qty`` — the two
+        diverged on partial fills.
+        """
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        om._create_position_record(_entry("SPY", shares=10, price=100.0))
+        active = self._seed_closing_position(
+            om, entry_price=100.0, filled_shares=10.0,
+        )
+        active.db_trade_id = 1
+
+        captured: list[tuple[str, str, float, float]] = []
+        om.set_exit_fill_callback(
+            lambda sid, tkr, qty, pnl: captured.append((sid, tkr, qty, pnl)),
+        )
+
+        # Only 4 of 10 shares fill at 95.00 — the position closes but
+        # the realised loss is bounded by the partial qty.
+        om._gw.client.get_order_by_id = MagicMock(
+            return_value=_alpaca_order(
+                "exit-1", "filled", filled_qty=4.0, filled_avg_price=95.0,
+            ),
+        )
+
+        await om._check_order_statuses()
+
+        # Callback sees the broker-reported qty (4), not the entry qty (10).
+        assert len(captured) == 1
+        _sid, _tkr, qty, pnl = captured[0]
+        assert qty == 4.0
+        assert pnl == pytest.approx(-20.0, rel=1e-6)  # (95 - 100) * 4
+
+        # And the trades row was written with the SAME qty-true P&L.
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            row = conn.execute(
+                "SELECT gross_pnl, net_pnl, exit_price FROM trades WHERE id = 1"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None
+        gross_pnl, net_pnl, exit_price = row
+        assert gross_pnl == pytest.approx(-20.0, rel=1e-6)
+        assert net_pnl == pytest.approx(-20.0, rel=1e-6)
+        assert exit_price == pytest.approx(95.0, rel=1e-6)
+
+    @pytest.mark.asyncio
+    async def test_callback_fires_via_place_limit_exit_path(
+        self, config, tmp_db_path: str, mock_notifier,
+    ):
+        """``place_limit_exit`` transitions to CLOSING and sets
+        ``alpaca_exit_order_id`` the same way ``place_exit`` does, so
+        the same _check_order_statuses fill branch handles both. This
+        test seeds the position via the real ``place_limit_exit`` call
+        to guard against future drift between the two paths.
+        """
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        # Real entry → real DB row → real trades row, so _close_position
+        # has something to update.
+        om._create_position_record(_entry("SPY"))
+        active = _ActiveOrder(
+            trade_id=1, ticker="SPY", exchange="US",
+            alpaca_entry_order_id="entry-1",
+            status=PositionStatus.STOP_AND_TARGET_ACTIVE,
+            entry_shares=10.0, filled_shares=10.0,
+            entry_price=100.0, stop_price=98.0, target_price=104.0,
+            hold_type="intraday", strategy_id="mean_reversion",
+            db_trade_id=1,
+        )
+        om._active_orders[1] = active
+
+        om._gw.client.submit_order = MagicMock(
+            return_value=_alpaca_order("exit-limit-1", "new"),
+        )
+        order_id = await om.place_limit_exit(
+            ticker="SPY", qty=10, limit_price=99.50, reason="time_stop",
+        )
+        assert order_id == "exit-limit-1"
+        assert active.status == PositionStatus.CLOSING
+
+        captured: list[tuple[str, str, float, float]] = []
+        om.set_exit_fill_callback(
+            lambda sid, tkr, qty, pnl: captured.append((sid, tkr, qty, pnl)),
+        )
+
+        om._gw.client.get_order_by_id = MagicMock(
+            return_value=_alpaca_order(
+                "exit-limit-1", "filled",
+                filled_qty=10.0, filled_avg_price=99.40,
+            ),
+        )
+        await om._check_order_statuses()
+
+        assert active.status == PositionStatus.CLOSED
+        assert len(captured) == 1
+        sid, _tkr, qty, pnl = captured[0]
+        assert sid == "mean_reversion"
+        assert qty == 10.0
+        assert pnl == pytest.approx(-6.0, rel=1e-6)  # (99.40 - 100) * 10

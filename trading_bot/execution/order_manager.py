@@ -488,6 +488,7 @@ class OrderManager:
                         )
                         await self._close_position(
                             trade_id, active, exit_px, reason_str,
+                            filled_qty=filled_exit_qty,
                         )
                         pnl_strategy: float = (
                             (exit_px - active.entry_price) * filled_exit_qty
@@ -1347,8 +1348,15 @@ class OrderManager:
     async def _close_position(
         self, trade_id: int, active: _ActiveOrder,
         exit_price: float, exit_reason: str,
+        filled_qty: float | None = None,
     ) -> None:
-        """Mark a position as CLOSED in the DB and clean up tracking."""
+        """Mark a position as CLOSED in the DB and clean up tracking.
+
+        ``filled_qty`` lets the caller override the share count used for
+        P&L when the broker fill diverges from ``active.filled_shares``
+        (e.g. a partial-fill exit). Defaults to ``active.filled_shares``
+        for callers that don't have a broker-reported quantity in hand.
+        """
         now_str: str = datetime.now(tz=ET).isoformat()
 
         active.status = PositionStatus.CLOSED
@@ -1356,7 +1364,11 @@ class OrderManager:
 
         # Compute realised P&L while we still have the active order in hand.
         # The bot is commission-free so net == gross; FX is 1.0 for USD.
-        gross_pnl: float = (exit_price - active.entry_price) * active.filled_shares
+        qty_for_pnl: float = (
+            filled_qty if filled_qty is not None and filled_qty > 0
+            else active.filled_shares
+        )
+        gross_pnl: float = (exit_price - active.entry_price) * qty_for_pnl
 
         # B3: target the trades row by trades.id, not positions.id. The two
         # tables have independent autoincrements; pre-fix this UPDATE
