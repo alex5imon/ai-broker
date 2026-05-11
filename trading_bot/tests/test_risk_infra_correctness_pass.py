@@ -226,22 +226,56 @@ def test_check_drawdown_breaker_is_idempotent(
     assert rm._drawdown_breaker_active is True
 
 
-def test_check_drawdown_breaker_is_wired_into_main_entry_path() -> None:
-    """Before this pass, ``check_drawdown_breaker`` was defined but never
-    called from production — only tests. The breaker could not trip.
-    Guard against regression by inspecting ``main.py`` for the call."""
+def test_check_drawdown_breaker_is_wired_into_unconditional_tick_path() -> None:
+    """The drawdown breaker (and the daily-loss check) must be invoked
+    from the unconditional ``TradingBot.tick`` path, NOT from
+    ``scan_for_entries``.
+
+    Pre-PR #93 the calls did not exist at all. PR #93 wired them in,
+    but inside ``scan_for_entries`` — which is skipped in close-only
+    mode, during wind-down, and on any tick where the entry-scan gate
+    is otherwise closed, leaving the breaker silent for the entire
+    afternoon. This guard fails if a regression moves the calls back
+    into the entry-scan-only path.
+    """
     import inspect
 
     from trading_bot import main as main_mod
+    from trading_bot.main import TradingBot
 
-    src = inspect.getsource(main_mod)
-    assert "check_drawdown_breaker(" in src, (
-        "check_drawdown_breaker is not invoked from trading_bot/main.py. "
-        "The drawdown breaker only fires when something polls it; missing "
-        "the call means the breaker silently never trips."
+    tick_src: str = inspect.getsource(TradingBot.tick)
+    assert "check_drawdown_breaker(" in tick_src, (
+        "check_drawdown_breaker must be called directly from TradingBot.tick "
+        "(the unconditional path). Calling it only from "
+        "scan_for_entries silences the breaker in close-only mode "
+        "and wind-down."
     )
-    assert "handle_drawdown_breaker_flatten(" in src, (
-        "When the breaker trips, main.py must call "
-        "handle_drawdown_breaker_flatten so existing positions are not "
-        "left riding stale stops."
+    assert "check_daily_loss_limit(" in tick_src, (
+        "check_daily_loss_limit must be called directly from TradingBot.tick "
+        "(the unconditional path). Calling it only from "
+        "scan_for_entries silences the daily-loss circuit in "
+        "close-only mode and wind-down."
     )
+    assert "handle_drawdown_breaker_flatten(" in tick_src, (
+        "When the breaker trips, TradingBot.tick must call "
+        "handle_drawdown_breaker_flatten so existing positions are "
+        "not left riding stale stops."
+    )
+
+    scan_src: str = inspect.getsource(TradingBot.scan_for_entries)
+    assert "check_drawdown_breaker(" not in scan_src, (
+        "check_drawdown_breaker must NOT live inside "
+        "scan_for_entries — that path is skipped in close-only mode "
+        "and wind-down, so the breaker would silently fail to trip."
+    )
+    assert "check_daily_loss_limit(" not in scan_src, (
+        "check_daily_loss_limit must NOT live inside "
+        "scan_for_entries — that path is skipped in close-only mode "
+        "and wind-down."
+    )
+
+    # Belt-and-braces: the symbols must also be referenced somewhere
+    # in main.py at module scope.
+    module_src: str = inspect.getsource(main_mod)
+    assert "check_drawdown_breaker(" in module_src
+    assert "handle_drawdown_breaker_flatten(" in module_src

@@ -345,6 +345,47 @@ class TradingBot:
             if today_et != self._risk_manager._trading_day:
                 self._risk_manager.reset_daily()
 
+            # --- 9b. Risk circuit breakers (unconditional) ---
+            # MUST run every tick regardless of market window or mode.
+            # Previously these sat inside ``scan_for_entries`` which is
+            # skipped in close-only mode, wind-down, or any tick where
+            # the entry-scan gate is closed — leaving the drawdown
+            # breaker silent for the entire afternoon. Hoisting them
+            # here means ``can_trade()`` always reflects the latest
+            # rolling-drawdown / daily-loss state, and a tripped
+            # breaker force-flattens even when no entries are being
+            # scanned.
+            equity_for_risk: float | None = await self._get_account_equity_usd()
+            if equity_for_risk is None:
+                logger.warning(
+                    "Risk circuit check skipped — equity unavailable",
+                )
+            else:
+                try:
+                    self._risk_manager.check_daily_loss_limit(
+                        self._risk_manager.daily_pnl_usd, equity_for_risk,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Daily-loss check raised — failing open",
+                    )
+                try:
+                    breaker_just_tripped: bool = (
+                        self._risk_manager.check_drawdown_breaker(
+                            equity_for_risk,
+                        )
+                    )
+                except Exception:
+                    logger.exception(
+                        "Drawdown breaker check raised — failing open "
+                        "(entries unblocked)",
+                    )
+                    breaker_just_tripped = False
+                if breaker_just_tripped:
+                    await self._risk_manager.handle_drawdown_breaker_flatten(
+                        self._gateway,
+                    )
+
             # --- 10. Watchlist bootstrap: seed quotes via bulk REST ---
             watchlist_tickers: list[str] = self._config.get_watchlist(Market.US)
             try:
@@ -606,29 +647,9 @@ class TradingBot:
             return
         account_equity_usd: float = equity_opt
 
-        # Update risk manager with today's P&L
-        self._risk_manager.check_daily_loss_limit(
-            self._risk_manager.daily_pnl_usd, account_equity_usd
-        )
-
-        # Drawdown breaker: 5-day rolling drawdown threshold. Returns
-        # True only on the activation tick (the breaker state then
-        # blocks subsequent entries via can_trade()). On activation,
-        # also force-flatten existing positions: the >5% drawdown that
-        # tripped the breaker is precisely the signal that our model
-        # is mispricing risk, so trusting the existing stops to behave
-        # is the assumption we shouldn't make.
-        try:
-            breaker_just_tripped: bool = self._risk_manager.check_drawdown_breaker(
-                account_equity_usd,
-            )
-        except Exception:
-            logger.exception(
-                "Drawdown breaker check raised — failing open (entries unblocked)",
-            )
-            breaker_just_tripped = False
-        if breaker_just_tripped:
-            await self._risk_manager.handle_drawdown_breaker_flatten(self._gateway)
+        # Risk circuit checks (daily-loss + drawdown breaker) run
+        # unconditionally in ``tick()`` step 9b. ``can_trade()`` below
+        # consults the cached state, so we do not re-evaluate here.
 
         exchange_str: str = "US"
 
