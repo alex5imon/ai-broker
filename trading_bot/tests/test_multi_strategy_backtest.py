@@ -507,6 +507,250 @@ class TestAlpacaDownloader:
             assert d.weekday() < 5
         assert len(days) == 5  # Mon-Fri
 
+    def test_download_daily_history_writes_per_day_files(
+        self,
+        tmp_path: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``--full-daily-history`` should emit one parquet per trading day.
+
+        Mocks the Alpaca client to return one bar per weekday, then verifies
+        that ``download_daily_history`` writes a separate file at every
+        target trading day whose slice is bounded by that day and capped at
+        ``lookback_days``.
+        """
+        import asyncio
+
+        from trading_bot.data import alpaca_downloader
+        from trading_bot import data_cache
+
+        # Redirect the cache directory at the source of truth in ``data_cache``
+        # so both ``save_to_cache`` writes and ``load_cached`` reads agree.
+        monkeypatch.setattr(data_cache, "_CACHE_DIR", tmp_path / "cache")
+
+        from_date = date(2026, 1, 5)   # Monday
+        to_date = date(2026, 1, 9)     # Friday → 5 trading days
+
+        # Build 150 daily bars ending at to_date so each per-day slice can
+        # be capped at lookback_days=120.
+        n_bars = 150
+        bars = []
+        for i in range(n_bars):
+            bar_day = to_date - timedelta(days=n_bars - 1 - i)
+            bar = MagicMock()
+            bar.timestamp = datetime(
+                bar_day.year, bar_day.month, bar_day.day, 0, 0, 0, tzinfo=TZ_UTC,
+            )
+            bar.open = 400.0 + i * 0.1
+            bar.high = 401.0 + i * 0.1
+            bar.low = 399.0 + i * 0.1
+            bar.close = 400.5 + i * 0.1
+            bar.volume = 1_000_000
+            bars.append(bar)
+
+        mock_response = MagicMock()
+        mock_response.data = {"SPY": bars}
+
+        client = MagicMock()
+        client.get_stock_bars.return_value = mock_response
+
+        config = Config.load("config.yaml")
+
+        result = asyncio.run(
+            alpaca_downloader.download_daily_history(
+                client, "SPY", from_date, to_date, config,
+                lookback_days=120, feed="iex",
+            )
+        )
+
+        assert result.requests_made == 1, "Should issue exactly one Alpaca request"
+        assert result.skipped == 0, "Fresh cache → nothing skipped"
+        assert result.missed == 0, "150 bars of synthetic history covers every target"
+        assert result.written == 5, "One file per trading day Mon-Fri"
+
+        cache_root = tmp_path / "cache" / "SPY"
+        files = sorted(cache_root.glob("*_daily.parquet"))
+        assert len(files) == 5
+        assert files[0].name == "2026-01-05_daily.parquet"
+        assert files[-1].name == "2026-01-09_daily.parquet"
+
+        # Each per-day file must be capped at lookback_days and stop at its
+        # filename date (not bleed in bars from after it).
+        for f in files:
+            df = pd.read_parquet(f)
+            assert len(df) <= 120, f"{f.name} exceeded lookback cap"
+            file_day = date.fromisoformat(f.stem.split("_")[0])
+            max_bar_day = df.index.tz_convert(TZ_UTC).date.max()
+            assert max_bar_day <= file_day, (
+                f"{f.name} contains bars dated after its filename"
+            )
+
+    def test_download_daily_history_skips_cached_days(
+        self,
+        tmp_path: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Idempotency: a second run on a populated cache writes nothing."""
+        import asyncio
+
+        from trading_bot.data import alpaca_downloader
+        from trading_bot import data_cache
+
+        monkeypatch.setattr(data_cache, "_CACHE_DIR", tmp_path / "cache")
+
+        from_date = date(2026, 1, 5)
+        to_date = date(2026, 1, 7)  # 3 trading days
+
+        bars = []
+        for i in range(60):
+            bar_day = to_date - timedelta(days=59 - i)
+            bar = MagicMock()
+            bar.timestamp = datetime(
+                bar_day.year, bar_day.month, bar_day.day, 0, 0, 0, tzinfo=TZ_UTC,
+            )
+            bar.open = 400.0
+            bar.high = 401.0
+            bar.low = 399.0
+            bar.close = 400.5
+            bar.volume = 1_000_000
+            bars.append(bar)
+
+        mock_response = MagicMock()
+        mock_response.data = {"SPY": bars}
+        client = MagicMock()
+        client.get_stock_bars.return_value = mock_response
+
+        config = Config.load("config.yaml")
+
+        # First run populates the cache.
+        asyncio.run(
+            alpaca_downloader.download_daily_history(
+                client, "SPY", from_date, to_date, config,
+            )
+        )
+
+        # Second run: every target is now cached; expect 0 writes and 0
+        # API requests.
+        client.get_stock_bars.reset_mock()
+        result = asyncio.run(
+            alpaca_downloader.download_daily_history(
+                client, "SPY", from_date, to_date, config,
+            )
+        )
+        assert result.written == 0
+        assert result.skipped == 3
+        assert result.missed == 0
+        assert result.requests_made == 0
+        client.get_stock_bars.assert_not_called()
+
+    def test_download_daily_history_records_missed_when_targets_predate_data(
+        self,
+        tmp_path: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Targets earlier than the API's history must count as ``missed``, not be silently skipped."""
+        import asyncio
+
+        from trading_bot.data import alpaca_downloader
+        from trading_bot import data_cache
+
+        monkeypatch.setattr(data_cache, "_CACHE_DIR", tmp_path / "cache")
+
+        from_date = date(2026, 1, 5)
+        to_date = date(2026, 1, 9)  # 5 trading days
+
+        # Only return bars for the last 2 trading days. The first 3 targets
+        # have no bar at-or-before them → should bump ``missed``.
+        bars = []
+        for d in [date(2026, 1, 8), date(2026, 1, 9)]:
+            bar = MagicMock()
+            bar.timestamp = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=TZ_UTC)
+            bar.open = 400.0
+            bar.high = 401.0
+            bar.low = 399.0
+            bar.close = 400.5
+            bar.volume = 1_000_000
+            bars.append(bar)
+
+        mock_response = MagicMock()
+        mock_response.data = {"SPY": bars}
+        client = MagicMock()
+        client.get_stock_bars.return_value = mock_response
+
+        config = Config.load("config.yaml")
+
+        result = asyncio.run(
+            alpaca_downloader.download_daily_history(
+                client, "SPY", from_date, to_date, config,
+            )
+        )
+        assert result.written == 2
+        assert result.missed == 3, "Targets predating the bar series must be reported as missed"
+        assert result.skipped == 0
+        assert result.requests_made == 1
+
+    def test_download_daily_history_with_trading_days_only_bars(
+        self,
+        tmp_path: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Realistic Alpaca shape: bars only on trading days, no weekends.
+
+        The bar list passed to the slicing logic in real use only contains
+        trading days. This verifies the date-based mask still produces the
+        right per-day slice counts under that shape.
+        """
+        import asyncio
+
+        from trading_bot.data import alpaca_downloader
+        from trading_bot import data_cache
+
+        monkeypatch.setattr(data_cache, "_CACHE_DIR", tmp_path / "cache")
+
+        from_date = date(2026, 1, 5)
+        to_date = date(2026, 1, 9)  # 5 trading days
+        config = Config.load("config.yaml")
+
+        # Build trading-days-only bars walking backwards from to_date.
+        bars: list[Any] = []
+        d_cursor = to_date
+        while len(bars) < 160:
+            if d_cursor.weekday() < 5:
+                bar = MagicMock()
+                bar.timestamp = datetime(
+                    d_cursor.year, d_cursor.month, d_cursor.day, 0, 0, 0, tzinfo=TZ_UTC,
+                )
+                bar.open = 400.0
+                bar.high = 401.0
+                bar.low = 399.0
+                bar.close = 400.5
+                bar.volume = 1_000_000
+                bars.append(bar)
+            d_cursor -= timedelta(days=1)
+        bars.reverse()  # chronological order
+
+        mock_response = MagicMock()
+        mock_response.data = {"SPY": bars}
+        client = MagicMock()
+        client.get_stock_bars.return_value = mock_response
+
+        result = asyncio.run(
+            alpaca_downloader.download_daily_history(
+                client, "SPY", from_date, to_date, config,
+                lookback_days=120, feed="iex",
+            )
+        )
+        assert result.written == 5
+        assert result.missed == 0
+
+        cache_root = tmp_path / "cache" / "SPY"
+        for f in sorted(cache_root.glob("*_daily.parquet")):
+            df = pd.read_parquet(f)
+            # All bars in a per-day file must be on weekdays.
+            for ts in df.index:
+                assert ts.weekday() < 5, f"weekend bar leaked into {f.name}"
+            assert len(df) == 120, f"{f.name} should be capped at lookback_days"
+
 
 # ---------------------------------------------------------------------------
 # StrategyResult tests
