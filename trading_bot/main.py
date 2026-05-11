@@ -315,9 +315,12 @@ class TradingBot:
             # equity isn't known yet at construction time. After Alpaca
             # connects, refresh from real NetLiquidation so the per-tick
             # phase-aware accessors (max_positions, risk_per_trade_pct,
-            # stop tighter, etc.) match the actual account size.
+            # stop tighter, etc.) match the actual account size. The
+            # fetched equity is also reused by step 9b below — no
+            # second REST call.
+            equity_for_risk: float | None = None
             try:
-                await self._refresh_phase_from_equity()
+                equity_for_risk = await self._refresh_phase_from_equity()
             except Exception:
                 logger.warning("Phase refresh failed (non-fatal)", exc_info=True)
 
@@ -344,6 +347,57 @@ class TradingBot:
             # overnight maintenance ticks but otherwise dead.
             if today_et != self._risk_manager._trading_day:
                 self._risk_manager.reset_daily()
+
+            # --- 9b. Risk circuit breakers (unconditional) ---
+            # MUST run every tick regardless of market window or mode.
+            # Previously these sat inside ``scan_for_entries`` which is
+            # skipped in close-only mode, wind-down, or any tick where
+            # the entry-scan gate is closed — leaving the drawdown
+            # breaker silent for the entire afternoon. Hoisting them
+            # here means ``can_trade()`` always reflects the latest
+            # rolling-drawdown / daily-loss state, and a tripped
+            # breaker force-flattens even when no entries are being
+            # scanned.
+            #
+            # Equity reused from step 5c — no extra REST call. If the
+            # equity fetch failed up there (Alpaca outage / transient
+            # 503) we fail OPEN here: skip the checks and warn. A
+            # false-positive force-flatten on a transient API blip is
+            # worse than briefly silencing the breaker; the next tick
+            # (5 min later) will retry.
+            if equity_for_risk is None:
+                logger.warning(
+                    "Risk circuit check skipped — equity unavailable",
+                )
+            else:
+                try:
+                    self._risk_manager.check_daily_loss_limit(
+                        self._risk_manager.daily_pnl_usd, equity_for_risk,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Daily-loss check raised — failing open",
+                    )
+                # Pre-init so the variable is defined on every path —
+                # strict mypy flags assign-only-in-try as possibly
+                # undefined, and the False default also makes the
+                # fail-open policy explicit at the declaration site.
+                breaker_just_tripped: bool = False
+                try:
+                    breaker_just_tripped = (
+                        self._risk_manager.check_drawdown_breaker(
+                            equity_for_risk,
+                        )
+                    )
+                except Exception:
+                    logger.exception(
+                        "Drawdown breaker check raised — failing open "
+                        "(entries unblocked)",
+                    )
+                if breaker_just_tripped:
+                    await self._risk_manager.handle_drawdown_breaker_flatten(
+                        self._gateway,
+                    )
 
             # --- 10. Watchlist bootstrap: seed quotes via bulk REST ---
             watchlist_tickers: list[str] = self._config.get_watchlist(Market.US)
@@ -606,29 +660,9 @@ class TradingBot:
             return
         account_equity_usd: float = equity_opt
 
-        # Update risk manager with today's P&L
-        self._risk_manager.check_daily_loss_limit(
-            self._risk_manager.daily_pnl_usd, account_equity_usd
-        )
-
-        # Drawdown breaker: 5-day rolling drawdown threshold. Returns
-        # True only on the activation tick (the breaker state then
-        # blocks subsequent entries via can_trade()). On activation,
-        # also force-flatten existing positions: the >5% drawdown that
-        # tripped the breaker is precisely the signal that our model
-        # is mispricing risk, so trusting the existing stops to behave
-        # is the assumption we shouldn't make.
-        try:
-            breaker_just_tripped: bool = self._risk_manager.check_drawdown_breaker(
-                account_equity_usd,
-            )
-        except Exception:
-            logger.exception(
-                "Drawdown breaker check raised — failing open (entries unblocked)",
-            )
-            breaker_just_tripped = False
-        if breaker_just_tripped:
-            await self._risk_manager.handle_drawdown_breaker_flatten(self._gateway)
+        # Risk circuit checks (daily-loss + drawdown breaker) run
+        # unconditionally in ``tick()`` step 9b. ``can_trade()`` below
+        # consults the cached state, so we do not re-evaluate here.
 
         exchange_str: str = "US"
 
@@ -1571,17 +1605,22 @@ class TradingBot:
             logger.warning("get_account_equity_usd failed", exc_info=True)
         return None
 
-    async def _refresh_phase_from_equity(self) -> None:
+    async def _refresh_phase_from_equity(self) -> float | None:
         """Re-resolve the operating phase using the broker's live equity.
 
         ``Config.get_phase`` caches its first answer; the first call
         happens in ``__init__`` before Alpaca is connected, so the cache
         always pinned MICRO. We reset the cache and re-resolve with
         live equity so per-tick phase-aware accessors match reality.
+
+        Returns the fetched equity (USD) so the caller can reuse it
+        for downstream risk checks without issuing a second REST call.
+        Returns ``None`` if the equity fetch failed or returned a
+        non-positive value.
         """
         equity_usd: float | None = await self._get_account_equity_usd()
         if equity_usd is None or equity_usd <= 0:
-            return
+            return None
 
         prior: Phase | None = getattr(self._config, "_phase", None)
         self._config._phase = None
@@ -1596,6 +1635,7 @@ class TradingBot:
                 "Phase resolved: %s (equity=$%.2f)",
                 new_phase.name, equity_usd,
             )
+        return equity_usd
 
     def _count_open_positions(self) -> int:
         """Count non-closed positions in SQLite."""
