@@ -341,7 +341,16 @@ entry:
   spread_max_us_pct: 0.0005       # 0.05%
   spread_wait_seconds: 120        # Wait up to 2 min for spread to narrow
   spread_recheck_seconds: 15      # Recheck spread every 15 sec
-  entry_timeout_seconds: 300      # Cancel unfilled entry after 5 min
+  # 2026-05-11: extended 300 → 600. Alpaca's get_order_by_id can lag
+  # behind the matching engine by 100s of ms to seconds — a 5-min poll
+  # at boundary can return status='new'/filled_qty=0 for an order that
+  # already filled, causing _maybe_timeout_entry to mark ENTRY_FAILED
+  # and orphan the position. The 10-min window gives Alpaca enough time
+  # to propagate the fill across REST endpoints. Combined with the
+  # _consistency_check_alpaca_position fallback in order_manager, the
+  # bot will also catch any remaining races by treating the Alpaca
+  # position list as the source of truth.
+  entry_timeout_seconds: 600      # Cancel unfilled entry after 10 min
   # Maximum slop above ask (buys) or below bid (sells) for entry limit
   # orders. Prevents thin-spread / pre-market chasing where a strategy's
   # current_price reference may already sit at ask. 0.002 = 0.2%.
