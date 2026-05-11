@@ -759,8 +759,20 @@ class OrderManager:
             # Benign: order may already be filled/cancelled by the time we try.
             logger.debug("Error cancelling order %s (may already be done)", order_id, exc_info=True)
 
-    async def cancel_all_for_ticker(self, ticker: str) -> None:
-        """Cancel all open orders for a ticker."""
+    async def cancel_all_for_ticker(
+        self, ticker: str, *, side_filter: OrderSide | None = None,
+    ) -> None:
+        """Cancel open orders for a ticker.
+
+        Args:
+            ticker: Symbol to scope the cancel to.
+            side_filter: If set, only cancel orders on this side. Used by
+                strategy-exit paths to pass ``OrderSide.SELL`` so an
+                in-flight BUY entry from another strategy on the same
+                ticker isn't collaterally cancelled. Default ``None``
+                preserves the pre-existing all-orders behaviour for
+                emergency-flatten / drain paths.
+        """
         try:
             from alpaca.trading.enums import QueryOrderStatus
             request = GetOrdersRequest(
@@ -771,15 +783,37 @@ class OrderManager:
                 self._gw.client.get_orders,  # type: ignore[arg-type]
                 filter=request,
             )
+            cancelled: int = 0
             for order in orders:
+                if side_filter is not None:
+                    order_side = getattr(order, "side", None)
+                    # OrderSide enum or .value — accept both. Skip on
+                    # mismatch.
+                    order_side_value = (
+                        order_side.value
+                        if hasattr(order_side, "value")
+                        else order_side
+                    )
+                    filter_value = (
+                        side_filter.value
+                        if hasattr(side_filter, "value")
+                        else side_filter
+                    )
+                    if order_side_value != filter_value:
+                        continue
                 try:
                     await asyncio.to_thread(
                         self._gw.client.cancel_order_by_id, str(order.id),
                     )
+                    cancelled += 1
                 except Exception:
                     logger.warning("Error cancelling order for %s", ticker, exc_info=True)
-            if orders:
-                logger.info("Cancelled %d order(s) for %s", len(orders), ticker)
+            if cancelled:
+                logger.info(
+                    "Cancelled %d order(s) for %s%s",
+                    cancelled, ticker,
+                    f" (side={side_filter.value})" if side_filter else "",
+                )
         except Exception:
             logger.exception("Error cancelling orders for %s", ticker)
 
@@ -872,20 +906,23 @@ class OrderManager:
             )
             return None
 
-        if matching_active is not None:
-            for oid in (
-                matching_active.alpaca_stop_order_id,
-                matching_active.alpaca_target_order_id,
-                matching_active.alpaca_trail_order_id,
-            ):
-                if oid is not None:
-                    await self.cancel_order(oid)
-        else:
-            # Recovery / orphan-drain path: no in-memory order tracked
-            # for this ticker (e.g., position predates this process).
-            # Cancel any orphan child orders so the SELL isn't blocked
-            # by reserved qty.
-            await self.cancel_all_for_ticker(ticker)
+        # Cancel ALL open orders for the ticker, not just the locally
+        # tracked bracket legs. Phantom stops (placed by earlier retry
+        # paths and never linked back into the DB) hold the qty as
+        # ``held_for_orders`` on Alpaca and cause the subsequent SELL
+        # to fail with code 40310000 ("insufficient qty available").
+        # Observed 2026-05-08 → 2026-05-11: XLK overnight_drift exit
+        # blocked for 3 trading days by an untracked stop, only cleared
+        # when an emergency-flatten path explicitly canceled all
+        # orders for the symbol. Treat broker as source of truth.
+        #
+        # SELL-side filter: only cancel SELL orders (existing
+        # stops/targets/trailing). If another strategy has an in-flight
+        # BUY entry on the same ticker (allowed by the multi-strategy
+        # framework once breakout/trend_following are re-enabled), we
+        # must not cancel it — only the bracket-leg sells reserve the
+        # qty that's blocking our SELL.
+        await self.cancel_all_for_ticker(ticker, side_filter=OrderSide.SELL)
 
         client: TradingClient = self._gw.client
         try:
@@ -989,16 +1026,13 @@ class OrderManager:
             )
             return None
 
-        if matching_active is not None:
-            for oid in (
-                matching_active.alpaca_stop_order_id,
-                matching_active.alpaca_target_order_id,
-                matching_active.alpaca_trail_order_id,
-            ):
-                if oid is not None:
-                    await self.cancel_order(oid)
-        else:
-            await self.cancel_all_for_ticker(ticker)
+        # Cancel SELL-side orders only for the ticker. Mirrors the
+        # change in place_exit — see that comment for rationale.
+        # Phantom stops not tracked in the local DB will otherwise hold
+        # the qty and reject this LIMIT submission with "insufficient
+        # qty available". The SELL filter protects an in-flight BUY
+        # entry from another strategy on the same ticker.
+        await self.cancel_all_for_ticker(ticker, side_filter=OrderSide.SELL)
 
         # Snapshot the prior status so we can roll back if Alpaca
         # rejects the submission. Without this, a failed submit leaves
