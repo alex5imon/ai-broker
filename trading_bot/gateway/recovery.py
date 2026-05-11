@@ -269,6 +269,31 @@ class StateRecovery:
             self._close_db_position(db_row["id"], "reconciliation_mismatch")
             result.positions_closed_mismatch.append(ticker)
 
+    # NYSE close = 16:00 ET. DAY stop orders expire at the bell, which
+    # means the close-of-day bot tick (cron fires at 20:00 UTC = 16:00 ET)
+    # sees an empty open-orders list for those tickers and would replace
+    # every fractional position's stop. Alpaca then defers the
+    # post-close-submitted stop to the next trading session's pre-market
+    # open (~04:00 ET), where it becomes a phantom that holds the qty
+    # and blocks the next morning's strategy exit (observed 2026-05-08
+    # XLF/XLC, 2026-05-11 09:30 ET overnight_drift exit rejections).
+    #
+    # Skip placing emergency stops once we're inside the close window;
+    # the next session's first tick (09:30 ET) will re-attach a fresh
+    # stop in a window where Alpaca submits it immediately.
+    _STOP_VERIFY_CUTOFF_HHMM: int = 15 * 60 + 55  # 15:55 ET
+
+    def _inside_stop_placement_window(self) -> bool:
+        """Return True when emergency-stop placement is safe.
+
+        Safe = inside NYSE regular hours with at least ~5 min of buffer
+        before the close. Outside that window we defer to the next
+        session — see _STOP_VERIFY_CUTOFF_HHMM rationale.
+        """
+        now_et: datetime = self._now_fn()
+        hhmm: int = now_et.hour * 60 + now_et.minute
+        return 9 * 60 + 30 <= hhmm < self._STOP_VERIFY_CUTOFF_HHMM
+
     async def _verify_stop_orders(
         self,
         alpaca_positions: list[AlpacaPosition],
@@ -276,6 +301,11 @@ class StateRecovery:
         result: RecoveryResult,
     ) -> None:
         """Ensure every open position has an active stop-loss order."""
+        if not self._inside_stop_placement_window():
+            # Outside the safe window — defer. Don't even iterate, so
+            # the run summary doesn't report "would have placed X stops".
+            return
+
         tickers_with_stops: set[str] = set()
         for order in alpaca_orders:
             if order.type and order.type.value in ("stop", "trailing_stop"):
