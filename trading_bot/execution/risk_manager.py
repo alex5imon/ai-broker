@@ -542,12 +542,24 @@ class RiskManager:
         return self._trade_count >= max_trades
 
     def check_drawdown_breaker(self, account_equity_usd: float) -> bool:
-        """Return ``True`` if 5-day rolling drawdown exceeds 5% from peak.
+        """Return ``True`` only on the *activation* tick.
 
         Reads the last N days of equity from ``daily_summaries`` to find
         the rolling peak.  If the breaker fires, it pauses trading for
         one day and activates the recovery-size regime.
+
+        Idempotency: returns ``False`` immediately when
+        ``_drawdown_breaker_active`` is already set (loaded from
+        ``risk_circuit_state`` at the start of each tick). Without this
+        guard, every subsequent tick while equity stayed below the
+        watermark would re-fire ``handle_drawdown_breaker_flatten`` and
+        retry ``close_all_positions`` against Alpaca — harmless when
+        positions are already flat, but a race risk if a new entry
+        order is in flight on the same tick.
         """
+        if self._drawdown_breaker_active:
+            return False
+
         rolling_days: int = self._config.drawdown_breaker_rolling_days
         threshold_pct: float = self._config.drawdown_breaker_threshold
 

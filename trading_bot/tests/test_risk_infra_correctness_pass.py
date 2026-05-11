@@ -182,6 +182,50 @@ async def test_handle_drawdown_breaker_flatten_swallows_alpaca_failure(
     gateway.client.close_all_positions.assert_called_once()
 
 
+def test_check_drawdown_breaker_is_idempotent(
+    config: Config, tmp_db_path: str, mock_notifier,
+) -> None:
+    """Activation tick returns True; every subsequent tick while the
+    breaker remains active must return False so we don't re-fire
+    ``handle_drawdown_breaker_flatten`` and pummel Alpaca's
+    ``close_all_positions`` endpoint every 5 minutes. /python-review
+    catch on PR #93."""
+    import sqlite3
+    from datetime import date, timedelta
+    from unittest.mock import patch
+
+    rm = RiskManager(config, tmp_db_path, mock_notifier)
+
+    # Seed 5 days of equity at $1000 so a $940 read is a 6% drawdown.
+    conn = sqlite3.connect(tmp_db_path)
+    today = date.today()
+    for i in range(5):
+        d = (today - timedelta(days=i + 1)).isoformat()
+        conn.execute(
+            "INSERT OR REPLACE INTO daily_summaries "
+            "(date, account_equity_usd, phase) VALUES (?, ?, 1)",
+            (d, 1000.0),
+        )
+    conn.commit()
+    conn.close()
+
+    def _swallow(coro: object) -> None:
+        if hasattr(coro, "close"):
+            coro.close()  # type: ignore[union-attr]
+
+    with patch("asyncio.ensure_future", _swallow):
+        first = rm.check_drawdown_breaker(940.0)
+        # Equity remains below the watermark on the next tick — but the
+        # breaker is already active so the check must short-circuit.
+        second = rm.check_drawdown_breaker(940.0)
+        third = rm.check_drawdown_breaker(940.0)
+
+    assert first is True, "activation tick must return True"
+    assert second is False, "subsequent ticks must NOT re-fire the breaker"
+    assert third is False
+    assert rm._drawdown_breaker_active is True
+
+
 def test_check_drawdown_breaker_is_wired_into_main_entry_path() -> None:
     """Before this pass, ``check_drawdown_breaker`` was defined but never
     called from production — only tests. The breaker could not trip.
