@@ -778,3 +778,77 @@ class TestOrphanAttributionRecovery:
         # Second pass: no new healing work to do — the original orphan
         # is now CLOSED and there's no remaining unknown POSITION_OPEN.
         assert second.orphans_healed == []
+
+    @pytest.mark.asyncio
+    async def test_heal_unknown_orphans_atomic_under_double_claim(
+        self, tmp_db_path: str, mock_notifier
+    ):
+        """Regression for SELECT-then-UPDATE race in _heal_unknown_orphans.
+
+        The earlier implementation used a SELECT to find an orphan/
+        ENTRY_FAILED pair then a separate UPDATE inside `with conn:`.
+        Two concurrent ticks could both observe the same pair and both
+        attempt the merge, inflating the heal count and (worse) producing
+        a second POSITION_OPEN row from the same broker holding if the
+        ENTRY_FAILED row was already promoted.
+
+        With the atomic single-UPDATE-with-rowcount-check, the second
+        attempt must report no healing and the DB must reflect exactly
+        ONE POSITION_OPEN row for the ticker.
+        """
+        conn = sqlite3.connect(tmp_db_path)
+        failed_id = _insert_entry_failed(
+            conn, "XLK", qty=0.3927, entry_price=177.438,
+            strategy_id="overnight_drift", minutes_ago=15,
+        )
+        orphan_id = _insert_unknown_orphan(
+            conn, "XLK", qty=0.3927, entry_price=177.438, minutes_ago=10,
+        )
+        conn.close()
+
+        pos = _alpaca_position("XLK", qty=0.3927, avg_entry_price=177.438)
+        gw = self._make_gateway(positions=[pos])
+
+        # Simulate two ticks racing against the same state by building
+        # two recovery instances against the same DB path and calling
+        # _heal_unknown_orphans directly twice in sequence. The atomic
+        # UPDATE in the second call must observe status != ENTRY_FAILED
+        # and report no heal.
+        from trading_bot.gateway.recovery import RecoveryResult
+        recovery_a = _make_recovery(gw, tmp_db_path, mock_notifier)
+        recovery_b = _make_recovery(gw, tmp_db_path, mock_notifier)
+
+        result_a = RecoveryResult()
+        result_b = RecoveryResult()
+        recovery_a._heal_unknown_orphans(result_a)
+        recovery_b._heal_unknown_orphans(result_b)
+
+        # First call did the work; second saw a clean DB.
+        assert len(result_a.orphans_healed) == 1
+        assert result_b.orphans_healed == []
+
+        # End-state must have exactly ONE POSITION_OPEN row for XLK —
+        # the promoted ENTRY_FAILED row — and the original orphan must
+        # be CLOSED. No duplicate POSITION_OPEN.
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            rows = conn.execute(
+                "SELECT id, status, strategy_id FROM positions "
+                "WHERE ticker = 'XLK' ORDER BY id"
+            ).fetchall()
+        finally:
+            conn.close()
+        open_rows = [r for r in rows if r[1] == "POSITION_OPEN"]
+        assert len(open_rows) == 1, (
+            f"expected exactly 1 POSITION_OPEN after double-heal, "
+            f"got {len(open_rows)} rows: {rows}"
+        )
+        assert open_rows[0][0] == failed_id
+        assert open_rows[0][2] == "overnight_drift"
+        # Original orphan must be CLOSED.
+        closed_orphan = [
+            r for r in rows if r[0] == orphan_id and r[1] == "CLOSED"
+        ]
+        assert closed_orphan, (
+            f"orphan #{orphan_id} must be CLOSED after heal, got {rows}"
+        )

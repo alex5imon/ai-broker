@@ -593,36 +593,86 @@ class StateRecovery:
             healed: list[str] = []
             now: str = datetime.now(tz=ET).isoformat()
             for orphan in orphans:
-                match = conn.execute(
-                    "SELECT id, strategy_id FROM positions "
-                    "WHERE status = 'ENTRY_FAILED' AND ticker = ? "
-                    "AND ABS(quantity - ?) < 1e-6 "
-                    "AND ABS(entry_price - ?) <= ? "
-                    "AND entry_time >= ? "
-                    "AND strategy_id IS NOT NULL AND strategy_id != 'unknown' "
-                    "ORDER BY entry_time DESC LIMIT 1",
-                    (
-                        orphan["ticker"],
-                        float(orphan["quantity"]),
-                        float(orphan["entry_price"]),
-                        self._ORPHAN_REATTRIBUTION_PRICE_TOL,
-                        cutoff,
-                    ),
-                ).fetchone()
-                if match is None:
-                    continue
-                canonical_id: int = int(match["id"])
                 orphan_id: int = int(orphan["id"])
-                strategy_id: str = str(match["strategy_id"])
-                # Promote ENTRY_FAILED → POSITION_OPEN, close the orphan.
-                # Single transaction so we don't end up with two open
-                # rows or two failed rows for the same broker holding.
+                # Atomic claim: promote a matching ENTRY_FAILED row to
+                # POSITION_OPEN in a single UPDATE that selects on the
+                # match predicates. If another tick has already claimed
+                # the same ENTRY_FAILED row (status no longer matches),
+                # rowcount = 0 and we skip without producing a duplicate
+                # heal. Without this, the SELECT-then-UPDATE pattern had
+                # a race window where two ticks could both observe the
+                # ENTRY_FAILED row and both attempt to promote it /
+                # close the orphan, inflating the heal count.
                 with conn:
-                    conn.execute(
-                        "UPDATE positions SET status = 'POSITION_OPEN', "
-                        "updated_at = ? WHERE id = ?",
-                        (now, canonical_id),
+                    cur = conn.execute(
+                        "UPDATE positions "
+                        "SET status = 'POSITION_OPEN', updated_at = ? "
+                        "WHERE status = 'ENTRY_FAILED' AND ticker = ? "
+                        "AND ABS(quantity - ?) < 1e-6 "
+                        "AND ABS(entry_price - ?) <= ? "
+                        "AND entry_time >= ? "
+                        "AND strategy_id IS NOT NULL AND strategy_id != 'unknown' "
+                        "AND id = ("
+                        "    SELECT id FROM positions "
+                        "    WHERE status = 'ENTRY_FAILED' AND ticker = ? "
+                        "    AND ABS(quantity - ?) < 1e-6 "
+                        "    AND ABS(entry_price - ?) <= ? "
+                        "    AND entry_time >= ? "
+                        "    AND strategy_id IS NOT NULL AND strategy_id != 'unknown' "
+                        "    ORDER BY entry_time DESC LIMIT 1"
+                        ")",
+                        (
+                            now,
+                            orphan["ticker"],
+                            float(orphan["quantity"]),
+                            float(orphan["entry_price"]),
+                            self._ORPHAN_REATTRIBUTION_PRICE_TOL,
+                            cutoff,
+                            orphan["ticker"],
+                            float(orphan["quantity"]),
+                            float(orphan["entry_price"]),
+                            self._ORPHAN_REATTRIBUTION_PRICE_TOL,
+                            cutoff,
+                        ),
                     )
+                    if cur.rowcount == 0:
+                        # No matching ENTRY_FAILED row (or another tick
+                        # claimed it first). Leave the orphan alone.
+                        continue
+                    # Look up the row we just promoted so we can record
+                    # the canonical id + strategy in the heal summary.
+                    promoted = conn.execute(
+                        "SELECT id, strategy_id FROM positions "
+                        "WHERE ticker = ? AND status = 'POSITION_OPEN' "
+                        "AND ABS(quantity - ?) < 1e-6 "
+                        "AND ABS(entry_price - ?) <= ? "
+                        "AND id != ? "
+                        "AND updated_at = ? "
+                        "ORDER BY id DESC LIMIT 1",
+                        (
+                            orphan["ticker"],
+                            float(orphan["quantity"]),
+                            float(orphan["entry_price"]),
+                            self._ORPHAN_REATTRIBUTION_PRICE_TOL,
+                            orphan_id,
+                            now,
+                        ),
+                    ).fetchone()
+                    if promoted is None:
+                        # Promotion happened but lookup didn't find it
+                        # (extremely unlikely — would indicate concurrent
+                        # mutation). Log and bail without closing the
+                        # orphan, to avoid leaving an open Alpaca holding
+                        # with no DB row.
+                        logger.error(
+                            "Healed orphan attribution: %s promoted but "
+                            "canonical row lookup failed; not closing "
+                            "orphan #%d.",
+                            orphan["ticker"], orphan_id,
+                        )
+                        continue
+                    canonical_id = int(promoted["id"])
+                    strategy_id = str(promoted["strategy_id"])
                     conn.execute(
                         "UPDATE positions SET status = 'CLOSED', "
                         "updated_at = ? WHERE id = ?",
@@ -676,25 +726,54 @@ class StateRecovery:
         cutoff: str = (
             datetime.now(tz=ET) - timedelta(minutes=self._ORPHAN_REATTRIBUTION_WINDOW_MIN)
         ).isoformat()
+        # Atomic claim: single UPDATE filtered on the match predicates,
+        # with rowcount = 0 signalling "nothing to merge". This collapses
+        # the previous SELECT-then-UPDATE pair into a single statement
+        # so two concurrent ticks can't both observe the ENTRY_FAILED
+        # row and both promote it (the second tick's UPDATE would see
+        # status no longer matching 'ENTRY_FAILED' and report 0 rows).
+        with conn:
+            cur = conn.execute(
+                "UPDATE positions "
+                "SET status = 'POSITION_OPEN', updated_at = ? "
+                "WHERE ticker = ? AND status = 'ENTRY_FAILED' "
+                "AND ABS(quantity - ?) < 1e-6 "
+                "AND ABS(entry_price - ?) <= ? "
+                "AND entry_time >= ? "
+                "AND id = ("
+                "    SELECT id FROM positions "
+                "    WHERE ticker = ? AND status = 'ENTRY_FAILED' "
+                "    AND ABS(quantity - ?) < 1e-6 "
+                "    AND ABS(entry_price - ?) <= ? "
+                "    AND entry_time >= ? "
+                "    ORDER BY entry_time DESC LIMIT 1"
+                ")",
+                (
+                    now_iso,
+                    ticker, qty, avg_cost,
+                    self._ORPHAN_REATTRIBUTION_PRICE_TOL, cutoff,
+                    ticker, qty, avg_cost,
+                    self._ORPHAN_REATTRIBUTION_PRICE_TOL, cutoff,
+                ),
+            )
+            if cur.rowcount == 0:
+                return False
+        # Best-effort strategy_id lookup for the log line. The match
+        # criteria are tight enough that the row we just promoted is the
+        # only one fitting the description with updated_at = now_iso.
         row = conn.execute(
-            "SELECT id, strategy_id, quantity, entry_price FROM positions "
-            "WHERE ticker = ? AND status = 'ENTRY_FAILED' "
+            "SELECT id, strategy_id FROM positions "
+            "WHERE ticker = ? AND status = 'POSITION_OPEN' "
             "AND ABS(quantity - ?) < 1e-6 "
             "AND ABS(entry_price - ?) <= ? "
-            "AND entry_time >= ? "
-            "ORDER BY entry_time DESC LIMIT 1",
-            (ticker, qty, avg_cost, self._ORPHAN_REATTRIBUTION_PRICE_TOL, cutoff),
+            "AND updated_at = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (ticker, qty, avg_cost, self._ORPHAN_REATTRIBUTION_PRICE_TOL, now_iso),
         ).fetchone()
-        if row is None:
-            return False
-        row_id: int = int(row[0])
-        strategy_id: str = str(row[1]) if row[1] is not None else "unknown"
-        conn.execute(
-            "UPDATE positions SET status = 'POSITION_OPEN', updated_at = ? "
-            "WHERE id = ?",
-            (now_iso, row_id),
+        row_id: int = int(row[0]) if row is not None else -1
+        strategy_id: str = (
+            str(row[1]) if row is not None and row[1] is not None else "unknown"
         )
-        conn.commit()
         logger.warning(
             "Reattributed Alpaca position %s (qty=%.6f, price=%.4f) to "
             "ENTRY_FAILED row #%d (strategy=%s) — entry filled at broker "
