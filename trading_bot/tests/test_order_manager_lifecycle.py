@@ -1641,3 +1641,56 @@ class TestStrategyExitFillCallback:
         assert sid == "mean_reversion"
         assert qty == 10.0
         assert pnl == pytest.approx(-6.0, rel=1e-6)  # (99.40 - 100) * 10
+
+
+# ---------------------------------------------------------------------------
+# _coerce_broker_qty — defensive coercion helper for the timeout fallback
+# ---------------------------------------------------------------------------
+
+
+class TestCoerceBrokerQty:
+    """Locks in the strict-type contract for the broker-position fallback.
+
+    The helper is the gatekeeper between Alpaca position fields and the
+    promote-to-open path in _maybe_timeout_entry. Loose coercion here
+    would cause silent miscategorisation of a held position vs no
+    position, which directly affects whether a row becomes
+    POSITION_OPEN or ENTRY_FAILED.
+    """
+
+    def test_accepts_alpaca_string_qty(self) -> None:
+        from trading_bot.execution.order_manager import _coerce_broker_qty
+        assert _coerce_broker_qty("0.3927") == pytest.approx(0.3927)
+        assert _coerce_broker_qty("100") == 100.0
+
+    def test_accepts_int_and_float(self) -> None:
+        from trading_bot.execution.order_manager import _coerce_broker_qty
+        assert _coerce_broker_qty(10) == 10.0
+        assert _coerce_broker_qty(3.5) == 3.5
+
+    def test_rejects_none(self) -> None:
+        from trading_bot.execution.order_manager import _coerce_broker_qty
+        assert _coerce_broker_qty(None) is None
+
+    def test_rejects_bool(self) -> None:
+        """bool is a subclass of int — explicit reject so float(True)==1.0
+        can't silently look like a 1-share position."""
+        from trading_bot.execution.order_manager import _coerce_broker_qty
+        assert _coerce_broker_qty(True) is None
+        assert _coerce_broker_qty(False) is None
+
+    def test_rejects_magicmock(self) -> None:
+        """Defends against test gateways that auto-mock the qty attribute.
+        Without this guard, float(MagicMock()) returns 1.0 and the
+        timeout-fallback path would falsely report a held position."""
+        from trading_bot.execution.order_manager import _coerce_broker_qty
+        assert _coerce_broker_qty(MagicMock()) is None
+
+    def test_rejects_empty_string(self) -> None:
+        from trading_bot.execution.order_manager import _coerce_broker_qty
+        assert _coerce_broker_qty("") is None
+        assert _coerce_broker_qty("   ") is None
+
+    def test_rejects_garbage_string(self) -> None:
+        from trading_bot.execution.order_manager import _coerce_broker_qty
+        assert _coerce_broker_qty("not-a-number") is None

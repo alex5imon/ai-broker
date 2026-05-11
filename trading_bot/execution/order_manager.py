@@ -60,14 +60,34 @@ ET: ZoneInfo = TZ_EASTERN
 def _coerce_broker_qty(value: Any) -> float | None:
     """Coerce an Alpaca position field to float, or return None.
 
-    Alpaca returns qty/avg_entry_price as strings ("0.3927", "177.438").
-    A defensive coercion: only accept str/int/float so the call site
-    is immune to test gateways that auto-mock attributes with
-    MagicMock objects (which would otherwise yield ``float(MagicMock)
-    == 1.0`` and trick the consistency check into reporting a held
-    position that doesn't exist).
+    Alpaca returns ``qty`` / ``avg_entry_price`` as strings
+    ("0.3927", "177.438") via Pydantic-defined ``Optional[str]``
+    fields. A defensive coercion: only accept ``str``/``int``/``float``
+    so the call site is immune to:
+
+    1. **MagicMock auto-attrs in tests.** ``float(MagicMock())`` returns
+       1.0, which would otherwise trick the timeout-fallback consistency
+       check in ``_maybe_timeout_entry`` into reporting a held position
+       that doesn't exist. The strict isinstance check forces tests to
+       set string values explicitly (matching production SDK behavior).
+    2. **``bool``-as-``int`` aliasing.** ``isinstance(True, int)`` is
+       True in Python, so a stray ``True`` would pass and
+       ``float(True) == 1.0`` — wrong for a position quantity. Listing
+       the types explicitly and excluding bool via a guard isn't done
+       directly here, but the SDK contract guarantees str, not bool, so
+       the isinstance check is sufficient — IF the SDK ever changed to
+       return bool we'd want to know rather than silently coerce.
+
+    ``decimal.Decimal`` is rejected because alpaca-py's release-pinned
+    Pydantic model defines these fields as ``str`` and never produces
+    Decimal. If that changes we want a None return + explicit log over
+    silent type-coercion that could lose precision.
     """
     if value is None:
+        return None
+    # `bool` is a subclass of `int`; reject explicitly because
+    # `float(True) == 1.0` would silently look like a 1-share position.
+    if isinstance(value, bool):
         return None
     if not isinstance(value, (str, int, float)):
         return None
