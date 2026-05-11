@@ -25,7 +25,7 @@ import logging
 import os
 import time
 from datetime import date, datetime, timedelta
-from typing import Any
+from typing import Any, NamedTuple
 
 import pandas as pd
 
@@ -38,6 +38,23 @@ from trading_bot.constants import TZ_EASTERN, TZ_UTC
 from trading_bot.data_cache import load_cached, save_to_cache
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+class DailyHistoryResult(NamedTuple):
+    """Outcome of a :func:`download_daily_history` call.
+
+    ``missed`` counts target trading days that were requested but produced
+    an empty slice (typically: the target predates Alpaca's available
+    history for the ticker, or the API returned no bars covering it).
+    Callers should surface a non-zero ``missed`` count loudly — a missed
+    day means the cache is incomplete, which is exactly the failure mode
+    this helper exists to prevent.
+    """
+
+    written: int
+    skipped: int
+    missed: int
+    requests_made: int
 
 
 def _get_trading_days(start: date, end: date, config: Config) -> list[date]:
@@ -187,7 +204,7 @@ async def download_daily_history(
     config: Config,
     lookback_days: int = 120,
     feed: str = "iex",
-) -> tuple[int, int, int]:
+) -> DailyHistoryResult:
     """Download a full daily history and emit one cached parquet per trading day.
 
     Fetches a single Alpaca daily-bars request covering
@@ -196,12 +213,12 @@ async def download_daily_history(
     the last ``lookback_days`` trading-day bars ending on ``D``. Days that
     already have a cached file are skipped (idempotent).
 
-    Returns ``(written, skipped, requests_made)`` so callers can update
-    progress counters and rate-limit windows.
+    Returns a :class:`DailyHistoryResult` so callers can update progress
+    counters, rate-limit windows, and surface coverage gaps.
     """
     trading_days: list[date] = _get_trading_days(from_date, to_date, config)
     if not trading_days:
-        return 0, 0, 0
+        return DailyHistoryResult(0, 0, 0, 0)
 
     targets: list[date] = [
         d for d in trading_days if load_cached(ticker, d, "daily") is None
@@ -211,7 +228,7 @@ async def download_daily_history(
         logger.debug(
             "All %d daily files already cached for %s", len(trading_days), ticker,
         )
-        return 0, skipped, 0
+        return DailyHistoryResult(0, skipped, 0, 0)
 
     # Fetch enough calendar days to cover ``lookback_days`` trading days plus
     # holidays/weekends. ``lookback_days * 1.5 + 30`` is generous; the cost is
@@ -225,6 +242,9 @@ async def download_daily_history(
         23, 59, 59, tzinfo=TZ_UTC,
     )
 
+    # Narrow try/except around the API call so transient network/auth errors
+    # are absorbed but structural surprises (e.g. response shape mismatch)
+    # surface to the caller instead of being conflated with "0 bars".
     try:
         from alpaca.data.enums import DataFeed, Adjustment
         feed_enum = DataFeed.IEX if feed.lower() == "iex" else DataFeed.SIP
@@ -238,41 +258,72 @@ async def download_daily_history(
             adjustment=Adjustment.ALL,
         )
         response = client.get_stock_bars(request)
-        bars = response.data.get(ticker, [])
     except Exception:
         logger.exception(
             "Failed to download daily history for %s (%s to %s)",
             ticker, request_start.date(), request_end.date(),
         )
-        return 0, skipped, 1
+        return DailyHistoryResult(0, skipped, len(targets), 1)
+
+    # The Alpaca SDK return type is union'd with ``dict[str, Any]`` (hence the
+    # standing mypy ``union-attr`` warning at other call sites). A dict-shaped
+    # response is a structural surprise — surface it rather than swallow it.
+    raw_data: Any = getattr(response, "data", None)
+    if raw_data is None:
+        if isinstance(response, dict):
+            raw_data = response
+        else:
+            logger.error(
+                "Unexpected Alpaca response shape for %s: %s — treating as empty",
+                ticker, type(response).__name__,
+            )
+            return DailyHistoryResult(0, skipped, len(targets), 1)
+    bars: list = list(raw_data.get(ticker, []))
 
     if not bars:
         logger.warning(
-            "Empty daily history for %s (%s to %s)",
-            ticker, request_start.date(), request_end.date(),
+            "Empty daily history for %s (%s to %s) — %d target days unwritten",
+            ticker, request_start.date(), request_end.date(), len(targets),
         )
-        return 0, skipped, 1
+        return DailyHistoryResult(0, skipped, len(targets), 1)
 
     df_full: pd.DataFrame = _bars_to_df(bars)
     # Per-bar trading day, tz-normalised to UTC date for inclusive comparison.
     bar_dates = df_full.index.tz_convert(TZ_UTC).date
 
     written: int = 0
+    missed: int = 0
     for d in targets:
         mask = bar_dates <= d
         df_slice: pd.DataFrame = df_full.loc[mask]
         if df_slice.empty:
+            # Target predates Alpaca's history for this ticker — silent skip
+            # here is exactly the failure mode this PR is meant to prevent.
+            logger.warning(
+                "No daily bars at-or-before %s for %s — file not written "
+                "(check ticker history start vs from_date - buffer=%s)",
+                d.isoformat(), ticker, request_start.date().isoformat(),
+            )
+            missed += 1
             continue
+        if len(df_slice) < lookback_days:
+            logger.debug(
+                "Truncated lookback for %s @ %s: %d/%d bars (likely near "
+                "Alpaca data-availability boundary)",
+                ticker, d.isoformat(), len(df_slice), lookback_days,
+            )
         if len(df_slice) > lookback_days:
             df_slice = df_slice.iloc[-lookback_days:]
         save_to_cache(ticker, d, "daily", df_slice)
         written += 1
 
-    logger.info(
-        "Daily history for %s: %d written, %d skipped (cached) — 1 API request",
-        ticker, written, skipped,
+    log = logger.warning if missed else logger.info
+    log(
+        "Daily history for %s: %d written, %d skipped (cached), "
+        "%d missed (no coverage) — 1 API request",
+        ticker, written, skipped, missed,
     )
-    return written, skipped, 1
+    return DailyHistoryResult(written, skipped, missed, 1)
 
 
 async def download_all(
@@ -311,21 +362,34 @@ async def download_all(
     )
 
     stats: dict[str, int] = {"cached": 0, "downloaded": 0, "empty": 0, "error": 0}
+    if full_daily_history:
+        stats.update({"daily_written": 0, "daily_skipped": 0, "daily_missed": 0})
     request_count: int = 0
     window_start: float = time.monotonic()
 
-    stats.setdefault("daily_written", 0)
-    stats.setdefault("daily_skipped", 0)
+    async def _respect_rate_limit() -> None:
+        """Pause if we've sent ``rate_limit_per_min`` requests this window."""
+        nonlocal request_count, window_start
+        if request_count >= rate_limit_per_min:
+            elapsed: float = time.monotonic() - window_start
+            if elapsed < 60:
+                wait: float = 60 - elapsed + 1
+                logger.info("Rate limit: waiting %.0fs...", wait)
+                await asyncio.sleep(wait)
+            request_count = 0
+            window_start = time.monotonic()
 
     for ticker in tickers:
         if full_daily_history:
-            written, skipped, reqs = await download_daily_history(
+            await _respect_rate_limit()
+            result: DailyHistoryResult = await download_daily_history(
                 client, ticker, from_date, to_date, config,
                 lookback_days=120, feed=feed,
             )
-            stats["daily_written"] += written
-            stats["daily_skipped"] += skipped
-            request_count += reqs
+            stats["daily_written"] += result.written
+            stats["daily_skipped"] += result.skipped
+            stats["daily_missed"] += result.missed
+            request_count += result.requests_made
         else:
             # Legacy single-file path: one daily parquet per ticker, anchored
             # on ``to_date`` with 120-day lookback. Sufficient for the live
@@ -338,16 +402,7 @@ async def download_all(
                 request_count += 1
 
         for day in trading_days:
-            # Rate limiting
-            if request_count >= rate_limit_per_min:
-                elapsed: float = time.monotonic() - window_start
-                if elapsed < 60:
-                    wait: float = 60 - elapsed + 1
-                    logger.info("Rate limit: waiting %.0fs...", wait)
-                    await asyncio.sleep(wait)
-                request_count = 0
-                window_start = time.monotonic()
-
+            await _respect_rate_limit()
             _, status = await download_ticker_day(client, ticker, day, feed=feed)
             stats[status] = stats.get(status, 0) + 1
             if status == "downloaded":
@@ -360,9 +415,21 @@ async def download_all(
                     stats["empty"], stats["error"],
                 )
 
+    if stats.get("daily_missed"):
+        logger.warning(
+            "Download complete with %d missed daily targets — cache may be "
+            "incomplete; see prior warnings for affected (ticker, date) pairs.",
+            stats["daily_missed"],
+        )
     logger.info(
-        "Download complete: cached=%d downloaded=%d empty=%d error=%d",
+        "Download complete: cached=%d downloaded=%d empty=%d error=%d%s",
         stats["cached"], stats["downloaded"], stats["empty"], stats["error"],
+        (
+            f" daily_written={stats['daily_written']} "
+            f"daily_skipped={stats['daily_skipped']} "
+            f"daily_missed={stats['daily_missed']}"
+            if full_daily_history else ""
+        ),
     )
     return stats
 
