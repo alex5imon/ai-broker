@@ -657,18 +657,28 @@ class TestCancelFlatten:
 
 class TestPlaceExit:
     @pytest.mark.asyncio
-    async def test_place_exit_cancels_bracket_legs_and_submits_market_sell(
+    async def test_place_exit_cancels_all_open_orders_including_phantom_stops(
         self, config, tmp_db_path: str, mock_notifier,
     ):
+        """Regression for 2026-05-11 XLK/XLF stuck-overnight bug.
+
+        ``place_exit`` must cancel ALL open orders for the ticker, not
+        just the locally-tracked bracket legs. When earlier retry paths
+        place additional stops that aren't linked back into the DB,
+        those phantom stops still hold the qty as ``held_for_orders``
+        on Alpaca and cause the subsequent SELL to be rejected
+        (Alpaca code 40310000 "insufficient qty available").
+
+        See: trading_bot/execution/order_manager.py#place_exit.
+        """
         om = _make_om(config, tmp_db_path, mock_notifier)
-        # Track an in-flight position with both bracket legs known.
         active = _ActiveOrder(
             trade_id=1,
             ticker="SPY",
             exchange="US",
             alpaca_entry_order_id="entry-1",
-            alpaca_stop_order_id="stop-1",
-            alpaca_target_order_id="target-1",
+            alpaca_stop_order_id="stop-1",  # locally tracked
+            alpaca_target_order_id="target-1",  # locally tracked
             status=PositionStatus.STOP_AND_TARGET_ACTIVE,
             entry_shares=10.0,
             filled_shares=10.0,
@@ -679,6 +689,19 @@ class TestPlaceExit:
             strategy_id="mean_reversion",
         )
         om._active_orders[1] = active
+
+        # Alpaca reports three OPEN orders for SPY: the tracked bracket
+        # legs PLUS a phantom stop the local DB doesn't know about.
+        def _mk_open(oid: str) -> Any:
+            o = MagicMock()
+            o.id = oid
+            return o
+
+        om._gw.client.get_orders = MagicMock(return_value=[
+            _mk_open("stop-1"),
+            _mk_open("target-1"),
+            _mk_open("phantom-stop-from-retry"),
+        ])
 
         cancel_calls: list[str] = []
         om._gw.client.cancel_order_by_id = MagicMock(
@@ -698,10 +721,14 @@ class TestPlaceExit:
             ticker="SPY", qty=10, reason="rsi_normalized",
         )
         assert order_id == "exit-1"
-        # Both bracket legs cancelled before the new market order
+        # All three open orders cancelled — including the phantom stop
         assert "stop-1" in cancel_calls
         assert "target-1" in cancel_calls
-        # Market sell submitted
+        assert "phantom-stop-from-retry" in cancel_calls, (
+            "phantom stop not in DB must still be cancelled — Alpaca is "
+            "the source of truth for what's holding the qty"
+        )
+        # Market sell submitted exactly once after the cancels
         assert len(submit_orders) == 1
         # New order id mapped to the original trade id
         assert om._alpaca_to_trade.get("exit-1") == 1
@@ -1275,6 +1302,61 @@ class TestPlaceLimitExit:
             ticker="SPY", qty=0, limit_price=100.0, reason="bug",
         )
         assert order_id is None
+
+    @pytest.mark.asyncio
+    async def test_place_limit_exit_cancels_phantom_stops(
+        self, config, tmp_db_path: str, mock_notifier
+    ):
+        """Mirror of place_exit phantom-stop regression. The TAKE_PROFIT
+        path is what finally cleared XLK on 2026-05-11 because the
+        emergency-flatten fallback called cancel_all_for_ticker. With
+        this fix the limit path itself cancels all open orders, so the
+        fallback shouldn't be needed.
+        """
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        active = _ActiveOrder(
+            trade_id=1,
+            ticker="SPY",
+            exchange="US",
+            alpaca_entry_order_id="entry-1",
+            alpaca_stop_order_id="stop-1",  # locally tracked
+            status=PositionStatus.STOP_AND_TARGET_ACTIVE,
+            entry_shares=10.0,
+            filled_shares=10.0,
+            entry_price=100.0,
+            stop_price=98.0,
+            target_price=104.0,
+            hold_type="intraday",
+            strategy_id="mean_reversion",
+        )
+        om._active_orders[1] = active
+
+        def _mk_open(oid: str) -> Any:
+            o = MagicMock()
+            o.id = oid
+            return o
+
+        om._gw.client.get_orders = MagicMock(return_value=[
+            _mk_open("stop-1"),
+            _mk_open("phantom-stop-from-retry"),
+        ])
+        cancel_calls: list[str] = []
+        om._gw.client.cancel_order_by_id = MagicMock(
+            side_effect=lambda oid: cancel_calls.append(oid),
+        )
+        om._gw.client.submit_order = MagicMock(
+            return_value=_alpaca_order("limit-exit-2", status="new"),
+        )
+
+        order_id = await om.place_limit_exit(
+            ticker="SPY", qty=10, limit_price=104.5, reason="take_profit",
+        )
+        assert order_id == "limit-exit-2"
+        assert "stop-1" in cancel_calls
+        assert "phantom-stop-from-retry" in cancel_calls, (
+            "limit-exit path must also cancel untracked stops so the "
+            "SELL isn't rejected with insufficient-qty"
+        )
 
 
 # ---------------------------------------------------------------------------

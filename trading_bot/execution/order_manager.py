@@ -872,20 +872,16 @@ class OrderManager:
             )
             return None
 
-        if matching_active is not None:
-            for oid in (
-                matching_active.alpaca_stop_order_id,
-                matching_active.alpaca_target_order_id,
-                matching_active.alpaca_trail_order_id,
-            ):
-                if oid is not None:
-                    await self.cancel_order(oid)
-        else:
-            # Recovery / orphan-drain path: no in-memory order tracked
-            # for this ticker (e.g., position predates this process).
-            # Cancel any orphan child orders so the SELL isn't blocked
-            # by reserved qty.
-            await self.cancel_all_for_ticker(ticker)
+        # Cancel ALL open orders for the ticker, not just the locally
+        # tracked bracket legs. Phantom stops (placed by earlier retry
+        # paths and never linked back into the DB) hold the qty as
+        # ``held_for_orders`` on Alpaca and cause the subsequent SELL
+        # to fail with code 40310000 ("insufficient qty available").
+        # Observed 2026-05-08 → 2026-05-11: XLK overnight_drift exit
+        # blocked for 3 trading days by an untracked stop, only cleared
+        # when an emergency-flatten path explicitly canceled all
+        # orders for the symbol. Treat broker as source of truth.
+        await self.cancel_all_for_ticker(ticker)
 
         client: TradingClient = self._gw.client
         try:
@@ -989,16 +985,11 @@ class OrderManager:
             )
             return None
 
-        if matching_active is not None:
-            for oid in (
-                matching_active.alpaca_stop_order_id,
-                matching_active.alpaca_target_order_id,
-                matching_active.alpaca_trail_order_id,
-            ):
-                if oid is not None:
-                    await self.cancel_order(oid)
-        else:
-            await self.cancel_all_for_ticker(ticker)
+        # Cancel ALL open orders for the ticker. Mirrors the change in
+        # place_exit — see that comment for rationale. Phantom stops not
+        # tracked in the local DB will otherwise hold the qty and reject
+        # this LIMIT submission with "insufficient qty available".
+        await self.cancel_all_for_ticker(ticker)
 
         # Snapshot the prior status so we can roll back if Alpaca
         # rejects the submission. Without this, a failed submit leaves
