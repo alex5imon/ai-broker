@@ -122,6 +122,24 @@ close (via `.github/workflows/daily-review.yml`, 21:30 UTC weekdays). It:
 
 - `ALPACA_ENV` — defaults to `paper`. Set to `live` to flip to live trading. The workflow selects the matching key pair automatically.
 
+## Merge protocol
+
+`main` is protected by a ruleset (`name: master`) that enforces:
+
+- All changes via PR — no direct pushes
+- `static-checks` AND `coverage` must report `success` before the merge button enables
+- No force-pushes, no branch deletion
+
+**Always queue PRs for auto-merge rather than waiting on CI manually:**
+
+```bash
+gh pr merge <N> --auto --squash --delete-branch
+```
+
+GitHub will merge the PR the moment both checks turn green. Fire-and-forget — no risk of merging before CI completes (which broke `static-checks` once on 2026-05-11 with PR #98 — see [memory: phantom_stop_close_of_day_2026_05_11](memory/phantom_stop_close_of_day_2026_05_11.md)).
+
+If a check fails after auto-merge is queued, the auto-merge stays queued and merges as soon as a follow-up push goes green. Cancel with `gh pr merge --disable-auto <N>`.
+
 ## Testing
 
 ```bash
