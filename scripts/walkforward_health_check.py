@@ -178,7 +178,16 @@ def _fmt(v: float | None) -> str:
 
 
 def _fmt_pct(v: float | None) -> str:
-    return f"{v * 100:.1f}%" if v is not None else "—"
+    """Format a value the multi_strategy_backtest already pre-multiplies.
+
+    ``win_rate`` and ``return_pct`` in the walkforward JSON are stored as
+    already-scaled percentages (50.72 means 50.72%, not 0.5072) — see
+    ``multi_strategy_backtest.py`` lines 816 + 844 where they're written
+    as ``wins / total * 100`` and ``total_pnl / cash * 100``. The pre-fix
+    `v * 100` here was multiplying a second time and producing values like
+    "5072%" / "169.3%". Format the input directly.
+    """
+    return f"{v:.1f}%" if v is not None else "—"
 
 
 if __name__ == "__main__":
