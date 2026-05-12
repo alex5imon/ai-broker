@@ -879,21 +879,28 @@ class OrderManager:
                 filter=request,
             )
             cancelled: int = 0
+            filter_value: str | None = (
+                side_filter.value if side_filter is not None else None
+            )
             for order in orders:
-                if side_filter is not None:
-                    order_side = getattr(order, "side", None)
-                    # OrderSide enum or .value — accept both. Skip on
-                    # mismatch.
-                    order_side_value = (
-                        order_side.value
-                        if hasattr(order_side, "value")
-                        else order_side
-                    )
-                    filter_value = (
-                        side_filter.value
-                        if hasattr(side_filter, "value")
-                        else side_filter
-                    )
+                if filter_value is not None:
+                    order_side: Any = getattr(order, "side", None)
+                    if order_side is None:
+                        # No side metadata — can't filter, skip safely.
+                        # Treat as not-our-side rather than nuke an
+                        # order we can't classify.
+                        continue
+                    # Accept both OrderSide enum (has .value) and raw
+                    # string side. Narrow via isinstance to keep mypy
+                    # happy without `cast`.
+                    order_side_value: str
+                    if isinstance(order_side, str):
+                        order_side_value = order_side
+                    else:
+                        side_value_attr = getattr(order_side, "value", None)
+                        if not isinstance(side_value_attr, str):
+                            continue
+                        order_side_value = side_value_attr
                     if order_side_value != filter_value:
                         continue
                 try:
@@ -907,7 +914,7 @@ class OrderManager:
                 logger.info(
                     "Cancelled %d order(s) for %s%s",
                     cancelled, ticker,
-                    f" (side={side_filter.value})" if side_filter else "",
+                    f" (side={filter_value})" if filter_value else "",
                 )
         except Exception:
             logger.exception("Error cancelling orders for %s", ticker)
