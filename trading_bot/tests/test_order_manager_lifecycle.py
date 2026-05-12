@@ -887,6 +887,127 @@ class TestPlaceExit:
         )
 
     @pytest.mark.asyncio
+    async def test_place_exit_side_filter_accepts_raw_string_side(
+        self, config, tmp_db_path: str, mock_notifier,
+    ):
+        """Defence-in-depth: if alpaca-py ever flattens OrderSide enums
+        to raw strings in the response, the side-filter must still
+        identify and cancel the matching SELL orders. Covers the
+        isinstance(order_side, str) branch in cancel_all_for_ticker.
+        """
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        active = _ActiveOrder(
+            trade_id=1,
+            ticker="XLF",
+            exchange="US",
+            alpaca_entry_order_id="entry-1",
+            alpaca_stop_order_id="stop-1",
+            status=PositionStatus.STOP_AND_TARGET_ACTIVE,
+            entry_shares=10.0,
+            filled_shares=10.0,
+            entry_price=50.0,
+            stop_price=49.0,
+            target_price=52.0,
+            hold_type="intraday",
+            strategy_id="overnight_drift",
+        )
+        om._active_orders[1] = active
+
+        # Raw-string sides, no .value attr (the future-SDK shape).
+        def _mk_open(oid: str, side_str: str) -> Any:
+            o = MagicMock()
+            o.id = oid
+            o.side = side_str
+            return o
+
+        om._gw.client.get_orders = MagicMock(return_value=[
+            _mk_open("stop-1", "sell"),
+            _mk_open("other-buy", "buy"),
+        ])
+        cancel_calls: list[str] = []
+        om._gw.client.cancel_order_by_id = MagicMock(
+            side_effect=lambda oid: cancel_calls.append(oid),
+        )
+        om._gw.client.submit_order = MagicMock(
+            return_value=_alpaca_order("exit-3", status="new"),
+        )
+
+        order_id = await om.place_exit(
+            ticker="XLF", qty=10, reason="overnight_exit",
+        )
+        assert order_id == "exit-3"
+        assert "stop-1" in cancel_calls, (
+            "raw-string 'sell' side must match the filter and be cancelled"
+        )
+        assert "other-buy" not in cancel_calls, (
+            "raw-string 'buy' side must not match a SELL filter"
+        )
+
+    @pytest.mark.asyncio
+    async def test_place_exit_side_filter_skips_none_side(
+        self, config, tmp_db_path: str, mock_notifier,
+    ):
+        """An order with no .side attribute (or .side=None) cannot be
+        classified by side. The filter must skip it rather than nuke
+        it — we'd rather leave an unidentifiable order alone than
+        cancel something that might belong to a different concern.
+        """
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        active = _ActiveOrder(
+            trade_id=1,
+            ticker="XLF",
+            exchange="US",
+            alpaca_entry_order_id="entry-1",
+            alpaca_stop_order_id="stop-known",
+            status=PositionStatus.STOP_AND_TARGET_ACTIVE,
+            entry_shares=10.0,
+            filled_shares=10.0,
+            entry_price=50.0,
+            stop_price=49.0,
+            target_price=52.0,
+            hold_type="intraday",
+            strategy_id="overnight_drift",
+        )
+        om._active_orders[1] = active
+
+        from alpaca.trading.enums import OrderSide as _OrderSide
+
+        def _mk_open_known_side(oid: str) -> Any:
+            o = MagicMock()
+            o.id = oid
+            o.side = _OrderSide.SELL
+            return o
+
+        def _mk_open_no_side(oid: str) -> Any:
+            o = MagicMock()
+            o.id = oid
+            o.side = None
+            return o
+
+        om._gw.client.get_orders = MagicMock(return_value=[
+            _mk_open_known_side("stop-known"),
+            _mk_open_no_side("malformed-no-side"),
+        ])
+        cancel_calls: list[str] = []
+        om._gw.client.cancel_order_by_id = MagicMock(
+            side_effect=lambda oid: cancel_calls.append(oid),
+        )
+        om._gw.client.submit_order = MagicMock(
+            return_value=_alpaca_order("exit-4", status="new"),
+        )
+
+        order_id = await om.place_exit(
+            ticker="XLF", qty=10, reason="overnight_exit",
+        )
+        assert order_id == "exit-4"
+        # Known SELL cancelled, unidentifiable order preserved.
+        assert "stop-known" in cancel_calls
+        assert "malformed-no-side" not in cancel_calls, (
+            "order with .side=None must be skipped, not cancelled — "
+            "we can't prove it's blocking our qty"
+        )
+
+    @pytest.mark.asyncio
     async def test_place_exit_returns_none_on_broker_failure(
         self, config, tmp_db_path: str, mock_notifier,
     ):
