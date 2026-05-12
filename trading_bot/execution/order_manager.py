@@ -884,19 +884,24 @@ class OrderManager:
             )
             for order in orders:
                 if filter_value is not None:
-                    order_side: Any = getattr(order, "side", None)
+                    # alpaca-py's Order.side is Optional[OrderSide]
+                    # (Pydantic enum). We also tolerate a raw-string
+                    # ``side`` in case the SDK ever flattens enums in
+                    # a future release. None → can't classify, skip
+                    # safely rather than nuking an order whose side
+                    # we don't know.
+                    order_side: OrderSide | str | None = getattr(
+                        order, "side", None,
+                    )
                     if order_side is None:
-                        # No side metadata — can't filter, skip safely.
-                        # Treat as not-our-side rather than nuke an
-                        # order we can't classify.
                         continue
-                    # Accept both OrderSide enum (has .value) and raw
-                    # string side. Narrow via isinstance to keep mypy
-                    # happy without `cast`.
                     order_side_value: str
                     if isinstance(order_side, str):
                         order_side_value = order_side
                     else:
+                        # OrderSide.value is `str` per alpaca-py's
+                        # Pydantic model — the isinstance guard is
+                        # defensive against a future SDK shape change.
                         side_value_attr = getattr(order_side, "value", None)
                         if not isinstance(side_value_attr, str):
                             continue
