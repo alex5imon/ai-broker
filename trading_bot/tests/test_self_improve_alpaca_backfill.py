@@ -30,7 +30,7 @@ def _insert_position(
     ticker: str = "SPY",
     strategy_id: str = "overnight_drift",
     status: str = "CLOSED",
-    quantity: int = 10,
+    quantity: float = 10,
     entry_price: float = 100.0,
     entry_time: datetime,
     alpaca_order_id: str = "alp-entry-001",
@@ -260,6 +260,59 @@ def test_backfill_inserts_when_no_reconciliation_row_present(tmp_db):
     assert len(rows) == 1
     assert rows[0][0] == pytest.approx(98.0)
     assert rows[0][1] == f"{BACKFILL_MARKER_PREFIX}1"
+
+
+@pytest.mark.asyncio
+async def test_backfill_preserves_fractional_quantity(tmp_db):
+    """Live bug 2026-05-12: ``ClosedPositionRow.quantity`` was typed
+    ``int`` and ``load_candidates`` cast ``int(row[5])``, truncating
+    fractional shares to 0/1. A 0.3927-share XLK position recorded
+    pnl=$0.00 instead of the real -$1.29 — masking realized losses on
+    every sub-1-share fractional close.
+
+    The fix preserves float precision through the candidate row and into
+    the ``gross_pnl = (exit - entry) * quantity`` calculation.
+    """
+    entry_time = datetime(2026, 5, 12, 15, 45, tzinfo=TZ_EASTERN)
+    tmp_db.execute(
+        """
+        INSERT INTO positions (
+            id, ticker, exchange, currency, quantity,
+            entry_price, entry_time, status, hold_type, phase,
+            alpaca_order_id, strategy_id
+        ) VALUES (1, 'XLK', 'NYSE', 'USD', 0.3927,
+                  177.438, ?, 'CLOSED', 'swing', 1,
+                  'alp-entry-xlk', 'overnight_drift')
+        """,
+        (entry_time.isoformat(),),
+    )
+    tmp_db.commit()
+
+    candidates = load_candidates(tmp_db)
+    assert len(candidates) == 1
+    assert candidates[0].quantity == pytest.approx(0.3927), (
+        "fractional quantity must round-trip from the positions row — "
+        "int() truncation drops sub-share precision"
+    )
+
+    async def stub_finder(client, position):
+        return ExitFill(
+            order_id="alp-exit-xlk",
+            filled_at=entry_time + timedelta(hours=18),
+            filled_avg_price=174.154,
+            filled_qty=0.3927,
+        )
+
+    report = await backfill(tmp_db, client=None, fill_finder=stub_finder)
+    assert report.inserted == 1
+
+    row = tmp_db.execute(
+        "SELECT quantity, gross_pnl, pnl_usd FROM trades WHERE ticker='XLK'"
+    ).fetchone()
+    expected_pnl = (174.154 - 177.438) * 0.3927
+    assert row[0] == pytest.approx(0.3927)
+    assert row[1] == pytest.approx(expected_pnl)
+    assert row[2] == pytest.approx(expected_pnl)
 
 
 @pytest.mark.unit
