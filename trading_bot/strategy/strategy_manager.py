@@ -407,6 +407,18 @@ class StrategyManager:
             positions: list[dict[str, Any]] = portfolio.get_open_positions()
             for position in positions:
                 ticker: str = position["ticker"]
+                # V11+: skip positions with a persisted pending exit.
+                # An earlier tick already submitted the exit order; the
+                # OrderManager will detect the fill (or rollback on
+                # cancel/expire/reject) via _check_order_statuses
+                # polling. Re-evaluating the exit signal here would
+                # only trigger a duplicate-submit that Alpaca rejects
+                # with `held_for_orders=qty, available=0` — the
+                # symptom pattern that motivated this gate.
+                # `position.get(...)` tolerates older DB rows where
+                # the column doesn't exist or is NULL.
+                if position.get("alpaca_exit_order_id") is not None:
+                    continue
                 # Stale-data gate — same protection scan_for_entries uses.
                 # A stale price that fires a false exit signal would
                 # otherwise cascade into a phantom market sell, broken

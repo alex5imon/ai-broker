@@ -365,6 +365,42 @@ def _migration_v10(conn: sqlite3.Connection) -> None:
     logger.info("Applied migration V10: USD-only column rename")
 
 
+def _migration_v11(conn: sqlite3.Connection) -> None:
+    """V11: add ``positions.alpaca_exit_order_id`` for cross-tick exit tracking.
+
+    Pre-V11 the strategy-driven exit order id lived only in
+    ``OrderManager._ActiveOrder.alpaca_exit_order_id`` — in-memory
+    state that vaporizes when the stateless tick exits. Every
+    overnight_drift exit straddles a process boundary (entry at 15:45
+    ET, exit fires at 09:30 ET next day), so the pending order id is
+    lost between ticks. The next tick re-evaluated the exit signal and
+    tried to re-submit, relying on Alpaca's ``held_for_orders`` to
+    reject the duplicate and on StateRecovery + nightly backfill to
+    reconcile. See memory/overnight_drift_exit_orphans.md.
+
+    This migration adds a nullable TEXT column so OrderManager can
+    persist the order id on ``place_exit`` success and rehydrate it on
+    the next tick start. Backfilled rows stay NULL — they have no
+    pending exit by definition.
+
+    Idempotent: skipped if the column already exists (fresh installs
+    via _SCHEMA_SQL get the column directly from V11-onwards
+    schema.py).
+    """
+    rows = conn.execute("PRAGMA table_info(positions)").fetchall()
+    if not any(r[1] == "alpaca_exit_order_id" for r in rows):
+        conn.execute(
+            "ALTER TABLE positions ADD COLUMN alpaca_exit_order_id TEXT"
+        )
+
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_version (version, description) "
+        "VALUES (11, "
+        "'V11 schema - positions.alpaca_exit_order_id for cross-tick exit tracking')"
+    )
+    logger.info("Applied migration V11: positions.alpaca_exit_order_id")
+
+
 _MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (4, "V4 schema - multi-market adaptive trading bot", _migration_v4),
     (5, "V5 schema - multi-strategy Alpaca trading bot", _migration_v5),
@@ -373,6 +409,8 @@ _MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (8, "V8 schema - ENTRY_FAILED terminal status (data-only)", _migration_v8),
     (9, "V9 schema - settlements table removed", _migration_v9),
     (10, "V10 schema - USD-only column rename", _migration_v10),
+    (11, "V11 schema - positions.alpaca_exit_order_id for cross-tick exit tracking",
+     _migration_v11),
 ]
 
 

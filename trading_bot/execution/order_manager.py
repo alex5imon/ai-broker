@@ -158,8 +158,11 @@ class _ActiveOrder:
     # when the position transitions to CLOSING; polled by
     # _check_order_statuses to advance CLOSING -> CLOSED with the real
     # exit_reason instead of leaving the row for state-recovery to
-    # tag as 'reconciliation_mismatch' next tick. In-memory only —
-    # process restarts fall back to the recovery path.
+    # tag as 'reconciliation_mismatch' next tick. Persisted to
+    # positions.alpaca_exit_order_id (V11+) so a stateless-tick restart
+    # rehydrates the pending order and avoids re-submitting the same
+    # exit. Pre-V11 this was in-memory only and every overnight_drift
+    # exit fell through to the recovery path.
     alpaca_exit_order_id: str | None = None
     exit_reason: str | None = None
     status: PositionStatus = PositionStatus.ENTRY_PENDING
@@ -268,6 +271,17 @@ class OrderManager:
                 logger.debug("Skipping row with unknown status %s", status_str)
                 continue
 
+            # alpaca_exit_order_id added in V11. Existing DBs may have
+            # this column NULL on every row until a place_exit fires;
+            # the `[idx] if "alpaca_exit_order_id" in row.keys()` check
+            # tolerates older schema views during the migration window.
+            row_keys = set(row.keys())
+            exit_oid: str | None = (
+                row["alpaca_exit_order_id"]
+                if "alpaca_exit_order_id" in row_keys
+                else None
+            )
+
             active = _ActiveOrder(
                 trade_id=trade_id,
                 ticker=str(row["ticker"]),
@@ -276,6 +290,7 @@ class OrderManager:
                 alpaca_stop_order_id=row["alpaca_stop_order_id"],
                 alpaca_target_order_id=row["alpaca_target_order_id"],
                 alpaca_trail_order_id=row["alpaca_trail_order_id"],
+                alpaca_exit_order_id=exit_oid,
                 status=status,
                 entry_shares=float(row["quantity"] or 0),
                 filled_shares=float(row["quantity"] or 0)
@@ -296,6 +311,7 @@ class OrderManager:
                 active.alpaca_stop_order_id,
                 active.alpaca_target_order_id,
                 active.alpaca_trail_order_id,
+                active.alpaca_exit_order_id,
             ):
                 if oid is not None:
                     self._alpaca_to_trade[str(oid)] = trade_id
@@ -572,6 +588,13 @@ class OrderManager:
                         active.alpaca_exit_order_id = None
                         active.exit_reason = None
                         active.status = PositionStatus.STOP_AND_TARGET_ACTIVE
+                        # V11+: clear the persisted exit order_id too,
+                        # so the next tick re-evaluates the exit
+                        # condition cleanly instead of seeing a stale
+                        # alpaca_exit_order_id and refusing to act.
+                        self._update_position_field(
+                            trade_id, "alpaca_exit_order_id", None,
+                        )
                         self._update_position_status(
                             trade_id, PositionStatus.STOP_AND_TARGET_ACTIVE,
                         )
@@ -1060,6 +1083,14 @@ class OrderManager:
                     matching_active.status = PositionStatus.CLOSING
                     matching_active.alpaca_exit_order_id = order_id
                     matching_active.exit_reason = reason
+                # Persist the exit order_id BEFORE flipping status to
+                # CLOSING — a crash between the two writes leaves the
+                # row still STOP_AND_TARGET_ACTIVE with the order id
+                # set, which the next tick's rehydration handles
+                # gracefully. V11+: column lives on positions table.
+                self._update_position_field(
+                    matching_trade_id, "alpaca_exit_order_id", order_id,
+                )
                 self._update_position_status(
                     matching_trade_id, PositionStatus.CLOSING,
                 )
@@ -1191,6 +1222,11 @@ class OrderManager:
                     matching_active.status = PositionStatus.CLOSING
                     matching_active.alpaca_exit_order_id = order_id
                     matching_active.exit_reason = reason
+                # V11+: persist exit order_id before status flip so a
+                # crash between the two writes is recoverable from DB.
+                self._update_position_field(
+                    matching_trade_id, "alpaca_exit_order_id", order_id,
+                )
                 self._update_position_status(
                     matching_trade_id, PositionStatus.CLOSING,
                 )
@@ -1572,6 +1608,7 @@ class OrderManager:
             active.alpaca_stop_order_id,
             active.alpaca_target_order_id,
             active.alpaca_trail_order_id,
+            active.alpaca_exit_order_id,
         ):
             if oid is not None:
                 self._alpaca_to_trade.pop(oid, None)
@@ -1722,7 +1759,8 @@ class OrderManager:
         col: f"UPDATE positions SET {col} = ?, updated_at = ? WHERE id = ?"  # nosec B608
         for col in (
             "status", "alpaca_order_id", "alpaca_stop_order_id",
-            "alpaca_target_order_id", "alpaca_trail_order_id", "oca_group",
+            "alpaca_target_order_id", "alpaca_trail_order_id",
+            "alpaca_exit_order_id", "oca_group",
             "quantity", "entry_price", "stop_price", "target_price",
             "trailing_active", "trailing_distance", "highest_price",
         )
