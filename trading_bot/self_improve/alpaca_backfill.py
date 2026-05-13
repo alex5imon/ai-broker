@@ -55,7 +55,7 @@ class ClosedPositionRow:
     exchange: str
     currency: str
     strategy_id: str
-    quantity: int
+    quantity: float
     entry_price: float
     entry_time: datetime
     hold_type: str
@@ -138,7 +138,10 @@ def load_candidates(conn: sqlite3.Connection) -> list[ClosedPositionRow]:
                 exchange=row[2],
                 currency=row[3],
                 strategy_id=row[4],
-                quantity=int(row[5]),
+                # positions.quantity is INTEGER affinity but the live writer
+                # stores fractional shares (e.g. 0.3927). int() truncates
+                # those to 0, masking pnl on any sub-1-share position.
+                quantity=float(row[5]),
                 entry_price=float(row[6]),
                 entry_time=entry_dt,
                 hold_type=row[8],
@@ -357,7 +360,7 @@ async def backfill(
         gross_pnl = (exit_fill.filled_avg_price - c.entry_price) * c.quantity
         exit_reason = _infer_exit_reason(exit_fill.order_id, c)
         logger.info(
-            "Position %d %s qty=%d entry=%.4f exit=%.4f pnl=%+.2f reason=%s%s",
+            "Position %d %s qty=%.4f entry=%.4f exit=%.4f pnl=%+.2f reason=%s%s",
             c.position_id, c.ticker, c.quantity,
             c.entry_price, exit_fill.filled_avg_price, gross_pnl, exit_reason,
             " (dry-run)" if dry_run else "",
