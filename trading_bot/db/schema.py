@@ -69,6 +69,12 @@ CREATE TABLE IF NOT EXISTS positions (
     alpaca_stop_order_id TEXT,
     alpaca_target_order_id TEXT,
     alpaca_trail_order_id TEXT,
+    -- Strategy-driven exit (place_exit / place_limit_exit). Populated
+    -- when the position transitions to CLOSING; cleared on FILLED or
+    -- on canceled/expired/rejected rollback. Persisted so the next
+    -- stateless tick can rehydrate the pending exit instead of
+    -- re-evaluating and double-submitting. Added in V11.
+    alpaca_exit_order_id TEXT,
     highest_price   REAL,
     strategy_id     TEXT NOT NULL,
     updated_at      TEXT NOT NULL DEFAULT (datetime('now'))

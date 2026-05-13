@@ -2206,6 +2206,73 @@ class TestCheckExits:
         assert n == 0
         assert strategy.evaluate_exit_calls == []
 
+    @pytest.mark.asyncio
+    async def test_pending_exit_skips_evaluate(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        tmp_db_path,
+    ):
+        """V11+: a position with a persisted alpaca_exit_order_id has
+        a pending exit order from an earlier tick. check_exits must
+        skip it entirely — no evaluate_exit call, no place_exit. The
+        OrderManager's poll handles fill detection (or rollback on
+        cancel/expire/reject). Without this gate, the bot would
+        re-submit and Alpaca would reject with
+        ``held_for_orders=qty`` — the 2026-05-12/13 pattern that
+        motivated the V11 work."""
+        sm, strategy, portfolio = self._setup(
+            base_market_data, base_portfolio_manager, base_order_manager, base_config,
+            base_risk_manager, base_sentiment, base_earnings, tmp_db_path,
+            positions=[{
+                "ticker": "SPY", "entry_price": 100.0, "quantity": 5,
+                "alpaca_exit_order_id": "alp-exit-pending",
+            }],
+            exit_signal=ExitSignal(should_exit=True, reason="overnight_exit"),
+        )
+        n = await sm.check_exits()
+        assert n == 0, "must not double-submit when an exit is already pending"
+        assert strategy.evaluate_exit_calls == [], (
+            "evaluate_exit must be short-circuited for positions with "
+            "a persisted alpaca_exit_order_id — the gate runs before "
+            "the strategy is consulted"
+        )
+        portfolio.record_exit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_null_exit_order_id_does_not_skip(
+        self,
+        base_market_data,
+        base_risk_manager,
+        base_earnings,
+        base_sentiment,
+        base_order_manager,
+        base_portfolio_manager,
+        base_config,
+        tmp_db_path,
+    ):
+        """Sanity: an explicit NULL in the position dict (the common
+        case — no pending exit) must NOT short-circuit. Catches a
+        regression where someone accidentally writes ``if "key" in
+        position`` instead of ``if position.get(...) is not None``."""
+        sm, strategy, _ = self._setup(
+            base_market_data, base_portfolio_manager, base_order_manager, base_config,
+            base_risk_manager, base_sentiment, base_earnings, tmp_db_path,
+            positions=[{
+                "ticker": "SPY", "entry_price": 100.0, "quantity": 5,
+                "alpaca_exit_order_id": None,
+            }],
+            exit_signal=ExitSignal(should_exit=True, reason="take_profit"),
+        )
+        n = await sm.check_exits()
+        assert n == 1
+        assert len(strategy.evaluate_exit_calls) == 1
+
 
 def test_get_comparison_report(
     base_market_data,
