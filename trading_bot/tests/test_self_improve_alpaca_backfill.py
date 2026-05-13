@@ -78,7 +78,7 @@ def _make_position(
         exchange="NYSE",
         currency="USD",
         strategy_id="overnight_drift",
-        quantity=10,
+        quantity=10.0,
         entry_price=100.0,
         entry_time=datetime(2026, 4, 1, 15, 45, tzinfo=TZ_EASTERN),
         hold_type="swing",
@@ -237,6 +237,66 @@ def test_backfill_updates_existing_reconciliation_mismatch_row(tmp_db):
     assert row[4] == f"{BACKFILL_MARKER_PREFIX}1", (
         "notes carries the backfill marker so load_candidates skips next time"
     )
+
+
+@pytest.mark.unit
+def test_backfill_update_path_preserves_fractional_pnl(tmp_db):
+    """The UPDATE branch of insert_backfilled_trade computes pnl from
+    ``ClosedPositionRow.quantity`` — same call site as the INSERT branch.
+    Mirrors the 2026-05-12 live failure where a 0.3927-share XLK position
+    landed in the reconciliation_mismatch UPDATE path: with quantity
+    truncated to 0, the UPDATE wrote pnl_usd=0.0 instead of the real
+    ~-$1.29.
+    """
+    p = ClosedPositionRow(
+        position_id=1,
+        ticker="XLK",
+        exchange="NYSE",
+        currency="USD",
+        strategy_id="overnight_drift",
+        quantity=0.3927,
+        entry_price=177.438,
+        entry_time=datetime(2026, 5, 11, 15, 45, tzinfo=TZ_EASTERN),
+        hold_type="swing",
+        phase=1,
+        alpaca_order_id="alp-entry-xlk",
+        alpaca_stop_order_id=None,
+        alpaca_target_order_id=None,
+        alpaca_trail_order_id=None,
+    )
+    tmp_db.execute(
+        """
+        INSERT INTO trades (
+            ticker, exchange, currency, side,
+            entry_time, entry_price, quantity,
+            exit_time, exit_reason,
+            hold_type, phase, strategy_id, notes
+        ) VALUES ('XLK', 'NYSE', 'USD', 'BUY',
+                  '2026-05-11T15:45:00-04:00', 177.438, 0.3927,
+                  '2026-05-12T09:40:34-04:00', 'reconciliation_mismatch',
+                  'swing', 1, 'overnight_drift', 'placeholder')
+        """,
+    )
+    tmp_db.commit()
+
+    insert_backfilled_trade(tmp_db, p, ExitFill(
+        order_id="alp-exit-xlk",
+        filled_at=datetime(2026, 5, 12, 13, 30, tzinfo=timezone.utc),
+        filled_avg_price=174.154,
+        filled_qty=0.3927,
+    ))
+    tmp_db.commit()
+
+    rows = tmp_db.execute(
+        "SELECT exit_reason, exit_price, gross_pnl, pnl_usd FROM trades "
+        "WHERE ticker='XLK'"
+    ).fetchall()
+    assert len(rows) == 1, "UPDATE in place — no duplicate row inserted"
+    expected_pnl = (174.154 - 177.438) * 0.3927
+    assert rows[0][0] == "manual"
+    assert rows[0][1] == pytest.approx(174.154)
+    assert rows[0][2] == pytest.approx(expected_pnl)
+    assert rows[0][3] == pytest.approx(expected_pnl)
 
 
 @pytest.mark.unit
