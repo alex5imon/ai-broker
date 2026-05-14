@@ -30,13 +30,13 @@ says "exercise extreme care with all order logic."
   the slippage it avoids. **Revisit only if** (i) live equity rises far
   enough that whole-share entries become the norm, or (ii) postmortems
   surface a pattern of take-profit slippage beyond the stop-distance bound.
-- **#40 — `PerformanceCalculator` not surfacing closed trades.** Two pre-existing
-  test failures reproduce the same pattern as the live `daily_summaries` showing
-  0/0/0 wins/losses despite closed entries. Probably the load-bearing reason
-  daily-review reports keep coming back empty.
-- **#41 — Verify PR #20 drain logic.** The verify-before-SELL guard merged after
-  the churn it was meant to prevent; needs unit + integration coverage before
-  the next sleeve-disable event proves it the hard way.
+- **~~#40 — `PerformanceCalculator` not surfacing closed trades.~~** Resolved
+  2026-05-07. The two failing tests (`test_daily_metrics_with_wins_and_losses`,
+  `test_daily_metrics_usd_passthrough`) now pass on main; the `daily_summaries`
+  recompute paths surface real win/loss/PnL.
+- **~~#41 — Verify PR #20 drain logic.~~** Resolved 2026-05-07. Unit +
+  integration coverage of the verify-before-SELL guard landed before the
+  next sleeve-disable event.
 - **~~Rename `STOP_AND_TARGET_ACTIVE` → `STOP_ACTIVE`.~~** **Resolved by
   ai-broker#54.** Under the ai-broker#39 entry path only the stop is
   broker-side (take-profit is polled in `main.check_exits` against
