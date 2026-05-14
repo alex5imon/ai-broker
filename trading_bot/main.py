@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import logging.handlers
@@ -513,27 +514,21 @@ class TradingBot:
         """Load day-scoped flags for *today*; reset if stored row is stale."""
         today_str: str = today.isoformat()
         try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-            try:
+            with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
                 row = repo.load_tick_state(conn, "__day__")
                 if row and row.get("last_bar_ts") == today_str:
                     return dict(row.get("state") or {})
-            finally:
-                conn.close()
         except Exception:
             logger.warning("Failed to load day flags", exc_info=True)
         return {}
 
     def _save_day_flags(self, today: date, flags: dict[str, Any]) -> None:
         try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-            try:
+            with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
                 repo.save_tick_state(
                     conn, "__day__", last_bar_ts=today.isoformat(), state=flags
                 )
                 conn.commit()
-            finally:
-                conn.close()
         except Exception:
             logger.warning("Failed to save day flags", exc_info=True)
 
@@ -813,10 +808,9 @@ class TradingBot:
     def _is_on_cooldown(self, ticker: str) -> bool:
         """Return True if ticker is in a post-exit cooldown window."""
         try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-            conn.row_factory = sqlite3.Row
-            cooldown_until: datetime | None = repo.get_cooldown(conn, ticker)
-            conn.close()
+            with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                cooldown_until: datetime | None = repo.get_cooldown(conn, ticker)
         except Exception:
             logger.warning("Cooldown lookup failed for %s", ticker, exc_info=True)
             return False
@@ -866,10 +860,9 @@ class TradingBot:
             # Fall through to also check legacy (untagged) positions below
 
         try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-            conn.row_factory = sqlite3.Row
-            open_positions: list[dict[str, Any]] = repo.get_open_positions(conn)
-            conn.close()
+            with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                open_positions: list[dict[str, Any]] = repo.get_open_positions(conn)
         except Exception:
             logger.exception("Failed to load open positions for exit check")
             return
@@ -1039,8 +1032,7 @@ class TradingBot:
         key: str = self._spread_defer_key(ticker)
         now_iso: str = now.isoformat()
         try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-            try:
+            with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
                 row = repo.load_tick_state(conn, key)
                 if row is None:
                     repo.save_tick_state(conn, key, last_bar_ts=now_iso, state={})
@@ -1057,8 +1049,6 @@ class TradingBot:
                 if first_dt.tzinfo is None:
                     first_dt = first_dt.replace(tzinfo=_EASTERN)
                 return (now - first_dt).total_seconds() >= max_delay_s
-            finally:
-                conn.close()
         except Exception:
             logger.exception("spread-defer bookkeeping failed for %s", ticker)
             return False
@@ -1067,14 +1057,11 @@ class TradingBot:
         """Remove a spread-defer record after a successful exit."""
         key: str = self._spread_defer_key(ticker)
         try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-            try:
+            with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
                 conn.execute(
                     "DELETE FROM tick_state WHERE strategy_id = ?", (key,),
                 )
                 conn.commit()
-            finally:
-                conn.close()
         except Exception:
             logger.debug("clear spread-defer failed for %s", ticker, exc_info=True)
 
@@ -1091,10 +1078,9 @@ class TradingBot:
         logger.info("Wind-down started for %s", market.value)
 
         try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-            conn.row_factory = sqlite3.Row
-            open_positions: list[dict[str, Any]] = repo.get_open_positions(conn)
-            conn.close()
+            with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                open_positions: list[dict[str, Any]] = repo.get_open_positions(conn)
         except Exception:
             logger.exception("Failed to load positions for wind-down")
             return
@@ -1200,12 +1186,11 @@ class TradingBot:
         raw_cfg: dict[str, Any] = self._config._raw
 
         try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-            conn.row_factory = sqlite3.Row
-            summaries: list[dict[str, Any]] = repo.get_recent_daily_summaries(
-                conn, n_days=60
-            )
-            conn.close()
+            with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                summaries: list[dict[str, Any]] = repo.get_recent_daily_summaries(
+                    conn, n_days=60
+                )
         except Exception:
             logger.exception("Failed to load daily summaries for phase check")
             return
@@ -1328,18 +1313,17 @@ class TradingBot:
     def _calc_recent_win_rate(self, lookback_trades: int) -> float:
         """Calculate win rate from the N most recent closed trades."""
         try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                """
-                SELECT pnl_usd FROM trades
-                WHERE exit_time IS NOT NULL
-                ORDER BY exit_time DESC
-                LIMIT ?
-                """,
-                (lookback_trades,),
-            ).fetchall()
-            conn.close()
+            with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """
+                    SELECT pnl_usd FROM trades
+                    WHERE exit_time IS NOT NULL
+                    ORDER BY exit_time DESC
+                    LIMIT ?
+                    """,
+                    (lookback_trades,),
+                ).fetchall()
             if not rows:
                 return 0.0
             wins: int = sum(1 for r in rows if (r["pnl_usd"] or 0) > 0)
@@ -1358,21 +1342,20 @@ class TradingBot:
         """Persist a phase_transitions record."""
         direction: str = "promotion" if to_phase > from_phase else "demotion"
         try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-            conn.row_factory = sqlite3.Row
-            repo.save_phase_transition(
-                conn,
-                {
-                    "date": datetime.now(tz=_EASTERN).strftime("%Y-%m-%d"),
-                    "from_phase": from_phase,
-                    "to_phase": to_phase,
-                    "direction": direction,
-                    "account_equity_usd": equity,
-                    "metrics_json": json.dumps({"reason": reason}),
-                    "reason": reason,
-                },
-            )
-            conn.close()
+            with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                repo.save_phase_transition(
+                    conn,
+                    {
+                        "date": datetime.now(tz=_EASTERN).strftime("%Y-%m-%d"),
+                        "from_phase": from_phase,
+                        "to_phase": to_phase,
+                        "direction": direction,
+                        "account_equity_usd": equity,
+                        "metrics_json": json.dumps({"reason": reason}),
+                        "reason": reason,
+                    },
+                )
             logger.info(
                 "Phase transition recorded: %d -> %d (%s) reason=%s",
                 from_phase, to_phase, direction, reason,
@@ -1571,10 +1554,9 @@ class TradingBot:
 
         saved: bool = False
         try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-            conn.row_factory = sqlite3.Row
-            repo.save_daily_summary(conn, summary)
-            conn.close()
+            with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                repo.save_daily_summary(conn, summary)
             saved = True
             logger.info("Daily summary saved for %s (trades=%d, net_pnl=$%.2f)",
                         today_str, summary["total_trades"], summary["net_pnl_usd"])
@@ -1658,10 +1640,9 @@ class TradingBot:
     def _count_open_positions(self) -> int:
         """Count non-closed positions in SQLite."""
         try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-            conn.row_factory = sqlite3.Row
-            positions: list[dict[str, Any]] = repo.get_open_positions(conn)
-            conn.close()
+            with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                positions: list[dict[str, Any]] = repo.get_open_positions(conn)
             return len(positions)
         except Exception:
             logger.warning("Failed to count open positions", exc_info=True)
@@ -1670,10 +1651,9 @@ class TradingBot:
     def _is_phase0_complete(self) -> bool:
         """Return True if a Phase 0 -> Phase 1 transition has been recorded."""
         try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-            conn.row_factory = sqlite3.Row
-            result: bool = repo.is_phase0_complete(conn)
-            conn.close()
+            with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                result: bool = repo.is_phase0_complete(conn)
             return result
         except Exception:
             logger.warning("Phase 0 check failed", exc_info=True)

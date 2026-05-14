@@ -8,6 +8,7 @@ trade/P&L limits.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import sqlite3
@@ -478,10 +479,9 @@ class EntryEvaluator:
     def _is_on_cooldown(self, ticker: str, now: datetime) -> bool:
         """Check if *ticker* is in a post-exit cooldown window."""
         try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-            conn.row_factory = sqlite3.Row
-            cooldown_until: datetime | None = repo.get_cooldown(conn, ticker)
-            conn.close()
+            with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                cooldown_until: datetime | None = repo.get_cooldown(conn, ticker)
         except sqlite3.Error:
             logger.exception("Error checking cooldown for %s", ticker)
             return False
@@ -498,10 +498,9 @@ class EntryEvaluator:
     def _get_open_position_count(self) -> int:
         """Get the number of currently open positions from the DB."""
         try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-            conn.row_factory = sqlite3.Row
-            positions: list[dict[str, Any]] = repo.get_open_positions(conn)
-            conn.close()
+            with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                positions: list[dict[str, Any]] = repo.get_open_positions(conn)
             return len(positions)
         except sqlite3.Error:
             logger.exception("Error fetching open positions")
@@ -510,10 +509,9 @@ class EntryEvaluator:
     def _get_sector_count(self, sector: str) -> int:
         """Count open positions in the given GICS sector."""
         try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-            conn.row_factory = sqlite3.Row
-            positions: list[dict[str, Any]] = repo.get_open_positions(conn)
-            conn.close()
+            with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                positions: list[dict[str, Any]] = repo.get_open_positions(conn)
         except sqlite3.Error:
             logger.exception("Error fetching positions for sector check")
             return 0
@@ -528,10 +526,9 @@ class EntryEvaluator:
     def _get_daily_trade_count(self) -> int:
         """Get today's trade count from the DB."""
         try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-            conn.row_factory = sqlite3.Row
-            count: int = repo.get_trade_count_today(conn)
-            conn.close()
+            with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                count: int = repo.get_trade_count_today(conn)
             return count
         except sqlite3.Error:
             logger.exception("Error fetching daily trade count")
@@ -540,10 +537,9 @@ class EntryEvaluator:
     def _get_daily_pnl_usd(self) -> float:
         """Get today's realised P&L in USD from the DB."""
         try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-            conn.row_factory = sqlite3.Row
-            pnl: float = repo.get_daily_pnl_usd(conn)
-            conn.close()
+            with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                pnl: float = repo.get_daily_pnl_usd(conn)
             return pnl
         except sqlite3.Error:
             logger.exception("Error fetching daily P&L")
