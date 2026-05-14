@@ -27,7 +27,6 @@ from zoneinfo import ZoneInfo
 
 from trading_bot.config import Config
 from trading_bot.constants import (
-    GICS_SECTOR,
     HoldType,
     Market,
     Phase,
@@ -41,7 +40,6 @@ from trading_bot.data.sentiment import SentimentAnalyzer
 from trading_bot.db import repository as repo
 from trading_bot.db.migrations import run_migrations
 from trading_bot.execution.loss_cooldown import LossCooldownConfig, LossCooldownTracker
-from trading_bot.execution.order_manager import EntryDecision as OMEntryDecision
 from trading_bot.execution.order_manager import OrderManager
 from trading_bot.execution.risk_manager import RiskManager
 from trading_bot.execution.stop_reconciler import reconcile_open_position_stops
@@ -51,7 +49,6 @@ from trading_bot.notifications.notifier import Notifier
 from trading_bot.execution.virtual_portfolio import PortfolioManager
 from trading_bot.reporting.daily_report import ReportGenerator
 from trading_bot.reporting.performance import PerformanceCalculator
-from trading_bot.strategy.entry import EntryDecision, EntryEvaluator
 from trading_bot.strategy.strategies import create_strategies
 from trading_bot.strategy.strategy_manager import StrategyManager
 from trading_bot.strategy.regime_filter import RegimeFilter
@@ -112,14 +109,6 @@ class TradingBot:
 
         # --- Strategy layer ---
         self._technical: TechnicalAnalyzer = TechnicalAnalyzer(config)
-        self._entry_evaluator: EntryEvaluator = EntryEvaluator(
-            config=config,
-            technical=self._technical,
-            sentiment=self._sentiment,
-            earnings=self._earnings,
-            market_data=self._market_data,
-            db_path=db_path,
-        )
         self._exit_manager: ExitManager = ExitManager(config, self._market_data)
 
         # --- Execution layer ---
@@ -136,59 +125,78 @@ class TradingBot:
         )
 
         # --- Multi-strategy layer ---
-        self._strategy_manager: StrategyManager | None = None
-        if config.multi_strategy_enabled:
-            strategy_configs: dict[str, Any] = config.get_strategy_configs()
-            vol_target_cfg: dict[str, Any] = (
-                config._raw.get("risk", {}) or {}
-            ).get("vol_target", {}) or {}
-            strategies = create_strategies(
-                strategy_configs,
-                db_path=db_path,
-                vol_target_config=vol_target_cfg,
+        # The legacy single-strategy ``EntryEvaluator`` path was removed in
+        # ai-broker#125. ``multi_strategy_enabled`` now defaults to True and
+        # production config sets it explicitly. A config that disables it
+        # is invalid — every entry runs through ``StrategyManager``.
+        if not config.multi_strategy_enabled:
+            raise RuntimeError(
+                "multi_strategy_enabled=False, but the legacy single-strategy "
+                "entry path was deleted in ai-broker#125. Remove "
+                "`multi_strategy: enabled: false` from config (the default is "
+                "True) and define at least one sleeve under `multi_strategy: "
+                "strategies:`."
             )
-            portfolio_mgr = PortfolioManager(
-                strategy_configs=strategy_configs,
-                total_cash=config.multi_strategy_total_allocation,
-                db_path=db_path,
+
+        strategy_configs: dict[str, Any] = config.get_strategy_configs()
+        if not strategy_configs:
+            raise RuntimeError(
+                "multi_strategy_enabled is True but config defines no "
+                "strategies. Add a `multi_strategy: strategies:` block with "
+                "at least one sleeve (see config.yaml). The legacy entry "
+                "path was removed in ai-broker#125."
             )
-            regime_cfg: dict[str, Any] = config._get("multi_strategy", "regime_filter", default={}) or {}
-            regime_filter: RegimeFilter | None = None
-            if bool(regime_cfg.get("enabled", True)):
-                regime_filter = RegimeFilter(
-                    get_daily_bars=self._get_daily_bars,
-                    index_symbol=str(regime_cfg.get("index_symbol", "SPY")),
-                    sma_period=int(regime_cfg.get("sma_period", 50)),
-                    enabled=True,
-                    cache_ttl_minutes=int(regime_cfg.get("cache_ttl_minutes", 30)),
-                )
-            loss_cd_cfg: dict[str, Any] = config.get_loss_cooldown_config()
-            loss_cooldown: LossCooldownTracker = LossCooldownTracker(
-                db_path=db_path,
-                config=LossCooldownConfig(
-                    enabled=bool(loss_cd_cfg.get("enabled", False)),
-                    threshold_losses=int(loss_cd_cfg.get("threshold_losses", 3)),
-                    cooldown_minutes=int(loss_cd_cfg.get("cooldown_minutes", 240)),
-                ),
+
+        vol_target_cfg: dict[str, Any] = (
+            config._raw.get("risk", {}) or {}
+        ).get("vol_target", {}) or {}
+        strategies = create_strategies(
+            strategy_configs,
+            db_path=db_path,
+            vol_target_config=vol_target_cfg,
+        )
+        portfolio_mgr = PortfolioManager(
+            strategy_configs=strategy_configs,
+            total_cash=config.multi_strategy_total_allocation,
+            db_path=db_path,
+        )
+        regime_cfg: dict[str, Any] = config._get("multi_strategy", "regime_filter", default={}) or {}
+        regime_filter: RegimeFilter | None = None
+        if bool(regime_cfg.get("enabled", True)):
+            regime_filter = RegimeFilter(
+                get_daily_bars=self._get_daily_bars,
+                index_symbol=str(regime_cfg.get("index_symbol", "SPY")),
+                sma_period=int(regime_cfg.get("sma_period", 50)),
+                enabled=True,
+                cache_ttl_minutes=int(regime_cfg.get("cache_ttl_minutes", 30)),
             )
-            self._strategy_manager = StrategyManager(
-                strategies=strategies,
-                portfolio_manager=portfolio_mgr,
-                market_data=self._market_data,
-                order_manager=self._order_manager,
-                risk_manager=self._risk_manager,
-                sentiment=self._sentiment,
-                earnings=self._earnings,
-                config=config,
-                db_path=db_path,
-                dry_run=dry_run,
-                regime_filter=regime_filter,
-                loss_cooldown=loss_cooldown,
-            )
-            logger.info(
-                "Multi-strategy enabled: %d strategies, $%.0f total",
-                len(strategies), config.multi_strategy_total_allocation,
-            )
+        loss_cd_cfg: dict[str, Any] = config.get_loss_cooldown_config()
+        loss_cooldown: LossCooldownTracker = LossCooldownTracker(
+            db_path=db_path,
+            config=LossCooldownConfig(
+                enabled=bool(loss_cd_cfg.get("enabled", False)),
+                threshold_losses=int(loss_cd_cfg.get("threshold_losses", 3)),
+                cooldown_minutes=int(loss_cd_cfg.get("cooldown_minutes", 240)),
+            ),
+        )
+        self._strategy_manager: StrategyManager = StrategyManager(
+            strategies=strategies,
+            portfolio_manager=portfolio_mgr,
+            market_data=self._market_data,
+            order_manager=self._order_manager,
+            risk_manager=self._risk_manager,
+            sentiment=self._sentiment,
+            earnings=self._earnings,
+            config=config,
+            db_path=db_path,
+            dry_run=dry_run,
+            regime_filter=regime_filter,
+            loss_cooldown=loss_cooldown,
+        )
+        logger.info(
+            "Multi-strategy enabled: %d strategies, $%.0f total",
+            len(strategies), config.multi_strategy_total_allocation,
+        )
 
         # --- Reporting ---
         self._performance: PerformanceCalculator = PerformanceCalculator(db_path)
@@ -637,185 +645,32 @@ class TradingBot:
     # ------------------------------------------------------------------
 
     async def scan_for_entries(self, market: Market) -> None:
-        """Scan active watchlist for entry signals and place orders."""
-        # Delegate to multi-strategy manager if enabled
-        if self._strategy_manager is not None:
-            ms_watchlist: list[str] = (
-                self._active_watchlist.get(market) or self._config.get_watchlist(market)
-            )
-            # NOTE: ``_get_account_equity_usd`` returns USD on Alpaca
-            # (NetLiquidation is reported in account currency = USD).
-            # The function name is a legacy IBKR-era misnomer pending a
-            # broader rename that also touches the daily_summaries DB
-            # column. Pass through as USD here for the new
-            # StrategyManager API.
-            ms_equity_usd: float | None = await self._get_account_equity_usd()
-            if ms_equity_usd is None:
-                logger.warning(
-                    "Skipping entry scan for %s — equity unavailable",
-                    market.value,
-                )
-                return
-            await self._strategy_manager.scan_for_entries(
-                watchlist=ms_watchlist,
-                get_5min_bars=self._get_5min_bars,
-                get_daily_bars=self._get_daily_bars,
-                account_equity_usd=ms_equity_usd,
-            )
-            return
+        """Scan active watchlist for entry signals and place orders.
 
-        if self._market_data.trading_paused:
-            logger.warning(
-                "Market data paused (mass staleness) — skipping entry scan for %s",
-                market.value,
-            )
-            return
-
-        watchlist: list[str] = (
+        Delegates to ``StrategyManager``. The legacy single-strategy
+        ``EntryEvaluator`` path was removed in ai-broker#125.
+        """
+        ms_watchlist: list[str] = (
             self._active_watchlist.get(market) or self._config.get_watchlist(market)
         )
-        if not watchlist:
-            return
-
-        equity_opt: float | None = await self._get_account_equity_usd()
-        if equity_opt is None:
+        # NOTE: ``_get_account_equity_usd`` returns USD on Alpaca
+        # (NetLiquidation is reported in account currency = USD).
+        # The function name is a legacy IBKR-era misnomer pending a
+        # broader rename that also touches the daily_summaries DB
+        # column. Pass through as USD here for the new
+        # StrategyManager API.
+        ms_equity_usd: float | None = await self._get_account_equity_usd()
+        if ms_equity_usd is None:
             logger.warning(
                 "Skipping entry scan for %s — equity unavailable",
                 market.value,
             )
             return
-        account_equity_usd: float = equity_opt
-
-        # Risk circuit checks (daily-loss + drawdown breaker) run
-        # unconditionally in ``tick()`` step 9b. ``can_trade()`` below
-        # consults the cached state, so we do not re-evaluate here.
-
-        exchange_str: str = "US"
-
-        for ticker in watchlist:
-            # Top-level risk gate before each candidate
-            can_trade, reason = self._risk_manager.can_trade()
-            if not can_trade:
-                logger.info(
-                    "Risk manager blocking new entries (%s) — stopping scan for %s",
-                    reason,
-                    market.value,
-                )
-                break
-
-            # Skip stale data
-            if self._market_data.is_stale(ticker):
-                logger.debug("%s: stale data — skipping", ticker)
-                continue
-
-            # Skip earnings blackout
-            if self._earnings.is_in_blackout(ticker, datetime.now(tz=_EASTERN)):
-                logger.debug("%s: earnings blackout — skipping", ticker)
-                continue
-
-            # Skip cooldown
-            if self._is_on_cooldown(ticker):
-                logger.debug("%s: on cooldown — skipping", ticker)
-                continue
-
-            # Fetch bars
-            try:
-                df_5min = await self._get_5min_bars(ticker, exchange_str)
-                df_daily = await self._get_daily_bars(ticker, exchange_str)
-            except Exception:
-                logger.warning("Bar fetch failed for %s", ticker, exc_info=True)
-                continue
-
-            if df_5min is None or df_5min.empty or df_daily is None or df_daily.empty:
-                logger.debug("%s: insufficient bars — skipping", ticker)
-                continue
-
-            # Evaluate entry signal
-            try:
-                decision: EntryDecision = await self._entry_evaluator.evaluate(
-                    ticker=ticker,
-                    exchange=exchange_str,
-                    df_5min=df_5min,
-                    df_daily=df_daily,
-                    account_equity_usd=account_equity_usd,
-                )
-            except Exception:
-                logger.warning("Entry evaluation error for %s", ticker, exc_info=True)
-                continue
-
-            if not decision.should_enter:
-                continue
-
-            # Final risk gate (race-condition guard)
-            can_trade, reason = self._risk_manager.can_trade()
-            if not can_trade:
-                logger.info("Risk gate blocked entry for %s: %s", ticker, reason)
-                break
-
-            # Build and place the order
-            om_decision: OMEntryDecision | None = self._build_om_decision(decision)
-            if om_decision is None:
-                continue
-
-            logger.info(
-                "Entry signal: %s %s %.6f shares @ %.4f",
-                ticker,
-                decision.direction,
-                decision.position_size or 0.0,
-                decision.signal_price or 0.0,
-            )
-
-            if self._dry_run:
-                logger.info(
-                    "[DRY RUN] Would enter: %s %s %.6f shares @ %.4f, stop=%.4f, target=%.4f",
-                    ticker,
-                    decision.direction,
-                    decision.position_size or 0.0,
-                    decision.signal_price or 0.0,
-                    decision.stop_price or 0.0,
-                    decision.target_price or 0.0,
-                )
-                continue
-
-            trade_id: int | None = await self._order_manager.place_entry(om_decision)
-            if trade_id is not None:
-                logger.info("Entry order placed: %s trade_id=%d", ticker, trade_id)
-            else:
-                logger.warning("Entry order failed: %s", ticker)
-
-    def _build_om_decision(self, decision: EntryDecision) -> OMEntryDecision | None:
-        """Convert strategy EntryDecision to order-manager EntryDecision."""
-        if (
-            decision.position_size is None
-            or decision.signal_price is None
-            or decision.stop_price is None
-            or decision.target_price is None
-            or decision.hold_type is None
-            or decision.direction is None
-        ):
-            logger.warning(
-                "%s: incomplete EntryDecision — cannot build OM order",
-                decision.ticker,
-            )
-            return None
-
-        sector: str = GICS_SECTOR.get(decision.ticker, "Unknown")
-        currency: str = "USD"
-
-        return OMEntryDecision(
-            ticker=decision.ticker,
-            exchange=decision.exchange,
-            side="BUY" if decision.direction == "long" else "SELL",
-            shares=decision.position_size,
-            limit_price=decision.signal_price,
-            stop_price=decision.stop_price,
-            target_price=decision.target_price,
-            hold_type=decision.hold_type.value,
-            sector=sector,
-            phase=self._config.get_phase().value,
-            sentiment_score=decision.sentiment_score,
-            signals=json.dumps(decision.signals) if decision.signals else "",
-            currency=currency,
+        await self._strategy_manager.scan_for_entries(
+            watchlist=ms_watchlist,
+            get_5min_bars=self._get_5min_bars,
+            get_daily_bars=self._get_daily_bars,
+            account_equity_usd=ms_equity_usd,
         )
 
     def _is_on_cooldown(self, ticker: str) -> bool:

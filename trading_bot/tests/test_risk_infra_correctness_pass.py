@@ -1,13 +1,17 @@
 """Regression tests for the 2026-05-11 trading-path correctness pass.
 
-Covers items 10-14 from ``memory/risk_infrastructure_gaps``:
+Covers items 10, 12, 13, 14 from ``memory/risk_infrastructure_gaps``:
 
 - Item 10: ``update_trade_exit`` was deleted as dead code (broken
   ``commission`` reference, zero callers). The inline writer in
   ``order_manager._close_position`` is the single source of truth and
   already performs a rowcount check — verified separately. The
   regression we guard against here is the helper resurrecting.
-- Item 11: ``_compute_position_size`` honours ``fractional=True``.
+- Item 11: ``_compute_position_size`` fractional invariant — the
+  legacy ``EntryEvaluator`` helper was deleted in ai-broker#125.
+  Fractional sizing is now covered by
+  ``test_sizing_properties.py`` (against ``StrategyBase.size_by_risk``)
+  and ``test_multi_strategy_backtest.py::test_fractional_sizing``.
 - Item 12: ``save_risk_state`` is wrapped in BEGIN IMMEDIATE and rolls back.
 - Item 13: ``_find_existing_stop`` requires stop_price match when provided
   (asserted in ``test_phase3_regressions.py``).
@@ -30,7 +34,6 @@ from trading_bot.config import Config
 from trading_bot.db import repository as repo
 from trading_bot.db.migrations import run_migrations
 from trading_bot.execution.risk_manager import RiskManager
-from trading_bot.strategy.entry import EntryEvaluator
 
 pytestmark = pytest.mark.critical
 
@@ -87,65 +90,8 @@ def test_save_risk_state_rolls_back_on_upsert_failure(tmp_path) -> None:
         conn.close()
 
 
-# ---------------------------------------------------------------------------
-# Item 11 — _compute_position_size fractional flag
-# ---------------------------------------------------------------------------
-
-
-def _make_evaluator(config: Config, tmp_db_path: str) -> EntryEvaluator:
-    """Minimal evaluator with mocked external deps — only sizing math is exercised."""
-    return EntryEvaluator(
-        config=config,
-        technical=MagicMock(),
-        sentiment=MagicMock(),
-        earnings=MagicMock(),
-        market_data=MagicMock(),
-        db_path=tmp_db_path,
-    )
-
-
-class TestFractionalSizing:
-    """The legacy single-strategy sizing path is dead in production today,
-    but config flips re-activate it; the fractional knob is the same
-    safety net that protects fractional sizing in the active multi-
-    strategy path (``PositionSizer.calculate_fractional``).
-    """
-
-    @pytest.mark.parametrize(
-        "signal_price,stop_loss_pct,equity",
-        [
-            (137.0, 0.013, 1000.0),   # ratio crafted to leave a residue
-            (251.7, 0.0237, 5000.0),  # ditto, larger equity
-            (10.0, 0.02, 1000.0),     # clean division — both paths agree
-        ],
-    )
-    def test_fractional_geq_floored(
-        self, config: Config, tmp_db_path: str,
-        signal_price: float, stop_loss_pct: float, equity: float,
-    ) -> None:
-        """fractional=True must always return ≥ fractional=False (we just
-        skip the floor; no other arithmetic differs). For inputs that
-        would produce a residue, the inequality must be strict."""
-        from trading_bot.constants import Phase
-
-        ev = _make_evaluator(config, tmp_db_path)
-        common = dict(
-            ticker="SPY",
-            exchange="US",
-            signal_price=signal_price,
-            stop_loss_pct=stop_loss_pct,
-            account_equity_usd=equity,
-            atr_rank=50.0,
-            sentiment_size_mult=1.0,
-            phase=Phase.MICRO,
-        )
-        whole, _ = ev._compute_position_size(**common, fractional=False)  # type: ignore[arg-type]
-        frac, _ = ev._compute_position_size(**common, fractional=True)  # type: ignore[arg-type]
-
-        # Floored is always integer-valued.
-        assert whole == float(int(whole))
-        # Fractional never returns less than the floor of the same inputs.
-        assert frac >= whole - 1e-9
+# Item 11 — fractional sizing — see module docstring. Coverage moved to
+# test_sizing_properties.py and test_multi_strategy_backtest.py.
 
 
 # ---------------------------------------------------------------------------
