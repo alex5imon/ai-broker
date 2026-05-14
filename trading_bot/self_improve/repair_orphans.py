@@ -193,7 +193,7 @@ async def _repair_entry_failed(
     Three outcomes per row:
 
     - Order **filled and ticker is still held** → flip to
-      ``STOP_AND_TARGET_ACTIVE`` (adopt matching broker stop) or
+      ``STOP_ACTIVE`` (adopt matching broker stop) or
       ``POSITION_OPEN`` (no live stop yet — next reconciler tick
       attaches one).
     - Order **filled but ticker is NOT held at Alpaca** → mark
@@ -269,7 +269,7 @@ async def _repair_entry_failed(
         )
 
         new_status: str = (
-            PositionStatus.STOP_AND_TARGET_ACTIVE.value
+            PositionStatus.STOP_ACTIVE.value
             if stop_id is not None
             else PositionStatus.POSITION_OPEN.value
         )

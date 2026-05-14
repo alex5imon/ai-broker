@@ -69,7 +69,7 @@ def _entry(ticker: str = "SPY") -> EntryDecision:
 def _seed_open_position(
     om: OrderManager, ticker: str = "SPY"
 ) -> int:
-    """Helper: seed a STOP_AND_TARGET_ACTIVE position (entry already
+    """Helper: seed a STOP_ACTIVE position (entry already
     filled) ready for place_exit to act on."""
     trade_id = om._create_position_record(_entry(ticker))
     # Wire the in-memory _ActiveOrder so place_exit can find it.
@@ -80,7 +80,7 @@ def _seed_open_position(
         alpaca_entry_order_id="entry-1",
         alpaca_stop_order_id="stop-1",
         alpaca_target_order_id="target-1",
-        status=PositionStatus.STOP_AND_TARGET_ACTIVE,
+        status=PositionStatus.STOP_ACTIVE,
         entry_shares=10.0,
         filled_shares=10.0,
         entry_price=100.0,
@@ -90,7 +90,7 @@ def _seed_open_position(
         strategy_id="overnight_drift",
     )
     om._update_position_status(
-        trade_id, PositionStatus.STOP_AND_TARGET_ACTIVE,
+        trade_id, PositionStatus.STOP_ACTIVE,
     )
     return trade_id
 
@@ -168,7 +168,7 @@ async def test_cancel_rollback_clears_persisted_exit_order_id(
     config, tmp_db_path: str, mock_notifier,
 ):
     """If a limit exit is canceled/expired/rejected, the OM rolls back
-    the position to STOP_AND_TARGET_ACTIVE. The persisted exit_order_id
+    the position to STOP_ACTIVE. The persisted exit_order_id
     must also be cleared in the DB so the next tick re-evaluates the
     exit fresh and doesn't see a stale order id pointing at a dead
     Alpaca order."""
@@ -204,7 +204,7 @@ async def test_cancel_rollback_clears_persisted_exit_order_id(
     assert om._active_orders[trade_id].alpaca_exit_order_id is None
     assert (
         om._active_orders[trade_id].status
-        == PositionStatus.STOP_AND_TARGET_ACTIVE
+        == PositionStatus.STOP_ACTIVE
     )
     conn = sqlite3.connect(tmp_db_path)
     try:
@@ -215,7 +215,7 @@ async def test_cancel_rollback_clears_persisted_exit_order_id(
     finally:
         conn.close()
     assert row[0] is None, "DB column must be cleared on rollback"
-    assert row[1] == "STOP_AND_TARGET_ACTIVE"
+    assert row[1] == "STOP_ACTIVE"
 
 
 @pytest.mark.asyncio

@@ -373,7 +373,7 @@ The defer state is persisted in `tick_state` so a deferred exit picks up on the 
 Each position transitions through:
 
 ```
-SIGNAL_DETECTED → ENTRY_PENDING → POSITION_OPEN → STOP_AND_TARGET_ACTIVE
+SIGNAL_DETECTED → ENTRY_PENDING → POSITION_OPEN → STOP_ACTIVE
                                                       ↓
                                                 TRAILING_ACTIVE
                                                       ↓

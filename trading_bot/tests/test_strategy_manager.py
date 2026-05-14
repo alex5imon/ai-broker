@@ -759,7 +759,7 @@ class TestDrainDisabledSleeves:
             INSERT INTO positions (
                 ticker, exchange, currency, quantity, entry_price,
                 entry_time, status, hold_type, phase, strategy_id
-            ) VALUES (?, 'US', 'USD', 5.0, 100.0, ?, 'STOP_AND_TARGET_ACTIVE', 'swing', 1, ?)
+            ) VALUES (?, 'US', 'USD', 5.0, 100.0, ?, 'STOP_ACTIVE', 'swing', 1, ?)
             """,
             ("SPY", "2026-04-27T15:40:00-04:00", "breakout"),
         )
@@ -900,7 +900,7 @@ class TestDrainDisabledSleeves:
                 entry_time, status, hold_type, phase, strategy_id
             ) VALUES (99, 'SPY', 'US', 'USD', 1.0, 100.0,
                       '2026-04-27T15:40:00-04:00',
-                      'STOP_AND_TARGET_ACTIVE', 'swing', 1, 'breakout')
+                      'STOP_ACTIVE', 'swing', 1, 'breakout')
             """
         )
         conn.commit()
@@ -983,7 +983,7 @@ class TestDrainDisabledSleeves:
                 entry_time, status, hold_type, phase, strategy_id
             ) VALUES (77, 'SPY', 'US', 'USD', 1.0, 100.0,
                       '2026-04-27T15:40:00-04:00',
-                      'STOP_AND_TARGET_ACTIVE', 'swing', 1, 'breakout')
+                      'STOP_ACTIVE', 'swing', 1, 'breakout')
             """
         )
         conn.commit()
@@ -1018,7 +1018,7 @@ class TestDrainDisabledSleeves:
             ).fetchone()
         finally:
             conn.close()
-        assert row[0] == "STOP_AND_TARGET_ACTIVE"
+        assert row[0] == "STOP_ACTIVE"
 
     @pytest.mark.asyncio
     async def test_drain_proceeds_when_alpaca_confirms_same_side(
@@ -1045,7 +1045,7 @@ class TestDrainDisabledSleeves:
                 entry_time, status, hold_type, phase, strategy_id
             ) VALUES ('SPY', 'US', 'USD', 5.0, 100.0,
                       '2026-04-27T15:40:00-04:00',
-                      'STOP_AND_TARGET_ACTIVE', 'swing', 1, 'breakout')
+                      'STOP_ACTIVE', 'swing', 1, 'breakout')
             """
         )
         conn.commit()
@@ -1110,7 +1110,7 @@ class TestDrainDisabledSleeves:
                 entry_time, status, hold_type, phase, strategy_id
             ) VALUES ('SPY', 'US', 'USD', 10.0, 100.0,
                       '2026-04-27T15:40:00-04:00',
-                      'STOP_AND_TARGET_ACTIVE', 'swing', 1, 'breakout')
+                      'STOP_ACTIVE', 'swing', 1, 'breakout')
             """
         )
         conn.commit()
@@ -1170,7 +1170,7 @@ class TestDrainDisabledSleeves:
                 entry_time, status, hold_type, phase, strategy_id
             ) VALUES ('SPY', 'US', 'USD', 5.0, 100.0,
                       '2026-04-27T15:40:00-04:00',
-                      'STOP_AND_TARGET_ACTIVE', 'swing', 1, 'breakout')
+                      'STOP_ACTIVE', 'swing', 1, 'breakout')
             """
         )
         conn.commit()
@@ -1234,10 +1234,10 @@ class TestDrainDisabledSleeves:
             ) VALUES
               ('SPY',  'US', 'USD', 5.0, 100.0,
                '2026-04-27T15:40:00-04:00',
-               'STOP_AND_TARGET_ACTIVE', 'swing', 1, 'breakout'),
+               'STOP_ACTIVE', 'swing', 1, 'breakout'),
               ('XLRE', 'US', 'USD', 20.0, 50.0,
                '2026-04-28T09:40:00-04:00',
-               'STOP_AND_TARGET_ACTIVE', 'swing', 1, 'trend_following')
+               'STOP_ACTIVE', 'swing', 1, 'trend_following')
             """
         )
         conn.commit()
@@ -1310,7 +1310,7 @@ class TestDrainDisabledSleeves:
                 entry_time, status, hold_type, phase, strategy_id
             ) VALUES ('SPY', 'US', 'USD', 10.0, 100.0,
                       '2026-04-27T15:40:00-04:00',
-                      'STOP_AND_TARGET_ACTIVE', 'swing', 1, 'breakout')
+                      'STOP_ACTIVE', 'swing', 1, 'breakout')
             """
         )
         conn.commit()
@@ -1365,7 +1365,7 @@ class TestDrainDisabledSleeves:
                 entry_time, status, hold_type, phase, strategy_id
             ) VALUES ('SPY', 'US', 'USD', 10.0, 100.0,
                       '2026-04-27T15:40:00-04:00',
-                      'STOP_AND_TARGET_ACTIVE', 'swing', 1, 'breakout')
+                      'STOP_ACTIVE', 'swing', 1, 'breakout')
             """
         )
         conn.commit()
@@ -1435,7 +1435,7 @@ class TestDrainDisabledSleeves:
                 entry_time, status, hold_type, phase, strategy_id
             ) VALUES (55, 'SPY', 'US', 'USD', 1.0, 100.0,
                       '2026-04-27T15:40:00-04:00',
-                      'STOP_AND_TARGET_ACTIVE', 'swing', 1, 'breakout')
+                      'STOP_ACTIVE', 'swing', 1, 'breakout')
             """
         )
         conn.commit()
@@ -1474,7 +1474,7 @@ class TestDrainDisabledSleeves:
             ).fetchone()
         finally:
             conn.close()
-        assert row[0] == "STOP_AND_TARGET_ACTIVE", (
+        assert row[0] == "STOP_ACTIVE", (
             "transient Alpaca error must NOT mark DB CLOSED — pre-fix "
             "regression"
         )
@@ -1504,7 +1504,7 @@ class TestDrainDisabledSleeves:
                 entry_time, status, hold_type, phase, strategy_id
             ) VALUES (66, 'SPY', 'US', 'USD', 1.0, 100.0,
                       '2026-04-27T15:40:00-04:00',
-                      'STOP_AND_TARGET_ACTIVE', 'swing', 1, 'breakout')
+                      'STOP_ACTIVE', 'swing', 1, 'breakout')
             """
         )
         conn.commit()
@@ -1537,7 +1537,7 @@ class TestDrainDisabledSleeves:
             ).fetchone()
         finally:
             conn.close()
-        assert row[0] == "STOP_AND_TARGET_ACTIVE"
+        assert row[0] == "STOP_ACTIVE"
 
 
 # ---------------------------------------------------------------------------

@@ -62,7 +62,7 @@ class PositionStatus(str, Enum):
     """
     ENTRY_PENDING = "ENTRY_PENDING"
     POSITION_OPEN = "POSITION_OPEN"
-    STOP_AND_TARGET_ACTIVE = "STOP_AND_TARGET_ACTIVE"
+    STOP_ACTIVE = "STOP_ACTIVE"
     TRAILING_ACTIVE = "TRAILING_ACTIVE"
     CLOSING = "CLOSING"
     CLOSED = "CLOSED"
@@ -196,4 +196,4 @@ def ticker_market(ticker: str) -> Market:
 # Schema version — must match the DB migration target
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION: int = 11
+SCHEMA_VERSION: int = 12

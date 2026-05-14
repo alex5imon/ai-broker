@@ -37,15 +37,18 @@ says "exercise extreme care with all order logic."
 - **#41 — Verify PR #20 drain logic.** The verify-before-SELL guard merged after
   the churn it was meant to prevent; needs unit + integration coverage before
   the next sleeve-disable event proves it the hard way.
-- **Rename `STOP_AND_TARGET_ACTIVE` → `STOP_ACTIVE`.** Under the
-  ai-broker#39 entry path only the stop is broker-side (take-profit is
-  polled in `main.check_exits` against `target_price`), so the status
-  name is semantically inaccurate. Deferred from #39 because the rename
-  touches 45 references across 10 files plus a DB migration on the
-  GHA-cached SQLite — too much churn pre-launch for a naming fix.
-  Action: add `PositionStatus.STOP_ACTIVE`, migration v11 (`UPDATE
-  positions SET status='STOP_ACTIVE' WHERE status='STOP_AND_TARGET_ACTIVE'`),
-  bump SCHEMA_VERSION, sweep tests + scripts. No behavior change.
+- **~~Rename `STOP_AND_TARGET_ACTIVE` → `STOP_ACTIVE`.~~** **Resolved by
+  ai-broker#54.** Under the ai-broker#39 entry path only the stop is
+  broker-side (take-profit is polled in `main.check_exits` against
+  `target_price`), so the status name was semantically inaccurate.
+  Deferred from #39 because the rename touched 45+ references across
+  10+ files plus a DB migration on the GHA-cached SQLite — too much
+  churn pre-launch for a naming fix. Landed in ai-broker#54: added
+  `PositionStatus.STOP_ACTIVE`, migration V12 (`UPDATE positions SET
+  status='STOP_ACTIVE' WHERE status='STOP_AND_TARGET_ACTIVE'`), bumped
+  `SCHEMA_VERSION` to 12, swept call-sites and tests. No behavior
+  change. Historical SQL snapshots below still quote the legacy value
+  verbatim — that's the audit trail of what was in the DB at the time.
 
 The legacy "Task #2 / #3 / Bug B6" sections below are kept for the audit trail
 but their resolved status is summarized at the top of each.

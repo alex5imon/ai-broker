@@ -468,7 +468,7 @@ class OrderManager:
 
             # Check exit orders (stop/target/trail)
             if active.status in (
-                PositionStatus.STOP_AND_TARGET_ACTIVE,
+                PositionStatus.STOP_ACTIVE,
                 PositionStatus.TRAILING_ACTIVE,
             ):
                 for order_id_attr, exit_reason in [
@@ -505,7 +505,7 @@ class OrderManager:
                             # Issue #117 failure mode A: a stop/target/trail
                             # cancelled at the broker (DAY expiry, external
                             # cancel, EOD wind-down) leaves the row pinned to
-                            # STOP_AND_TARGET_ACTIVE with a dead order_id —
+                            # STOP_ACTIVE with a dead order_id —
                             # subsequent ticks never re-attach because no
                             # branch handles that state. Clear the dead id
                             # and, for the protective stop specifically,
@@ -537,7 +537,7 @@ class OrderManager:
                                 # (alpaca_stop_order_id) is independent —
                                 # not nulled when activate_trailing_stop
                                 # ran, so the position is still protected.
-                                # Demote to STOP_AND_TARGET_ACTIVE so the
+                                # Demote to STOP_ACTIVE so the
                                 # trail re-activation logic in
                                 # check_trail_activations can re-fire
                                 # next time price crosses the threshold;
@@ -546,11 +546,11 @@ class OrderManager:
                                 # forever.
                                 active.trail_activated = False
                                 active.status = (
-                                    PositionStatus.STOP_AND_TARGET_ACTIVE
+                                    PositionStatus.STOP_ACTIVE
                                 )
                                 self._update_position_status(
                                     trade_id,
-                                    PositionStatus.STOP_AND_TARGET_ACTIVE,
+                                    PositionStatus.STOP_ACTIVE,
                                 )
                             # Don't continue checking remaining legs on
                             # this iteration — the row's status has
@@ -664,17 +664,17 @@ class OrderManager:
                                 )
                     elif exit_order.status.value in ("canceled", "expired", "rejected"):  # type: ignore[union-attr]
                         # Limit exit didn't fill (e.g. price gapped through
-                        # the limit). Roll back to STOP_AND_TARGET_ACTIVE so
+                        # the limit). Roll back to STOP_ACTIVE so
                         # the next tick re-evaluates the exit condition; the
                         # protective stop is re-attached by recovery if it
                         # was cancelled.
                         logger.warning(
-                            "Strategy exit %s for %s — rolling back to STOP_AND_TARGET_ACTIVE",
+                            "Strategy exit %s for %s — rolling back to STOP_ACTIVE",
                             exit_order.status.value, active.ticker,  # type: ignore[union-attr]
                         )
                         active.alpaca_exit_order_id = None
                         active.exit_reason = None
-                        active.status = PositionStatus.STOP_AND_TARGET_ACTIVE
+                        active.status = PositionStatus.STOP_ACTIVE
                         # V11+: clear the persisted exit order_id too,
                         # so the next tick re-evaluates the exit
                         # condition cleanly instead of seeing a stale
@@ -683,7 +683,7 @@ class OrderManager:
                             trade_id, "alpaca_exit_order_id", None,
                         )
                         self._update_position_status(
-                            trade_id, PositionStatus.STOP_AND_TARGET_ACTIVE,
+                            trade_id, PositionStatus.STOP_ACTIVE,
                         )
                 except Exception:
                     logger.warning(
@@ -1172,7 +1172,7 @@ class OrderManager:
                     matching_active.exit_reason = reason
                 # Persist the exit order_id BEFORE flipping status to
                 # CLOSING — a crash between the two writes leaves the
-                # row still STOP_AND_TARGET_ACTIVE with the order id
+                # row still STOP_ACTIVE with the order id
                 # set, which the next tick's rehydration handles
                 # gracefully. V11+: column lives on positions table.
                 self._update_position_field(
@@ -1427,8 +1427,8 @@ class OrderManager:
         # tree). Under this entry path only the stop is broker-side; take-
         # profit is polled in main.check_exits via target_price. Renaming is
         # tracked as a post-launch follow-up.
-        active.status = PositionStatus.STOP_AND_TARGET_ACTIVE
-        self._update_position_status(trade_id, PositionStatus.STOP_AND_TARGET_ACTIVE)
+        active.status = PositionStatus.STOP_ACTIVE
+        self._update_position_status(trade_id, PositionStatus.STOP_ACTIVE)
         logger.info(
             "Protective stop active for %s (trade_id=%d): stop_id=%s @ %.4f",
             active.ticker, trade_id, stop_id, active.stop_price,
@@ -1634,9 +1634,9 @@ class OrderManager:
             self._update_position_field(
                 trade_id, "alpaca_stop_order_id", recovered,
             )
-            active.status = PositionStatus.STOP_AND_TARGET_ACTIVE
+            active.status = PositionStatus.STOP_ACTIVE
             self._update_position_status(
-                trade_id, PositionStatus.STOP_AND_TARGET_ACTIVE,
+                trade_id, PositionStatus.STOP_ACTIVE,
             )
             await self._notifier.send(
                 "Stop Recovery: Adopted Existing Broker Stop",
@@ -1671,9 +1671,9 @@ class OrderManager:
         active.alpaca_stop_order_id = stop_id
         self._alpaca_to_trade[stop_id] = trade_id
         self._update_position_field(trade_id, "alpaca_stop_order_id", stop_id)
-        active.status = PositionStatus.STOP_AND_TARGET_ACTIVE
+        active.status = PositionStatus.STOP_ACTIVE
         self._update_position_status(
-            trade_id, PositionStatus.STOP_AND_TARGET_ACTIVE,
+            trade_id, PositionStatus.STOP_ACTIVE,
         )
         logger.warning(
             "Stop recovery: attached fresh stop %s for %s (trade_id=%d, "
@@ -1733,7 +1733,7 @@ class OrderManager:
         for trade_id, active in list(self._active_orders.items()):
             if active.trail_activated:
                 continue
-            if active.status != PositionStatus.STOP_AND_TARGET_ACTIVE:
+            if active.status != PositionStatus.STOP_ACTIVE:
                 continue
             if active.trail_pct is None or active.trail_activation_price is None:
                 continue

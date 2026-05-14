@@ -389,3 +389,8 @@ Counts above map directly to the data-layer bugs in [docs/self_improve_followups
 ---
 
 _This report is read-only. No DB rows were modified and no orders were submitted. Use it to plan Phase 2 (DB migration) and Phase 3 (live order logic fixes)._
+
+> **Note (post-hoc):** The status value `STOP_AND_TARGET_ACTIVE` quoted
+> throughout this report was renamed to `STOP_ACTIVE` in ai-broker#54
+> (V12 migration). The historical text is left intact as the audit
+> trail of what was actually in the DB at the time of the snapshot.

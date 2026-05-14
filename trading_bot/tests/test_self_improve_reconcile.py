@@ -322,7 +322,7 @@ def _seed_realistic_db(conn: sqlite3.Connection) -> None:
     conn.execute(
         "INSERT INTO positions (ticker, exchange, currency, quantity, "
         "entry_price, entry_time, status, hold_type, phase, strategy_id) "
-        "VALUES ('XLF','ARCA','USD',5,40.0,?,'STOP_AND_TARGET_ACTIVE',"
+        "VALUES ('XLF','ARCA','USD',5,40.0,?,'STOP_ACTIVE',"
         "'intraday',1,'breakout')",
         (ENTRY_TIME.isoformat(),),
     )

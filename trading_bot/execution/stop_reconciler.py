@@ -90,7 +90,7 @@ class ReconciliationResult:
 # the market-hours gate.
 _STATUSES_NEEDING_STOP: tuple[str, ...] = (
     PositionStatus.POSITION_OPEN.value,
-    PositionStatus.STOP_AND_TARGET_ACTIVE.value,
+    PositionStatus.STOP_ACTIVE.value,
     PositionStatus.TRAILING_ACTIVE.value,
 )
 
