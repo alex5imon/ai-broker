@@ -330,6 +330,26 @@ class TradingBot:
             except Exception:
                 logger.warning("Order status poll failed", exc_info=True)
 
+            # --- 6b. Naked-position reconciliation (issue #117) ---
+            # Walks DB-open rows and verifies each has an active broker
+            # stop. Surfaces the issue #117 failure surface even when
+            # the in-tick recovery silently heals — operator visibility
+            # is the goal (the in-tick recovery is the actual healer).
+            try:
+                from trading_bot.execution.stop_reconciler import (
+                    reconcile_open_position_stops,
+                )
+                await reconcile_open_position_stops(
+                    db_path=self._db_path,
+                    gateway=self._gateway,
+                    notifier=self._notifier,
+                )
+            except Exception:
+                logger.warning(
+                    "Naked-position reconciliation failed (non-fatal)",
+                    exc_info=True,
+                )
+
             # --- 7. Phase 0 one-time marker (Alpaca has no legacy cleanup) ---
             if not self._is_phase0_complete():
                 self._record_phase_transition(

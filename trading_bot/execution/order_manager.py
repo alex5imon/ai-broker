@@ -501,11 +501,55 @@ class OrderManager:
                                 hold_time="", exit_reason=exit_reason.value,
                             )
                             break
+                        if order.status.value in ("canceled", "expired", "rejected"):
+                            # Issue #117 failure mode A: a stop/target/trail
+                            # cancelled at the broker (DAY expiry, external
+                            # cancel, EOD wind-down) leaves the row pinned to
+                            # STOP_AND_TARGET_ACTIVE with a dead order_id —
+                            # subsequent ticks never re-attach because no
+                            # branch handles that state. Clear the dead id
+                            # and, for the protective stop specifically,
+                            # demote to POSITION_OPEN so the recovery branch
+                            # below re-attaches a fresh stop this tick.
+                            logger.warning(
+                                "Exit order %s for %s is %s — clearing dead id "
+                                "(trade_id=%d, leg=%s)",
+                                order_id, active.ticker, order.status.value,
+                                trade_id, order_id_attr,
+                            )
+                            setattr(active, order_id_attr, None)
+                            self._update_position_field(
+                                trade_id, order_id_attr, None,
+                            )
+                            self._alpaca_to_trade.pop(order_id, None)
+                            if order_id_attr == "alpaca_stop_order_id":
+                                active.status = PositionStatus.POSITION_OPEN
+                                self._update_position_status(
+                                    trade_id, PositionStatus.POSITION_OPEN,
+                                )
                     except Exception:
                         logger.warning(
                             "Error checking exit order for %s", active.ticker,
                             exc_info=True,
                         )
+
+            # Issue #117 failure modes B & C: a position can land in
+            # POSITION_OPEN with alpaca_stop_order_id=NULL when
+            # _transition_to_open was interrupted between the status flip
+            # (line 1281) and the stop-id write (line 1337) — a killed
+            # cron tick, an SDK hang, or a silent submit-response loss.
+            # Pre-fix the only thing that healed this was the next-market-
+            # open _verify_stop_orders sweep, leaving the position naked
+            # for up to a full overnight + weekend window. Re-attempt the
+            # stop attach during market hours so the protective stop is
+            # back on the book within one tick (≤ 5 min) of the gap.
+            if (
+                active.status == PositionStatus.POSITION_OPEN
+                and active.alpaca_stop_order_id is None
+                and active.filled_shares > 0
+                and active.stop_price > 0
+            ):
+                await self._recover_missing_stop(trade_id, active)
 
             # Strategy-driven exit (place_exit / place_limit_exit). Without
             # this branch the row stays CLOSING until the next tick's
@@ -1456,6 +1500,157 @@ class OrderManager:
                     continue
             return str(order.id)
         return None
+
+    # Minimum seconds before close required for a DAY stop to make it onto
+    # the book before Alpaca defers it to the next session. Mirrors
+    # recovery._STOP_VERIFY_CLOSE_BUFFER_SEC (PR #102) — the same phantom-
+    # stop bug applies here: a stop submitted at 15:57 ET is deferred to
+    # the next session's pre-market open where it holds the qty and
+    # blocks the morning's strategy exit.
+    _STOP_RECOVER_CLOSE_BUFFER_SEC: int = 300
+
+    async def _inside_market_hours_for_stop_attach(self) -> bool:
+        """Return True when the recovery branch may submit a fresh stop.
+
+        Primary: consult Alpaca's clock (`is_open` + `next_close`) so
+        early-close days (Thanksgiving Friday, July 3, Christmas Eve)
+        are handled correctly — a fixed 15:55 ET cutoff would happily
+        place a stop at 13:30 on an early-close day, which Alpaca would
+        defer to the next session.
+
+        Fallback: fixed time gate 09:30 ≤ now_et < 15:55 ET.
+        """
+        try:
+            clock = await asyncio.to_thread(self._gw.client.get_clock)
+            is_open = getattr(clock, "is_open", None)
+            if isinstance(is_open, bool):
+                if not is_open:
+                    return False
+                next_close = getattr(clock, "next_close", None)
+                if isinstance(next_close, datetime):
+                    if next_close.tzinfo is None:
+                        next_close = next_close.replace(tzinfo=ET)
+                    seconds_to_close: float = (
+                        next_close - datetime.now(tz=ET)
+                    ).total_seconds()
+                    if seconds_to_close < self._STOP_RECOVER_CLOSE_BUFFER_SEC:
+                        return False
+                return True
+        except Exception:
+            logger.debug(
+                "AlpacaClock unavailable for stop-recover gate; "
+                "falling back to fixed time window",
+                exc_info=True,
+            )
+        now_et: datetime = datetime.now(tz=ET)
+        hhmm: int = now_et.hour * 60 + now_et.minute
+        return 9 * 60 + 30 <= hhmm < 15 * 60 + 55
+
+    async def _recover_missing_stop(
+        self, trade_id: int, active: _ActiveOrder,
+    ) -> None:
+        """Attach a standalone stop on a POSITION_OPEN row that has none.
+
+        Called from ``_check_order_statuses`` when a row is rehydrated
+        with ``status=POSITION_OPEN`` and ``alpaca_stop_order_id=NULL``
+        — the survivor of a crashed/interrupted ``_transition_to_open``
+        (issue #117 failure modes B & C) or of a stop that was cancelled
+        at the broker without re-attachment (failure mode A, after the
+        cancellation handler in ``_check_order_statuses`` demotes the
+        row's status). Gated on market hours to avoid the phantom-stop
+        bug that PR #102 fixed for ``recovery._verify_stop_orders``.
+
+        On submit-response loss (alpaca-py occasionally raises after
+        Alpaca accepted the order) we adopt any matching open stop via
+        ``_find_existing_stop`` rather than emergency-flattening a real
+        position. On total failure the row stays POSITION_OPEN so the
+        next tick retries — and ``recovery._verify_stop_orders`` is the
+        ultimate fallback at the next market open.
+        """
+        if not await self._inside_market_hours_for_stop_attach():
+            logger.info(
+                "Stop recovery deferred for %s (trade_id=%d) — outside "
+                "safe placement window; next market-open recovery sweep "
+                "will heal.",
+                active.ticker, trade_id,
+            )
+            return
+
+        recovered: str | None = await self._find_existing_stop(
+            active.ticker, active.filled_shares, stop_price=active.stop_price,
+        )
+        if recovered is not None:
+            logger.warning(
+                "Stop recovery: adopting existing broker stop for %s "
+                "(trade_id=%d, alpaca_id=%s) — DB row was POSITION_OPEN "
+                "with no recorded stop_order_id.",
+                active.ticker, trade_id, recovered,
+            )
+            active.alpaca_stop_order_id = recovered
+            self._alpaca_to_trade[recovered] = trade_id
+            self._update_position_field(
+                trade_id, "alpaca_stop_order_id", recovered,
+            )
+            active.status = PositionStatus.STOP_AND_TARGET_ACTIVE
+            self._update_position_status(
+                trade_id, PositionStatus.STOP_AND_TARGET_ACTIVE,
+            )
+            await self._notifier.send(
+                "Stop Recovery: Adopted Existing Broker Stop",
+                (
+                    f"Adopted broker-side stop for {active.ticker} "
+                    f"(trade_id={trade_id}, alpaca_id={recovered}). "
+                    f"Position was POSITION_OPEN without a recorded "
+                    f"stop_order_id; investigate issue #117 lineage."
+                ),
+                priority=3,
+                tags=["warning"],
+            )
+            return
+
+        stop_id: str | None = await self._place_standalone_stop(
+            trade_id, active, active.filled_shares,
+        )
+        if stop_id is None:
+            logger.warning(
+                "Stop recovery: submit failed for %s (trade_id=%d, "
+                "qty=%.6f, stop=%.4f) — leaving POSITION_OPEN for next "
+                "tick retry; recovery._verify_stop_orders is the final "
+                "fallback at next market open.",
+                active.ticker, trade_id,
+                active.filled_shares, active.stop_price,
+            )
+            return
+
+        # Persist the order_id BEFORE the status flip so a crash between
+        # the two writes leaves the row POSITION_OPEN + stop_id set —
+        # the next tick's recovery treats that as already-healed.
+        active.alpaca_stop_order_id = stop_id
+        self._alpaca_to_trade[stop_id] = trade_id
+        self._update_position_field(trade_id, "alpaca_stop_order_id", stop_id)
+        active.status = PositionStatus.STOP_AND_TARGET_ACTIVE
+        self._update_position_status(
+            trade_id, PositionStatus.STOP_AND_TARGET_ACTIVE,
+        )
+        logger.warning(
+            "Stop recovery: attached fresh stop %s for %s (trade_id=%d, "
+            "qty=%.6f, stop=%.4f) — position was naked since prior tick.",
+            stop_id, active.ticker, trade_id,
+            active.filled_shares, active.stop_price,
+        )
+        await self._notifier.send(
+            "Stop Recovery: Re-attached Protective Stop",
+            (
+                f"Re-attached protective stop for {active.ticker} "
+                f"(trade_id={trade_id}, qty={active.filled_shares:.6f}, "
+                f"stop=${active.stop_price:.4f}, alpaca_id={stop_id}). "
+                f"Position was POSITION_OPEN without a stop; this is "
+                f"the issue #117 failure surface — investigate prior "
+                f"tick's logs."
+            ),
+            priority=3,
+            tags=["warning"],
+        )
 
     async def activate_trailing_stop(self, trade_id: int, trail_pct: float) -> bool:
         """Activate trailing stop, replacing the take-profit order."""
