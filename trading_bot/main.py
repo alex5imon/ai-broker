@@ -43,6 +43,7 @@ from trading_bot.execution.loss_cooldown import LossCooldownConfig, LossCooldown
 from trading_bot.execution.order_manager import EntryDecision as OMEntryDecision
 from trading_bot.execution.order_manager import OrderManager
 from trading_bot.execution.risk_manager import RiskManager
+from trading_bot.execution.stop_reconciler import reconcile_open_position_stops
 from trading_bot.gateway.connection import GatewayConnection
 from trading_bot.gateway.recovery import StateRecovery
 from trading_bot.notifications.notifier import Notifier
@@ -329,6 +330,23 @@ class TradingBot:
                 await self._order_manager._check_order_statuses()
             except Exception:
                 logger.warning("Order status poll failed", exc_info=True)
+
+            # --- 6b. Naked-position reconciliation (issue #117) ---
+            # Walks DB-open rows and verifies each has an active broker
+            # stop. Surfaces the issue #117 failure surface even when
+            # the in-tick recovery silently heals — operator visibility
+            # is the goal (the in-tick recovery is the actual healer).
+            try:
+                await reconcile_open_position_stops(
+                    db_path=self._db_path,
+                    gateway=self._gateway,
+                    notifier=self._notifier,
+                )
+            except Exception:
+                logger.warning(
+                    "Naked-position reconciliation failed (non-fatal)",
+                    exc_info=True,
+                )
 
             # --- 7. Phase 0 one-time marker (Alpaca has no legacy cleanup) ---
             if not self._is_phase0_complete():
