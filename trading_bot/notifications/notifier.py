@@ -8,6 +8,7 @@ HTTP POST via ``requests`` and return immediately.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import subprocess
@@ -121,7 +122,11 @@ class Notifier:
             )
             return
 
-        self._do_send(title, message, priority, resolved_tags)
+        # Offload the blocking ``requests.post`` to a worker thread so the
+        # event loop keeps making progress when ntfy.sh is slow or rate-limited.
+        await asyncio.to_thread(
+            self._do_send, title, message, priority, resolved_tags
+        )
 
     def send_sync(
         self,
