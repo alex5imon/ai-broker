@@ -208,6 +208,12 @@ class TradingBot:
             Market.US: [],
         }
 
+        # Cached at init so _rank_watchlist doesn't hit the config dict per
+        # ticker. See ai-broker#58 (M-2).
+        self._sentiment_composite_offset: float = float(
+            self._config._get("entry", "sentiment_composite_offset", default=0.0)
+        )
+
         logger.info(
             "TradingBot initialised (phase=%s, mode=%s, account=%s, dry_run=%s)",
             config.get_phase().name,
@@ -593,7 +599,14 @@ class TradingBot:
     async def _rank_watchlist(
         self, watchlist: list[str], market: Market, exchange_str: str
     ) -> list[str]:
-        """Rank tickers by sentiment_score * (1 + gap_pct) descending."""
+        """Rank tickers by (offset + sentiment_score) * (1 + gap_pct) descending.
+
+        ``offset`` defaults to 0.0 — neutral sentiment zero-weights the gap
+        component and negative sentiment penalises ranking. Set
+        ``entry.sentiment_composite_offset`` in config.yaml to override
+        (e.g. 0.5 to restore the pre-#58 legacy behavior).
+        """
+        offset: float = self._sentiment_composite_offset
         scores: list[tuple[str, float]] = []
 
         for ticker in watchlist:
@@ -615,7 +628,7 @@ class TradingBot:
                         if prev_close > 0:
                             gap_pct = abs(current_price - prev_close) / prev_close
 
-                composite: float = (0.5 + sentiment_score) * (1.0 + gap_pct)
+                composite: float = (offset + sentiment_score) * (1.0 + gap_pct)
                 scores.append((ticker, composite))
             except Exception:
                 logger.warning("Ranking failed for %s", ticker, exc_info=True)
