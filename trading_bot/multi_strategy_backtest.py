@@ -1319,6 +1319,15 @@ class MultiStrategyBacktester:
         # ``prev_day is None`` on the very first bar prevents the read,
         # but explicit init removes the smell.
         day_start_equity: dict[str, float] = {}
+        # Last bar's close, used as the mark-to-market price for open
+        # positions when crossing a day boundary. Pre-fix this code path
+        # marked positions at ``entry_price`` (= cost basis) and never
+        # updated ``peak_equity_usd``/``max_drawdown_pct``, which made
+        # MaxDD report 0.0% on every --spy run regardless of actual
+        # equity excursions. ``run_multi_ticker_intraday`` and
+        # ``run_daily_backtest`` mark at the latest close and track DD
+        # correctly — this aligns ``run_spy_intraday`` with them.
+        last_close: float = 0.0
 
         for bar_idx in range(LOOKBACK_BARS, len(df_5min)):
             bar = df_5min.iloc[bar_idx]
@@ -1336,8 +1345,14 @@ class MultiStrategyBacktester:
             if bar_date != prev_day:
                 if prev_day is not None:
                     for sid, st in states.items():
+                        # Mark open positions at the previous day's
+                        # last close (``last_close``), not at entry
+                        # price. Without this, intraday and overnight
+                        # P&L on still-open positions never reflects
+                        # in equity, so peak/DD stay anchored at the
+                        # opening cash balance.
                         pos_value = sum(
-                            t.entry_price * t.shares for t in st.open_positions
+                            last_close * t.shares for t in st.open_positions
                         )
                         total_now = st.cash_usd + pos_value
                         total_before = day_start_equity.get(sid, total_now)
@@ -1347,6 +1362,20 @@ class MultiStrategyBacktester:
                             )
                         else:
                             st.daily_returns.append(0.0)
+                        # Update peak / max drawdown at the day boundary.
+                        # Mirrors the same block in
+                        # ``run_multi_ticker_intraday`` (~L1825) and
+                        # ``run_daily_backtest`` (~L678). Pre-fix this
+                        # block was absent and MaxDD never moved off 0.0.
+                        if total_now > st.peak_equity_usd:
+                            st.peak_equity_usd = total_now
+                        if st.peak_equity_usd > 0:
+                            dd_pct = (
+                                (st.peak_equity_usd - total_now)
+                                / st.peak_equity_usd * 100
+                            )
+                            if dd_pct > st.max_drawdown_pct:
+                                st.max_drawdown_pct = dd_pct
 
                     for st in states.values():
                         for trade in st.open_positions:
@@ -1354,8 +1383,12 @@ class MultiStrategyBacktester:
 
                 day_start_equity = {}
                 for sid, st in states.items():
+                    # Baseline for the new day's daily_returns. Use the
+                    # most recent close (= previous day's close, which
+                    # equals today's pre-open mark) to keep open
+                    # positions valued at market.
                     pos_value = sum(
-                        t.entry_price * t.shares for t in st.open_positions
+                        last_close * t.shares for t in st.open_positions
                     )
                     day_start_equity[sid] = st.cash_usd + pos_value
 
@@ -1492,6 +1525,10 @@ class MultiStrategyBacktester:
                     st.open_positions.append(trade)
                     st.cash_usd -= cost
                     st.trade_count += 1
+
+            # End-of-bar bookkeeping: remember the close so the next
+            # day-boundary block can mark-to-market and update DD.
+            last_close = bar_close
 
             # Progress logging
             if bar_idx % 10000 == 0:
