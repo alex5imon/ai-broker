@@ -47,7 +47,14 @@ class MeanReversionStrategy(StrategyBase):
         self._atr_activation_mult: float = float(config.get("atr_activation_mult", 2.5))
         self._risk_per_trade_pct: float = float(config.get("risk_per_trade_pct", 0.02))
         self._max_position_pct: float = float(config.get("max_position_pct", 0.40))
-        self._fractional_shares: bool = bool(config.get("fractional_shares", False))
+        # Default True for consistency with overnight_drift / ORB and to
+        # match the ai-broker#39 plain-limit + standalone-stop entry path,
+        # which is the path the $1k live account *must* take. Whole shares
+        # at $1k with SPY/QQQ/XLK >$400 floors to 0, dropping ~50% of
+        # mean_reversion signals — see PR #38 / issue ai-broker#39. Live
+        # config.yaml sets this explicitly to True; the default exists so
+        # a forgotten override does not silently regress to the floor.
+        self._fractional_shares: bool = bool(config.get("fractional_shares", True))
         # Let winners run past the target. When true, the ATR-derived target
         # is used as the trailing-stop activation price (not a hard exit).
         # Exits become: stop loss, trailing stop after activation, or RSI exit.
