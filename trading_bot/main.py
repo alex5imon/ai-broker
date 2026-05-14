@@ -43,6 +43,7 @@ from trading_bot.execution.loss_cooldown import LossCooldownConfig, LossCooldown
 from trading_bot.execution.order_manager import EntryDecision as OMEntryDecision
 from trading_bot.execution.order_manager import OrderManager
 from trading_bot.execution.risk_manager import RiskManager
+from trading_bot.execution.stop_reconciler import reconcile_open_position_stops
 from trading_bot.gateway.connection import GatewayConnection
 from trading_bot.gateway.recovery import StateRecovery
 from trading_bot.notifications.notifier import Notifier
@@ -336,9 +337,6 @@ class TradingBot:
             # the in-tick recovery silently heals — operator visibility
             # is the goal (the in-tick recovery is the actual healer).
             try:
-                from trading_bot.execution.stop_reconciler import (
-                    reconcile_open_position_stops,
-                )
                 await reconcile_open_position_stops(
                     db_path=self._db_path,
                     gateway=self._gateway,

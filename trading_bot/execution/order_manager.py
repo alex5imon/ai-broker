@@ -523,10 +523,40 @@ class OrderManager:
                             )
                             self._alpaca_to_trade.pop(order_id, None)
                             if order_id_attr == "alpaca_stop_order_id":
+                                # Protective stop gone — demote so the
+                                # recovery branch below re-attaches.
                                 active.status = PositionStatus.POSITION_OPEN
                                 self._update_position_status(
                                     trade_id, PositionStatus.POSITION_OPEN,
                                 )
+                            elif (
+                                order_id_attr == "alpaca_trail_order_id"
+                                and active.status == PositionStatus.TRAILING_ACTIVE
+                            ):
+                                # Trail order gone but fixed stop
+                                # (alpaca_stop_order_id) is independent —
+                                # not nulled when activate_trailing_stop
+                                # ran, so the position is still protected.
+                                # Demote to STOP_AND_TARGET_ACTIVE so the
+                                # trail re-activation logic in
+                                # check_trail_activations can re-fire
+                                # next time price crosses the threshold;
+                                # otherwise the row sticks in
+                                # TRAILING_ACTIVE with a NULL trail id
+                                # forever.
+                                active.trail_activated = False
+                                active.status = (
+                                    PositionStatus.STOP_AND_TARGET_ACTIVE
+                                )
+                                self._update_position_status(
+                                    trade_id,
+                                    PositionStatus.STOP_AND_TARGET_ACTIVE,
+                                )
+                            # Don't continue checking remaining legs on
+                            # this iteration — the row's status has
+                            # changed and the next tick will re-evaluate
+                            # cleanly.
+                            break
                     except Exception:
                         logger.warning(
                             "Error checking exit order for %s", active.ticker,
@@ -547,9 +577,22 @@ class OrderManager:
                 active.status == PositionStatus.POSITION_OPEN
                 and active.alpaca_stop_order_id is None
                 and active.filled_shares > 0
-                and active.stop_price > 0
             ):
-                await self._recover_missing_stop(trade_id, active)
+                if active.stop_price <= 0:
+                    # Defence-in-depth: a row with status=POSITION_OPEN
+                    # but no stop_price means the strategy or persistence
+                    # layer dropped it. _place_standalone_stop refuses
+                    # to attach a non-positive stop anyway; surface the
+                    # state explicitly rather than silently skip so the
+                    # operator can spot the upstream bug.
+                    logger.warning(
+                        "Stop recovery skipped for %s (trade_id=%d): "
+                        "stop_price=%.4f is non-positive — cannot attach. "
+                        "Inspect upstream strategy/persistence path.",
+                        active.ticker, trade_id, active.stop_price,
+                    )
+                else:
+                    await self._recover_missing_stop(trade_id, active)
 
             # Strategy-driven exit (place_exit / place_limit_exit). Without
             # this branch the row stays CLOSING until the next tick's

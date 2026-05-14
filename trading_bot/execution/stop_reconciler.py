@@ -101,9 +101,13 @@ def _load_open_positions(db_path: str) -> list[sqlite3.Row]:
         conn: sqlite3.Connection = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         try:
+            # The f-string composes only literal "?" placeholders from a
+            # fixed module-level tuple — no user input reaches the SQL.
+            # Bandit B608 flags any f-string in SQL; pinned `# nosec`
+            # mirrors the same pattern at order_manager.py:1954.
             placeholders: str = ",".join("?" * len(_STATUSES_NEEDING_STOP))
             rows: list[sqlite3.Row] = conn.execute(
-                f"SELECT id, ticker, status, quantity, entry_price, "
+                f"SELECT id, ticker, status, quantity, entry_price, "  # nosec B608
                 f"stop_price, alpaca_stop_order_id "
                 f"FROM positions WHERE status IN ({placeholders})",
                 _STATUSES_NEEDING_STOP,

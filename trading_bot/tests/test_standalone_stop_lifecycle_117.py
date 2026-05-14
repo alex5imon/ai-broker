@@ -388,6 +388,136 @@ class TestFailureModeA_StopCancelledAtBroker:
         assert active.alpaca_target_order_id is None
         assert active.alpaca_stop_order_id == "stop-live"
 
+    @pytest.mark.asyncio
+    async def test_cancelled_stop_breaks_loop_does_not_double_process(
+        self, config, tmp_db_path: str, mock_notifier
+    ) -> None:
+        """After the stop cancellation handler demotes to POSITION_OPEN,
+        the leg loop must break — otherwise remaining legs (target,
+        trail) are polled against a row whose status was just changed,
+        producing confusing logs. Verifies the post-review break fix."""
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        _set_market_open(om)
+
+        trade_id = om._create_position_record(_entry("SPY"))
+        om._update_position_status(trade_id, PositionStatus.STOP_AND_TARGET_ACTIVE)
+        om._update_position_field(trade_id, "quantity", 100)
+        om._update_position_field(trade_id, "alpaca_stop_order_id", "stop-dead")
+        om._update_position_field(trade_id, "alpaca_target_order_id", "target-live")
+
+        get_calls: list[str] = []
+
+        def _get_order_by_id(oid: str):
+            get_calls.append(oid)
+            if oid == "stop-dead":
+                return _alpaca_order(oid, "canceled")
+            if oid == "target-live":
+                return _alpaca_order(oid, "new")
+            return _alpaca_order(oid, "new")
+
+        om._gw.client.get_order_by_id = MagicMock(side_effect=_get_order_by_id)
+        # Make _find_existing_stop return no match so recovery submits fresh.
+        om._gw.client.get_orders = MagicMock(return_value=[])
+        om._gw.client.submit_order = MagicMock(
+            return_value=_alpaca_order("stop-fresh", "new"),
+        )
+
+        await om._check_order_statuses()
+
+        # The target leg must NOT have been queried after the stop's
+        # cancellation handler demoted the row — break exits the loop.
+        assert "stop-dead" in get_calls
+        assert "target-live" not in get_calls
+
+    @pytest.mark.asyncio
+    async def test_cancelled_trail_demotes_to_stop_and_target_active(
+        self, config, tmp_db_path: str, mock_notifier
+    ) -> None:
+        """TRAILING_ACTIVE rows keep ``alpaca_stop_order_id`` populated
+        (activate_trailing_stop only cancels the take-profit leg, not
+        the protective stop). A cancelled trail order therefore is NOT
+        a naked-position event — but the row mustn't get stuck in
+        TRAILING_ACTIVE with a NULL trail id, or check_trail_activations
+        will never re-fire. Demoting to STOP_AND_TARGET_ACTIVE clears
+        the trail-activated flag so re-activation can run on the next
+        price cross."""
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        _set_market_open(om)
+
+        trade_id = om._create_position_record(_entry("SPY"))
+        om._update_position_status(trade_id, PositionStatus.TRAILING_ACTIVE)
+        om._update_position_field(trade_id, "quantity", 100)
+        om._update_position_field(trade_id, "alpaca_stop_order_id", "stop-live")
+        om._update_position_field(trade_id, "alpaca_trail_order_id", "trail-dead")
+        # Mark trail_activated so we can verify the demotion clears it.
+        # (Activation flag is in-memory only on _ActiveOrder; hydrate
+        # manually for the test.)
+
+        def _get_order_by_id(oid: str):
+            if oid == "stop-live":
+                return _alpaca_order(oid, "new")
+            if oid == "trail-dead":
+                return _alpaca_order(oid, "canceled")
+            return _alpaca_order(oid, "new")
+
+        om._gw.client.get_order_by_id = MagicMock(side_effect=_get_order_by_id)
+        om._gw.client.get_orders = MagicMock(return_value=[])
+
+        # Hydrate to load the row, then pre-set trail_activated.
+        om._hydrate_active_orders()
+        om._active_orders[trade_id].trail_activated = True
+
+        await om._check_order_statuses()
+
+        active = om._active_orders[trade_id]
+        # Demoted, not stuck in TRAILING_ACTIVE.
+        assert active.status == PositionStatus.STOP_AND_TARGET_ACTIVE
+        assert active.alpaca_trail_order_id is None
+        # Fixed stop still in place — position is not naked.
+        assert active.alpaca_stop_order_id == "stop-live"
+        # Re-activation flag reset so trail can re-fire next price cross.
+        assert active.trail_activated is False
+
+
+class TestRecoveryGuardEdgeCases:
+    """Edge cases around the new POSITION_OPEN-without-stop recovery branch."""
+
+    @pytest.mark.asyncio
+    async def test_recovery_skipped_when_stop_price_zero(
+        self, config, tmp_db_path: str, mock_notifier, caplog
+    ) -> None:
+        """A row with stop_price=0 cannot have a stop attached — the
+        underlying _place_standalone_stop refuses non-positive prices.
+        The recovery guard must skip with a warning rather than silently
+        falling through (operator needs visibility into upstream bugs)."""
+        import logging
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        _set_market_open(om)
+
+        # Seed: POSITION_OPEN, no stop id, qty > 0, but stop_price = 0.
+        entry = _entry("XLI")
+        entry.stop_price = 0.0  # type: ignore[misc]
+        trade_id = om._create_position_record(entry)
+        om._update_position_status(trade_id, PositionStatus.POSITION_OPEN)
+        om._update_position_field(trade_id, "quantity", 0.5)
+        om._update_position_field(trade_id, "stop_price", 0.0)
+
+        om._gw.client.submit_order = MagicMock(
+            side_effect=AssertionError("must not submit with stop_price=0"),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            await om._check_order_statuses()
+
+        # Recovery skipped, row left for operator inspection.
+        active = om._active_orders[trade_id]
+        assert active.status == PositionStatus.POSITION_OPEN
+        assert active.alpaca_stop_order_id is None
+        # The warning surfaces the upstream bug.
+        assert any(
+            "non-positive" in record.message for record in caplog.records
+        )
+
 
 # ---------------------------------------------------------------------------
 # Reconciliation report
