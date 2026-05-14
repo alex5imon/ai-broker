@@ -70,7 +70,7 @@ def test_warns_for_open_position_on_disabled_strategy(tmp_db_path):
     })
     conn = sqlite3.connect(tmp_db_path)
     _insert_position(conn, ticker="SPY", strategy_id="breakout",
-                     status="STOP_AND_TARGET_ACTIVE", quantity=1.0)
+                     status="STOP_ACTIVE", quantity=1.0)
     conn.commit()
     conn.close()
 
@@ -178,12 +178,12 @@ def test_warning_message_includes_status_and_qty(tmp_db_path):
     cfg = _build_config({"breakout": {"enabled": False}})
     conn = sqlite3.connect(tmp_db_path)
     _insert_position(conn, ticker="SPY", strategy_id="breakout",
-                     status="STOP_AND_TARGET_ACTIVE", quantity=1.0)
+                     status="STOP_ACTIVE", quantity=1.0)
     conn.commit()
     conn.close()
 
     out = cfg.detect_disabled_strategy_orphans(tmp_db_path)
     assert len(out) == 1
     msg = out[0]
-    assert "STOP_AND_TARGET_ACTIVE" in msg
+    assert "STOP_ACTIVE" in msg
     assert "1" in msg  # qty

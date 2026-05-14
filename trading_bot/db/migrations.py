@@ -401,6 +401,30 @@ def _migration_v11(conn: sqlite3.Connection) -> None:
     logger.info("Applied migration V11: positions.alpaca_exit_order_id")
 
 
+def _migration_v12(conn: sqlite3.Connection) -> None:
+    """V12: rename ``positions.status`` value ``STOP_AND_TARGET_ACTIVE`` → ``STOP_ACTIVE``.
+
+    Under the new entry path (plain-limit + standalone-stop, PR #53 /
+    ai-broker#39) only the stop is broker-side; take-profit is polled
+    in ``main.check_exits`` against ``target_price``. The legacy enum
+    name suggested both legs were live at the broker, which is no
+    longer true.
+
+    Data-only migration. Idempotent: the UPDATE is a no-op if no rows
+    still carry the legacy value.
+    """
+    conn.execute(
+        "UPDATE positions SET status='STOP_ACTIVE' "
+        "WHERE status='STOP_AND_TARGET_ACTIVE'"
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_version (version, description) "
+        "VALUES (12, "
+        "'V12 schema - rename STOP_AND_TARGET_ACTIVE → STOP_ACTIVE')"
+    )
+    logger.info("Applied migration V12: status rename")
+
+
 _MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (4, "V4 schema - multi-market adaptive trading bot", _migration_v4),
     (5, "V5 schema - multi-strategy Alpaca trading bot", _migration_v5),
@@ -411,6 +435,8 @@ _MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (10, "V10 schema - USD-only column rename", _migration_v10),
     (11, "V11 schema - positions.alpaca_exit_order_id for cross-tick exit tracking",
      _migration_v11),
+    (12, "V12 schema - rename STOP_AND_TARGET_ACTIVE → STOP_ACTIVE",
+     _migration_v12),
 ]
 
 

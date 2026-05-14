@@ -4,7 +4,7 @@ Covers three failure modes that left fractional positions naked at Alpaca:
 
 A. Stop cancelled at the broker but DB still references the dead order id —
    pre-#117 the stop-poll loop ignored ``canceled`` / ``expired`` / ``rejected``
-   statuses, so the row sat in ``STOP_AND_TARGET_ACTIVE`` forever.
+   statuses, so the row sat in ``STOP_ACTIVE`` forever.
 B. ``_transition_to_open`` interrupted between the status flip and the
    stop-id write — the row landed in ``POSITION_OPEN`` with
    ``alpaca_stop_order_id=NULL`` and no branch in ``_check_order_statuses``
@@ -160,7 +160,7 @@ class TestFailureModeB_StopNeverAttached:
 
         # Status promoted and order id persisted.
         active = om._active_orders[trade_id]
-        assert active.status == PositionStatus.STOP_AND_TARGET_ACTIVE
+        assert active.status == PositionStatus.STOP_ACTIVE
         assert active.alpaca_stop_order_id == "stop-recovered-1"
 
         conn = sqlite3.connect(tmp_db_path)
@@ -172,7 +172,7 @@ class TestFailureModeB_StopNeverAttached:
             ).fetchone()
         finally:
             conn.close()
-        assert row[0] == PositionStatus.STOP_AND_TARGET_ACTIVE.value
+        assert row[0] == PositionStatus.STOP_ACTIVE.value
         assert row[1] == "stop-recovered-1"
 
     @pytest.mark.asyncio
@@ -210,7 +210,7 @@ class TestFailureModeB_StopNeverAttached:
 
         active = om._active_orders[trade_id]
         assert active.alpaca_stop_order_id == "stop-on-broker"
-        assert active.status == PositionStatus.STOP_AND_TARGET_ACTIVE
+        assert active.status == PositionStatus.STOP_ACTIVE
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +254,7 @@ class TestFailureModeC_OvernightDriftEntry:
 
         assert len(submits) == 1
         active = om._active_orders[trade_id]
-        assert active.status == PositionStatus.STOP_AND_TARGET_ACTIVE
+        assert active.status == PositionStatus.STOP_ACTIVE
         assert active.alpaca_stop_order_id == "stop-1"
 
     @pytest.mark.asyncio
@@ -297,7 +297,7 @@ class TestFailureModeA_StopCancelledAtBroker:
     """Reproduces SPY #90 / QQQ #91 (2026-05-07): stops were attached
     correctly at entry but cancelled at 16:07 ET. Pre-#117 the stop-poll
     loop only handled ``filled`` status; ``canceled`` was a no-op, so
-    the row sat in ``STOP_AND_TARGET_ACTIVE`` with a dead order id and
+    the row sat in ``STOP_ACTIVE`` with a dead order id and
     no protective stop on the book.
     """
 
@@ -309,7 +309,7 @@ class TestFailureModeA_StopCancelledAtBroker:
         _set_market_open(om)
 
         trade_id = om._create_position_record(_entry("SPY", shares=0.1681, price=732.976))
-        om._update_position_status(trade_id, PositionStatus.STOP_AND_TARGET_ACTIVE)
+        om._update_position_status(trade_id, PositionStatus.STOP_ACTIVE)
         om._update_position_field(trade_id, "quantity", 0.1681)
         om._update_position_field(trade_id, "entry_price", 732.976)
         om._update_position_field(trade_id, "alpaca_stop_order_id", "stop-dead")
@@ -337,7 +337,7 @@ class TestFailureModeA_StopCancelledAtBroker:
         # Fresh stop attached on the same tick.
         assert len(submits) == 1
         active = om._active_orders[trade_id]
-        assert active.status == PositionStatus.STOP_AND_TARGET_ACTIVE
+        assert active.status == PositionStatus.STOP_ACTIVE
         assert active.alpaca_stop_order_id == "stop-fresh-1"
 
         conn = sqlite3.connect(tmp_db_path)
@@ -349,7 +349,7 @@ class TestFailureModeA_StopCancelledAtBroker:
             ).fetchone()
         finally:
             conn.close()
-        assert row[0] == PositionStatus.STOP_AND_TARGET_ACTIVE.value
+        assert row[0] == PositionStatus.STOP_ACTIVE.value
         assert row[1] == "stop-fresh-1"
 
     @pytest.mark.asyncio
@@ -364,7 +364,7 @@ class TestFailureModeA_StopCancelledAtBroker:
         _set_market_open(om)
 
         trade_id = om._create_position_record(_entry("SPY"))
-        om._update_position_status(trade_id, PositionStatus.STOP_AND_TARGET_ACTIVE)
+        om._update_position_status(trade_id, PositionStatus.STOP_ACTIVE)
         om._update_position_field(trade_id, "quantity", 100)
         om._update_position_field(trade_id, "alpaca_stop_order_id", "stop-live")
         om._update_position_field(trade_id, "alpaca_target_order_id", "target-dead")
@@ -383,7 +383,7 @@ class TestFailureModeA_StopCancelledAtBroker:
 
         active = om._active_orders[trade_id]
         # Status preserved — stop is still active.
-        assert active.status == PositionStatus.STOP_AND_TARGET_ACTIVE
+        assert active.status == PositionStatus.STOP_ACTIVE
         # Dead target id cleared.
         assert active.alpaca_target_order_id is None
         assert active.alpaca_stop_order_id == "stop-live"
@@ -400,7 +400,7 @@ class TestFailureModeA_StopCancelledAtBroker:
         _set_market_open(om)
 
         trade_id = om._create_position_record(_entry("SPY"))
-        om._update_position_status(trade_id, PositionStatus.STOP_AND_TARGET_ACTIVE)
+        om._update_position_status(trade_id, PositionStatus.STOP_ACTIVE)
         om._update_position_field(trade_id, "quantity", 100)
         om._update_position_field(trade_id, "alpaca_stop_order_id", "stop-dead")
         om._update_position_field(trade_id, "alpaca_target_order_id", "target-live")
@@ -438,7 +438,7 @@ class TestFailureModeA_StopCancelledAtBroker:
         the protective stop). A cancelled trail order therefore is NOT
         a naked-position event — but the row mustn't get stuck in
         TRAILING_ACTIVE with a NULL trail id, or check_trail_activations
-        will never re-fire. Demoting to STOP_AND_TARGET_ACTIVE clears
+        will never re-fire. Demoting to STOP_ACTIVE clears
         the trail-activated flag so re-activation can run on the next
         price cross."""
         om = _make_om(config, tmp_db_path, mock_notifier)
@@ -471,7 +471,7 @@ class TestFailureModeA_StopCancelledAtBroker:
 
         active = om._active_orders[trade_id]
         # Demoted, not stuck in TRAILING_ACTIVE.
-        assert active.status == PositionStatus.STOP_AND_TARGET_ACTIVE
+        assert active.status == PositionStatus.STOP_ACTIVE
         assert active.alpaca_trail_order_id is None
         # Fixed stop still in place — position is not naked.
         assert active.alpaca_stop_order_id == "stop-live"
@@ -585,7 +585,7 @@ class TestStopReconciliation:
         self, tmp_db_path: str, mock_notifier
     ) -> None:
         self._seed_open_position(
-            tmp_db_path, "SPY", PositionStatus.STOP_AND_TARGET_ACTIVE,
+            tmp_db_path, "SPY", PositionStatus.STOP_ACTIVE,
             "stop-cancelled",
         )
 
@@ -608,7 +608,7 @@ class TestStopReconciliation:
         self, tmp_db_path: str, mock_notifier
     ) -> None:
         self._seed_open_position(
-            tmp_db_path, "XLK", PositionStatus.STOP_AND_TARGET_ACTIVE,
+            tmp_db_path, "XLK", PositionStatus.STOP_ACTIVE,
             "stop-healthy",
         )
 
@@ -634,7 +634,7 @@ class TestStopReconciliation:
         the side of surfacing the position (better a false alarm than a
         silent naked position)."""
         self._seed_open_position(
-            tmp_db_path, "XLF", PositionStatus.STOP_AND_TARGET_ACTIVE,
+            tmp_db_path, "XLF", PositionStatus.STOP_ACTIVE,
             "stop-flaky",
         )
 

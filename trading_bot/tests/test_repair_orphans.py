@@ -139,7 +139,7 @@ async def test_flips_to_active_when_filled_and_held_with_stop(tmp_db_path: str):
         "FROM positions WHERE id = ?", (pos_id,),
     ).fetchone()
     conn.close()
-    assert row[0] == PositionStatus.STOP_AND_TARGET_ACTIVE.value
+    assert row[0] == PositionStatus.STOP_ACTIVE.value
     assert abs(row[1] - 724.72) < 1e-6
     assert row[2] == "stop-recovered"
 
@@ -260,7 +260,7 @@ async def test_closes_unknown_duplicate_when_real_sibling_exists(
 ):
     real_id = _seed_position(
         tmp_db_path, ticker="SPY",
-        status=PositionStatus.STOP_AND_TARGET_ACTIVE.value,
+        status=PositionStatus.STOP_ACTIVE.value,
         strategy_id="overnight_drift",
         alpaca_order_id="entry-real",
     )
@@ -285,7 +285,7 @@ async def test_closes_unknown_duplicate_when_real_sibling_exists(
 
     assert report.unknown_duplicates_closed == 1
     rows_by_id = {r[0]: r for r in rows}
-    assert rows_by_id[real_id][1] == PositionStatus.STOP_AND_TARGET_ACTIVE.value
+    assert rows_by_id[real_id][1] == PositionStatus.STOP_ACTIVE.value
     assert rows_by_id[unk_id][1] == "CLOSED"
 
 
@@ -355,7 +355,7 @@ async def test_phantom_step_closes_older_duplicate_keeps_latest(
     tmp_db_path: str,
 ):
     """Live bug: positions 74 (SPY 5/4) and 80 (SPY 5/5) both
-    POSITION_OPEN/STOP_AND_TARGET_ACTIVE for the same held ticker.
+    POSITION_OPEN/STOP_ACTIVE for the same held ticker.
     The reconciler's db_by_ticker dict overwrites duplicates and
     silently drops one — so the older row never gets closed.
 
@@ -370,7 +370,7 @@ async def test_phantom_step_closes_older_duplicate_keeps_latest(
     )
     newer_id = _seed_position(
         tmp_db_path, ticker="SPY",
-        status=PositionStatus.STOP_AND_TARGET_ACTIVE.value,
+        status=PositionStatus.STOP_ACTIVE.value,
         strategy_id="overnight_drift",
         entry_time="2026-05-05T15:45:00",  # newer
     )
@@ -390,7 +390,7 @@ async def test_phantom_step_closes_older_duplicate_keeps_latest(
         "older duplicate must be closed — it can't all map to the one "
         "broker-side position"
     )
-    assert by_id[newer_id] == PositionStatus.STOP_AND_TARGET_ACTIVE.value, (
+    assert by_id[newer_id] == PositionStatus.STOP_ACTIVE.value, (
         "newer row must be preserved — it matches the broker"
     )
 
@@ -401,7 +401,7 @@ async def test_phantom_step_leaves_single_held_row_alone(tmp_db_path: str):
     must not touch it."""
     pos_id = _seed_position(
         tmp_db_path, ticker="SPY",
-        status=PositionStatus.STOP_AND_TARGET_ACTIVE.value,
+        status=PositionStatus.STOP_ACTIVE.value,
         strategy_id="overnight_drift",
     )
     client = _make_client(held_tickers=["SPY"])
@@ -416,7 +416,7 @@ async def test_phantom_step_leaves_single_held_row_alone(tmp_db_path: str):
         conn.close()
 
     assert report.phantom_live_closed == 0
-    assert row[0] == PositionStatus.STOP_AND_TARGET_ACTIVE.value
+    assert row[0] == PositionStatus.STOP_ACTIVE.value
 
 
 # ---------------------------------------------------------------------------
@@ -518,13 +518,13 @@ async def test_full_scenario_2026_05_06_repair_state(tmp_db_path: str):
     # Real held positions from 5/5.
     spy_real_id = _seed_position(
         tmp_db_path, ticker="SPY",
-        status=PositionStatus.STOP_AND_TARGET_ACTIVE.value,
+        status=PositionStatus.STOP_ACTIVE.value,
         strategy_id="overnight_drift",
         entry_time="2026-05-05T15:45:36",
     )
     qqq_real_id = _seed_position(
         tmp_db_path, ticker="QQQ",
-        status=PositionStatus.STOP_AND_TARGET_ACTIVE.value,
+        status=PositionStatus.STOP_ACTIVE.value,
         strategy_id="overnight_drift",
         entry_time="2026-05-05T15:45:36",
     )
@@ -545,6 +545,6 @@ async def test_full_scenario_2026_05_06_repair_state(tmp_db_path: str):
     assert by_id[xlb_id][1] == PositionStatus.CLOSED.value
     assert by_id[spy_old_id][1] == PositionStatus.CLOSED.value
     assert by_id[qqq_old_id][1] == PositionStatus.CLOSED.value
-    assert by_id[spy_real_id][1] == PositionStatus.STOP_AND_TARGET_ACTIVE.value
-    assert by_id[qqq_real_id][1] == PositionStatus.STOP_AND_TARGET_ACTIVE.value
+    assert by_id[spy_real_id][1] == PositionStatus.STOP_ACTIVE.value
+    assert by_id[qqq_real_id][1] == PositionStatus.STOP_ACTIVE.value
     assert report.phantom_live_closed == 4

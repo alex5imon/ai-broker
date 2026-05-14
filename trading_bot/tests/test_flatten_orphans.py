@@ -101,7 +101,7 @@ def test_find_db_position_returns_open_row_with_child_orders(tmp_db):
            status, hold_type, phase, strategy_id,
            alpaca_stop_order_id, alpaca_target_order_id, alpaca_trail_order_id)
         VALUES ('SPY', 'NYSE', 'USD', 1, 700.0, '2026-04-27T15:40:00-04:00',
-                'STOP_AND_TARGET_ACTIVE', 'swing', 1, 'breakout',
+                'STOP_ACTIVE', 'swing', 1, 'breakout',
                 'stop-abc', 'target-def', NULL)
         """
     )

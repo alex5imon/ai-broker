@@ -283,7 +283,7 @@ def test_terminal_status_set_includes_both_terminal_states() -> None:
     for s in (
         PositionStatus.ENTRY_PENDING,
         PositionStatus.POSITION_OPEN,
-        PositionStatus.STOP_AND_TARGET_ACTIVE,
+        PositionStatus.STOP_ACTIVE,
         PositionStatus.TRAILING_ACTIVE,
         PositionStatus.CLOSING,
     ):

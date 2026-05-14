@@ -135,7 +135,7 @@ class TestEntryFill:
         await om._check_order_statuses()
 
         active = om._active_orders[trade_id]
-        assert active.status == PositionStatus.STOP_AND_TARGET_ACTIVE
+        assert active.status == PositionStatus.STOP_ACTIVE
         # Second submit_order call was the standalone stop
         assert len(captured) == 2
         stop_req = captured[1]
@@ -198,7 +198,7 @@ class TestEntryFill:
             "fractional with error 42210000)"
         )
         active = om._active_orders[trade_id]
-        assert active.status == PositionStatus.STOP_AND_TARGET_ACTIVE
+        assert active.status == PositionStatus.STOP_ACTIVE
 
     @pytest.mark.asyncio
     async def test_stop_attach_failure_triggers_emergency_flatten(
@@ -285,9 +285,9 @@ class TestEntryTimeout:
 
         # Cancelled the timed-out entry
         om._gw.client.cancel_order_by_id.assert_called()
-        # Position transitioned to STOP_AND_TARGET_ACTIVE with standalone stop
+        # Position transitioned to STOP_ACTIVE with standalone stop
         active = om._active_orders[trade_id]
-        assert active.status == PositionStatus.STOP_AND_TARGET_ACTIVE
+        assert active.status == PositionStatus.STOP_ACTIVE
         assert active.alpaca_stop_order_id == "stop-1"
         assert active.alpaca_target_order_id is None
 
@@ -568,12 +568,12 @@ class TestExitFill:
             alpaca_entry_order_id="entry-1",
             alpaca_stop_order_id="stop-1",
             alpaca_target_order_id="target-1",
-            status=PositionStatus.STOP_AND_TARGET_ACTIVE,
+            status=PositionStatus.STOP_ACTIVE,
             entry_shares=100, filled_shares=100,
             entry_price=10.0, stop_price=9.8, target_price=10.4,
         )
         om._active_orders[trade_id] = active
-        om._update_position_status(trade_id, PositionStatus.STOP_AND_TARGET_ACTIVE)
+        om._update_position_status(trade_id, PositionStatus.STOP_ACTIVE)
 
         # Stop fills @ 9.80, target still open (gets cancelled)
         def get_order_by_id(oid: str):
@@ -604,12 +604,12 @@ class TestExitFill:
             alpaca_entry_order_id="entry-1",
             alpaca_stop_order_id="stop-1",
             alpaca_target_order_id="target-1",
-            status=PositionStatus.STOP_AND_TARGET_ACTIVE,
+            status=PositionStatus.STOP_ACTIVE,
             entry_shares=100, filled_shares=100,
             entry_price=10.0, stop_price=9.8, target_price=10.4,
         )
         om._active_orders[trade_id] = active
-        om._update_position_status(trade_id, PositionStatus.STOP_AND_TARGET_ACTIVE)
+        om._update_position_status(trade_id, PositionStatus.STOP_ACTIVE)
 
         def get_order_by_id(oid: str):
             if oid == "target-1":
@@ -640,13 +640,13 @@ class TestTrailActivation:
             alpaca_entry_order_id="entry-1",
             alpaca_stop_order_id="stop-1",
             alpaca_target_order_id="target-1",
-            status=PositionStatus.STOP_AND_TARGET_ACTIVE,
+            status=PositionStatus.STOP_ACTIVE,
             entry_shares=100, filled_shares=100,
             entry_price=10.0, stop_price=9.8, target_price=10.4,
             trail_pct=0.02, trail_activation_price=10.20,
         )
         om._active_orders[trade_id] = active
-        om._update_position_status(trade_id, PositionStatus.STOP_AND_TARGET_ACTIVE)
+        om._update_position_status(trade_id, PositionStatus.STOP_ACTIVE)
 
         # Trailing-stop placement returns an order id
         om._gw.client.submit_order = MagicMock(return_value=_alpaca_order("trail-1", "new"))
@@ -665,7 +665,7 @@ class TestTrailActivation:
         trade_id = om._create_position_record(_entry("SPY"))
         active = _ActiveOrder(
             trade_id=trade_id, ticker="SPY", exchange="US",
-            status=PositionStatus.STOP_AND_TARGET_ACTIVE,
+            status=PositionStatus.STOP_ACTIVE,
             entry_shares=100, filled_shares=100,
             entry_price=10.0,
             trail_pct=0.02, trail_activation_price=10.20,
@@ -681,7 +681,7 @@ class TestTrailActivation:
         trade_id = om._create_position_record(_entry("SPY"))
         active = _ActiveOrder(
             trade_id=trade_id, ticker="SPY", exchange="US",
-            status=PositionStatus.STOP_AND_TARGET_ACTIVE,
+            status=PositionStatus.STOP_ACTIVE,
             entry_shares=100, filled_shares=100,
             trail_pct=0.02, trail_activation_price=10.20,
         )
@@ -765,7 +765,7 @@ class TestPlaceExit:
             alpaca_entry_order_id="entry-1",
             alpaca_stop_order_id="stop-1",  # locally tracked
             alpaca_target_order_id="target-1",  # locally tracked
-            status=PositionStatus.STOP_AND_TARGET_ACTIVE,
+            status=PositionStatus.STOP_ACTIVE,
             entry_shares=10.0,
             filled_shares=10.0,
             entry_price=100.0,
@@ -843,7 +843,7 @@ class TestPlaceExit:
             exchange="US",
             alpaca_entry_order_id="entry-1",
             alpaca_stop_order_id="stop-1",
-            status=PositionStatus.STOP_AND_TARGET_ACTIVE,
+            status=PositionStatus.STOP_ACTIVE,
             entry_shares=10.0,
             filled_shares=10.0,
             entry_price=50.0,
@@ -902,7 +902,7 @@ class TestPlaceExit:
             exchange="US",
             alpaca_entry_order_id="entry-1",
             alpaca_stop_order_id="stop-1",
-            status=PositionStatus.STOP_AND_TARGET_ACTIVE,
+            status=PositionStatus.STOP_ACTIVE,
             entry_shares=10.0,
             filled_shares=10.0,
             entry_price=50.0,
@@ -959,7 +959,7 @@ class TestPlaceExit:
             exchange="US",
             alpaca_entry_order_id="entry-1",
             alpaca_stop_order_id="stop-known",
-            status=PositionStatus.STOP_AND_TARGET_ACTIVE,
+            status=PositionStatus.STOP_ACTIVE,
             entry_shares=10.0,
             filled_shares=10.0,
             entry_price=50.0,
@@ -1158,7 +1158,7 @@ class TestPlaceExit:
             alpaca_entry_order_id="entry-1",
             alpaca_stop_order_id="stop-1",
             alpaca_target_order_id="target-1",
-            status=PositionStatus.STOP_AND_TARGET_ACTIVE,
+            status=PositionStatus.STOP_ACTIVE,
             entry_shares=10.0,
             filled_shares=10.0,
             entry_price=100.0,
@@ -1573,7 +1573,7 @@ class TestPlaceLimitExit:
             alpaca_entry_order_id="entry-1",
             alpaca_stop_order_id="stop-1",
             alpaca_target_order_id="target-1",
-            status=PositionStatus.STOP_AND_TARGET_ACTIVE,
+            status=PositionStatus.STOP_ACTIVE,
             entry_shares=10.0,
             filled_shares=10.0,
             entry_price=100.0,
@@ -1590,7 +1590,7 @@ class TestPlaceLimitExit:
 
         assert order_id is None
         # Status MUST be back to its prior value, not stuck at CLOSING.
-        assert active.status == PositionStatus.STOP_AND_TARGET_ACTIVE
+        assert active.status == PositionStatus.STOP_ACTIVE
 
     @pytest.mark.asyncio
     async def test_rejects_non_positive_qty(
@@ -1619,7 +1619,7 @@ class TestPlaceLimitExit:
             exchange="US",
             alpaca_entry_order_id="entry-1",
             alpaca_stop_order_id="stop-1",  # locally tracked
-            status=PositionStatus.STOP_AND_TARGET_ACTIVE,
+            status=PositionStatus.STOP_ACTIVE,
             entry_shares=10.0,
             filled_shares=10.0,
             entry_price=100.0,
@@ -1740,7 +1740,7 @@ class TestStrategyExitFillCallback:
         self, config, tmp_db_path: str, mock_notifier,
     ):
         """A limit exit that gets cancelled rolls back to
-        STOP_AND_TARGET_ACTIVE — the position remains open, so no
+        STOP_ACTIVE — the position remains open, so no
         outcome is recorded.
         """
         om = _make_om(config, tmp_db_path, mock_notifier)
@@ -1755,7 +1755,7 @@ class TestStrategyExitFillCallback:
 
         await om._check_order_statuses()
 
-        assert active.status == PositionStatus.STOP_AND_TARGET_ACTIVE
+        assert active.status == PositionStatus.STOP_ACTIVE
         assert captured == []
 
     @pytest.mark.asyncio
@@ -1878,7 +1878,7 @@ class TestStrategyExitFillCallback:
         active = _ActiveOrder(
             trade_id=1, ticker="SPY", exchange="US",
             alpaca_entry_order_id="entry-1",
-            status=PositionStatus.STOP_AND_TARGET_ACTIVE,
+            status=PositionStatus.STOP_ACTIVE,
             entry_shares=10.0, filled_shares=10.0,
             entry_price=100.0, stop_price=98.0, target_price=104.0,
             hold_type="intraday", strategy_id="mean_reversion",

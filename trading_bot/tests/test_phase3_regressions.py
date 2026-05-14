@@ -470,7 +470,7 @@ class TestB6_TransitionToOpenRecoversFromStopAttachResponseLoss:
 
     The fix queries Alpaca for an open SELL stop matching the ticker and
     qty before assuming submission failed; if found, the order is adopted
-    and the position transitions to STOP_AND_TARGET_ACTIVE normally.
+    and the position transitions to STOP_ACTIVE normally.
     """
 
     @pytest.mark.asyncio
@@ -522,7 +522,7 @@ class TestB6_TransitionToOpenRecoversFromStopAttachResponseLoss:
         finally:
             conn.close()
         assert row is not None
-        assert row[0] == PositionStatus.STOP_AND_TARGET_ACTIVE.value, (
+        assert row[0] == PositionStatus.STOP_ACTIVE.value, (
             "Recovery must adopt the live broker stop and proceed to the "
             "normal active-stop status — not stamp ENTRY_FAILED."
         )
