@@ -390,6 +390,287 @@ class TestB4_RecoveryCloseDbPositionWritesCompleteRow:
 
 
 # ---------------------------------------------------------------------------
+# Issue #132 — recovery / drain paths must not create duplicate trades rows
+# ---------------------------------------------------------------------------
+
+
+class TestIssue132_NoDuplicateTradesOnRecoveryClose:
+    """Issue #132: pre-fix, ``_close_db_position`` and ``_mark_position_closed``
+    blindly INSERTed a stub trades row even when an entry row already
+    existed. Prod audit (2026-05-14) found 25% of trades rows in dup groups
+    on ``(ticker, entry_time, strategy_id)``.
+
+    These tests pin both the entry-row-exists UPDATE branch and the
+    no-entry-row INSERT branch (broker-discovered orphan case).
+    """
+
+    def _make_recovery(self, config, tmp_db_path: str, mock_notifier):
+        from trading_bot.gateway.recovery import StateRecovery
+
+        gw = MagicMock()
+        return StateRecovery(gw, tmp_db_path, mock_notifier)
+
+    def _seed_with_entry_row(
+        self,
+        tmp_db_path: str,
+        *,
+        ticker: str = "SPY",
+        strategy_id: str = "overnight_drift",
+        qty: float = 0.4412,
+    ) -> tuple[int, int, str]:
+        """Mirror the production entry flow: insert paired positions +
+        trades rows the way ``_create_position_record`` does. Returns
+        ``(position_id, entry_trade_id, entry_time)``.
+        """
+        entry_time: str = "2026-05-04T15:45:37.982852-04:00"
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            pos_cur = conn.execute(
+                "INSERT INTO positions "
+                "(ticker, exchange, currency, quantity, entry_price, "
+                " entry_time, status, hold_type, phase, strategy_id) "
+                "VALUES (?, 'US', 'USD', ?, 100.0, ?, "
+                " 'POSITION_OPEN', 'intraday', 1, ?)",
+                (ticker, qty, entry_time, strategy_id),
+            )
+            position_id = int(pos_cur.lastrowid)
+            trade_cur = conn.execute(
+                "INSERT INTO trades "
+                "(ticker, exchange, currency, side, entry_time, entry_price, "
+                " quantity, hold_type, phase, signal_price, sentiment_score, "
+                " signals, strategy_id) "
+                "VALUES (?, 'US', 'USD', 'BUY', ?, 100.0, ?, "
+                " 'intraday', 1, 100.0, 0.0, 'test', ?)",
+                (ticker, entry_time, qty, strategy_id),
+            )
+            entry_trade_id = int(trade_cur.lastrowid)
+            conn.commit()
+            return position_id, entry_trade_id, entry_time
+        finally:
+            conn.close()
+
+    def test_recovery_close_updates_existing_entry_row(
+        self, config, tmp_db_path: str, mock_notifier,
+    ):
+        """When an entry trades row already exists, the recovery close
+        path must UPDATE it (set exit_time / exit_reason / notes) — not
+        INSERT a second row.
+        """
+        position_id, entry_trade_id, entry_time = self._seed_with_entry_row(
+            tmp_db_path,
+        )
+        rm = self._make_recovery(config, tmp_db_path, mock_notifier)
+
+        rm._close_db_position(position_id, "reconciliation_mismatch")
+
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            # Exactly one trades row for this (ticker, entry_time,
+            # strategy_id) tuple — proves no stub was inserted.
+            count = conn.execute(
+                "SELECT COUNT(*) FROM trades "
+                "WHERE ticker = ? AND entry_time = ? AND strategy_id = ?",
+                ("SPY", entry_time, "overnight_drift"),
+            ).fetchone()[0]
+            assert count == 1, (
+                f"Expected exactly one trades row; got {count} — "
+                "recovery path re-introduced the stub INSERT."
+            )
+            # And it must be the *original* entry row (preserving its id),
+            # now populated with exit columns.
+            row = conn.execute(
+                "SELECT id, side, strategy_id, exit_time, exit_reason, "
+                "       quantity, notes "
+                "FROM trades WHERE id = ?",
+                (entry_trade_id,),
+            ).fetchone()
+            assert row is not None
+            assert row[0] == entry_trade_id
+            assert row[1] == "BUY"
+            assert row[2] == "overnight_drift"
+            assert row[3] is not None  # exit_time populated
+            assert row[4] == "reconciliation_mismatch"
+            assert abs(float(row[5]) - 0.4412) < 1e-9  # qty preserved
+            assert "alpaca_backfill" in (row[6] or "")
+        finally:
+            conn.close()
+
+    def test_recovery_close_inserts_when_no_entry_row(
+        self, config, tmp_db_path: str, mock_notifier,
+    ):
+        """Broker-discovered orphan case (``_create_db_position`` flow):
+        the positions row exists but has no matching trades row. The
+        recovery close must still write a trades row so the audit trail
+        and alpaca_backfill candidate set are complete.
+        """
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            cur = conn.execute(
+                "INSERT INTO positions "
+                "(ticker, exchange, currency, quantity, entry_price, "
+                " entry_time, status, hold_type, phase, strategy_id) "
+                "VALUES ('QQQ', 'US', 'USD', 5.0, 50.0, "
+                " '2026-04-28T10:00:00', 'POSITION_OPEN', 'swing', 1, "
+                " 'unknown')",
+            )
+            position_id = int(cur.lastrowid)
+            conn.commit()
+        finally:
+            conn.close()
+
+        rm = self._make_recovery(config, tmp_db_path, mock_notifier)
+        rm._close_db_position(position_id, "reconciliation_mismatch")
+
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            rows = conn.execute(
+                "SELECT side, strategy_id, exit_reason, quantity "
+                "FROM trades WHERE ticker = 'QQQ'"
+            ).fetchall()
+        finally:
+            conn.close()
+        # Exactly one stub row inserted.
+        assert len(rows) == 1
+        assert rows[0][0] == "BUY"
+        assert rows[0][1] == "unknown"
+        assert rows[0][2] == "reconciliation_mismatch"
+        assert abs(float(rows[0][3]) - 5.0) < 1e-9
+
+    def test_recovery_close_ignores_already_closed_entry_row(
+        self, config, tmp_db_path: str, mock_notifier,
+    ):
+        """If the entry trades row already has exit_time set (e.g., a
+        prior tick closed it via a different code path), the recovery
+        close path must NOT match it — that would overwrite a real exit
+        with a reconciliation stub. Insert a new stub instead.
+        """
+        position_id, entry_trade_id, entry_time = self._seed_with_entry_row(
+            tmp_db_path,
+        )
+        # Simulate an earlier tick already closing the entry row.
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            conn.execute(
+                "UPDATE trades SET exit_time = ?, exit_reason = ?, "
+                "exit_price = ?, pnl_usd = ? WHERE id = ?",
+                (
+                    "2026-05-04T16:00:00-04:00", "stop_loss",
+                    99.5, -0.22, entry_trade_id,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        rm = self._make_recovery(config, tmp_db_path, mock_notifier)
+        rm._close_db_position(position_id, "reconciliation_mismatch")
+
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            # Two rows now: the original closed entry row + a new stub.
+            # The real exit is preserved; reconciliation didn't clobber
+            # the stop_loss attribution.
+            entry_row = conn.execute(
+                "SELECT exit_reason, pnl_usd FROM trades WHERE id = ?",
+                (entry_trade_id,),
+            ).fetchone()
+            assert entry_row[0] == "stop_loss"
+            assert abs(float(entry_row[1]) - (-0.22)) < 1e-9
+
+            stub_rows = conn.execute(
+                "SELECT id FROM trades "
+                "WHERE ticker = ? AND entry_time = ? AND strategy_id = ? "
+                "AND id != ?",
+                ("SPY", entry_time, "overnight_drift", entry_trade_id),
+            ).fetchall()
+            assert len(stub_rows) == 1
+        finally:
+            conn.close()
+
+
+class TestIssue132_NoDuplicateOnOrphanDrain:
+    """Same contract as TestIssue132_NoDuplicateTradesOnRecoveryClose,
+    but for ``strategy_manager._mark_position_closed`` — the orphan-sleeve
+    drain path that fires when Alpaca reports zero holdings for a sleeve
+    the DB believes is long.
+    """
+
+    def _seed_with_entry_row(
+        self, tmp_db_path: str,
+    ) -> tuple[int, int, str]:
+        entry_time: str = "2026-05-04T15:45:37.982852-04:00"
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            pos_cur = conn.execute(
+                "INSERT INTO positions "
+                "(ticker, exchange, currency, quantity, entry_price, "
+                " entry_time, status, hold_type, phase, strategy_id) "
+                "VALUES ('SPY', 'US', 'USD', 0.4412, 100.0, ?, "
+                " 'POSITION_OPEN', 'intraday', 1, 'overnight_drift')",
+                (entry_time,),
+            )
+            position_id = int(pos_cur.lastrowid)
+            trade_cur = conn.execute(
+                "INSERT INTO trades "
+                "(ticker, exchange, currency, side, entry_time, entry_price, "
+                " quantity, hold_type, phase, signal_price, sentiment_score, "
+                " signals, strategy_id) "
+                "VALUES ('SPY', 'US', 'USD', 'BUY', ?, 100.0, 0.4412, "
+                " 'intraday', 1, 100.0, 0.0, 'test', 'overnight_drift')",
+                (entry_time,),
+            )
+            entry_trade_id = int(trade_cur.lastrowid)
+            conn.commit()
+            return position_id, entry_trade_id, entry_time
+        finally:
+            conn.close()
+
+    def test_drain_close_updates_existing_entry_row(
+        self, config, tmp_db_path: str, mock_notifier,
+    ):
+        """``_mark_position_closed`` must UPDATE the entry trades row,
+        not INSERT a second one.
+
+        StrategyManager has a wide constructor and the drain helper only
+        touches ``self._db_path``; bind the method to a lightweight stub
+        rather than wiring the full dependency graph.
+        """
+        from trading_bot.strategy.strategy_manager import StrategyManager
+
+        position_id, entry_trade_id, entry_time = self._seed_with_entry_row(
+            tmp_db_path,
+        )
+
+        class _StubSM:
+            _db_path: str = tmp_db_path
+
+        # Call the unbound method directly against the stub.
+        StrategyManager._mark_position_closed(_StubSM(), position_id)  # type: ignore[arg-type]
+
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM trades "
+                "WHERE ticker = ? AND entry_time = ? AND strategy_id = ?",
+                ("SPY", entry_time, "overnight_drift"),
+            ).fetchone()[0]
+            assert count == 1, (
+                f"Expected exactly one trades row; got {count} — "
+                "orphan-drain path re-introduced the stub INSERT."
+            )
+            row = conn.execute(
+                "SELECT id, exit_reason, notes FROM trades WHERE id = ?",
+                (entry_trade_id,),
+            ).fetchone()
+            assert row is not None
+            assert row[0] == entry_trade_id
+            assert row[1] == "reconciliation_mismatch"
+            assert "orphan_sleeve_drain" in (row[2] or "")
+        finally:
+            conn.close()
+
+
+# ---------------------------------------------------------------------------
 # B5 — _update_position_field observability
 # ---------------------------------------------------------------------------
 

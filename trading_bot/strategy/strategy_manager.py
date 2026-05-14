@@ -782,35 +782,22 @@ class StrategyManager:
                     ).fetchone()
                     if row is None:
                         return
-                    qty: float = float(row["quantity"] or 0)
-                    entry_side: str = "BUY" if qty >= 0 else "SELL"
-                    conn.execute(
-                        "INSERT INTO trades "
-                        "(ticker, exchange, currency, side, entry_time, "
-                        " entry_price, quantity, exit_time, exit_reason, "
-                        " hold_type, phase, strategy_id, notes) "
-                        "VALUES (:ticker, :exchange, :currency, :side, "
-                        "        :entry_time, :entry_price, :quantity, "
-                        "        :exit_time, :exit_reason, :hold_type, "
-                        "        :phase, :strategy_id, :notes)",
-                        {
-                            "ticker": row["ticker"],
-                            "exchange": row["exchange"],
-                            "currency": row["currency"],
-                            "side": entry_side,
-                            "entry_time": row["entry_time"],
-                            "entry_price": row["entry_price"],
-                            "quantity": abs(qty),
-                            "exit_time": now_str,
-                            "exit_reason": "reconciliation_mismatch",
-                            "hold_type": row["hold_type"],
-                            "phase": row["phase"],
-                            "strategy_id": row["strategy_id"] or "unknown",
-                            "notes": (
-                                "orphan_sleeve_drain: Alpaca holds 0; "
-                                "exit_price/net_pnl pending alpaca_backfill"
-                            ),
-                        },
+                    # Issue #132: prefer UPDATE on the existing entry
+                    # trades row over INSERT of a stub. See
+                    # ``close_or_insert_trade_row`` for the contract.
+                    branch, trade_id = repo.close_or_insert_trade_row(
+                        conn,
+                        position_row=row,
+                        exit_time=now_str,
+                        exit_reason="reconciliation_mismatch",
+                        notes=(
+                            "orphan_sleeve_drain: Alpaca holds 0; "
+                            "exit_price/net_pnl pending alpaca_backfill"
+                        ),
+                    )
+                    logger.info(
+                        "Drain close: position_id=%d trades.id=%d branch=%s",
+                        position_id, trade_id, branch,
                     )
             finally:
                 conn.close()

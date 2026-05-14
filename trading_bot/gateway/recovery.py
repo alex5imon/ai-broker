@@ -19,6 +19,7 @@ from alpaca.trading.models import Position as AlpacaPosition
 from alpaca.trading.models import Order as AlpacaOrder
 
 from trading_bot.constants import TZ_EASTERN
+from trading_bot.db.repository import close_or_insert_trade_row
 from trading_bot.gateway.connection import GatewayConnection
 from trading_bot.notifications.notifier import Notifier
 
@@ -903,6 +904,18 @@ class StateRecovery:
         tool can populate them from order history. Pre-fix hardcoded
         side='SELL' made every recovery-driven trade look like a short
         entry, with no strategy attribution at all.
+
+        Issue #132 fix: prefer UPDATE-on-existing-entry-row over INSERT
+        of a stub. Most reconciliation-mismatch closes hit a position
+        that was created by ``OrderManager._create_position_record`` —
+        which already wrote an entry trades row carrying the strategy
+        metadata. INSERT-ing a second row produced 25% duplicates on
+        ``(ticker, entry_time, strategy_id)`` in prod and forced the
+        hydration JOIN to lean on ``MIN(t.id)`` for determinism (#128).
+        Now: locate the entry row (``exit_time IS NULL`` with matching
+        key) and update its exit columns. Only INSERT when no entry
+        row exists — the legitimate case for positions discovered by
+        ``_create_db_position`` from a stray Alpaca holding.
         """
         now: str = datetime.now(tz=ET).isoformat()
         conn: sqlite3.Connection = sqlite3.connect(self._db_path)
@@ -926,43 +939,21 @@ class StateRecovery:
                         "SELECT * FROM positions WHERE id = ?", (position_id,)
                     ).fetchone()
                     if row:
-                        # Float-typed: positions.quantity may be fractional.
-                        # int() truncation of -0.43 → 0 would mis-derive side
-                        # as BUY. Sign-of-the-float is the only invariant we
-                        # need here.
-                        qty: float = float(row["quantity"] or 0)
-                        # The bot is long-only at the strategy layer, but
-                        # the schema technically allows shorts — derive
-                        # rather than assume. Positive qty == long entry.
-                        entry_side: str = "BUY" if qty >= 0 else "SELL"
-                        conn.execute(
-                            "INSERT INTO trades "
-                            "(ticker, exchange, currency, side, entry_time, "
-                            " entry_price, quantity, exit_time, exit_reason, "
-                            " hold_type, phase, strategy_id, notes) "
-                            "VALUES (:ticker, :exchange, :currency, :side, "
-                            "        :entry_time, :entry_price, :quantity, "
-                            "        :exit_time, :exit_reason, :hold_type, "
-                            "        :phase, :strategy_id, :notes)",
-                            {
-                                "ticker": row["ticker"],
-                                "exchange": row["exchange"],
-                                "currency": row["currency"],
-                                "side": entry_side,
-                                "entry_time": row["entry_time"],
-                                "entry_price": row["entry_price"],
-                                "quantity": abs(qty),
-                                "exit_time": now,
-                                "exit_reason": reason,
-                                "hold_type": row["hold_type"],
-                                "phase": row["phase"],
-                                "strategy_id": row["strategy_id"] or "unknown",
-                                "notes": (
-                                    "Auto-closed by state recovery; "
-                                    "exit_price/net_pnl pending "
-                                    "alpaca_backfill"
-                                ),
-                            },
+                        branch, trade_id = close_or_insert_trade_row(
+                            conn,
+                            position_row=row,
+                            exit_time=now,
+                            exit_reason=reason,
+                            notes=(
+                                "Auto-closed by state recovery; "
+                                "exit_price/net_pnl pending "
+                                "alpaca_backfill"
+                            ),
+                        )
+                        logger.info(
+                            "Recovery close: position_id=%d trades.id=%d "
+                            "branch=%s reason=%s",
+                            position_id, trade_id, branch, reason,
                         )
             except sqlite3.OperationalError:
                 logger.warning("Could not close position id=%d", position_id)
