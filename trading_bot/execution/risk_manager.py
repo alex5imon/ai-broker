@@ -1,8 +1,8 @@
 """Centralized risk management with circuit breakers and kill switch.
 
-Enforces daily loss limits, position caps, sector exposure, correlation
-checks, drawdown breakers, and commission budgets.  All checks consult
-the current phase via Config.
+Enforces daily loss limits, position caps, sector exposure, drawdown
+breakers, and commission budgets.  All checks consult the current phase
+via Config.
 """
 
 from __future__ import annotations
@@ -29,7 +29,6 @@ _RISK_STATE_KEY: str = "risk_manager:global"
 
 if TYPE_CHECKING:
     from trading_bot.config import Config
-    from trading_bot.data.market_data import MarketDataManager
     from trading_bot.gateway import GatewayConnection
     from trading_bot.notifications import Notifier
 
@@ -432,109 +431,6 @@ class RiskManager:
             )
             return True
         return False
-
-    def check_correlation(
-        self,
-        ticker: str,
-        current_positions: list[dict[str, Any]],
-        market_data: MarketDataManager,
-    ) -> bool:
-        """Return ``True`` if *ticker* correlates > threshold with any held position.
-
-        Uses 30-day daily return correlation from cached historical data.
-        If correlation data is unavailable, allows the trade (conservative
-        in the "don't block" direction when data is missing).
-        """
-        threshold: float = self._config.correlation_threshold
-
-        for pos in current_positions:
-            held_ticker: str = pos.get("ticker", "")
-            if not held_ticker:
-                continue
-
-            try:
-                correlation: float | None = self._compute_correlation(
-                    ticker, held_ticker, market_data,
-                )
-            except Exception:
-                logger.warning(
-                    "Correlation check failed for %s vs %s, allowing trade",
-                    ticker,
-                    held_ticker,
-                    exc_info=True,
-                )
-                continue
-
-            if correlation is not None and abs(correlation) > threshold:
-                logger.info(
-                    "Blocked %s - correlation %.3f with held %s (threshold %.2f)",
-                    ticker,
-                    correlation,
-                    held_ticker,
-                    threshold,
-                )
-                return True
-
-        return False
-
-    def _compute_correlation(
-        self,
-        ticker_a: str,
-        ticker_b: str,
-        market_data: MarketDataManager,
-    ) -> float | None:
-        """Compute 30-day daily return correlation between two tickers.
-
-        Returns ``None`` if insufficient data.  Uses historical close
-        prices from MarketDataManager cache.
-        """
-        try:
-            closes_a: list[float] | None = getattr(
-                market_data, "get_daily_closes", lambda t, n: None
-            )(ticker_a, 30)
-            closes_b: list[float] | None = getattr(
-                market_data, "get_daily_closes", lambda t, n: None
-            )(ticker_b, 30)
-        except Exception:
-            return None
-
-        if closes_a is None or closes_b is None:
-            return None
-
-        min_len: int = min(len(closes_a), len(closes_b))
-        if min_len < 10:
-            return None
-
-        # Align to same length
-        a: list[float] = closes_a[-min_len:]
-        b: list[float] = closes_b[-min_len:]
-
-        # Compute daily returns
-        returns_a: list[float] = [
-            (a[i] - a[i - 1]) / a[i - 1] for i in range(1, len(a)) if a[i - 1] != 0
-        ]
-        returns_b: list[float] = [
-            (b[i] - b[i - 1]) / b[i - 1] for i in range(1, len(b)) if b[i - 1] != 0
-        ]
-
-        n: int = min(len(returns_a), len(returns_b))
-        if n < 5:
-            return None
-
-        ra: list[float] = returns_a[-n:]
-        rb: list[float] = returns_b[-n:]
-
-        mean_a: float = sum(ra) / n
-        mean_b: float = sum(rb) / n
-
-        cov: float = sum((ra[i] - mean_a) * (rb[i] - mean_b) for i in range(n)) / n
-        std_a: float = (sum((x - mean_a) ** 2 for x in ra) / n) ** 0.5
-        std_b: float = (sum((x - mean_b) ** 2 for x in rb) / n) ** 0.5
-
-        if std_a == 0 or std_b == 0:
-            return None
-
-        return cov / (std_a * std_b)
 
     def check_daily_trade_count(self) -> bool:
         """Return ``True`` if max daily trade count reached."""

@@ -402,10 +402,10 @@ class EntryEvaluator:
         Returns (shares, position_value_in_local_currency).
 
         Note: production sizing flows through
-        ``PositionSizer.calculate_fractional`` via the multi-strategy
-        path; this legacy helper is retained for the single-strategy
-        codepath and tests. Pass ``fractional=True`` to skip the
-        whole-share floors when callers want Alpaca-fractional sizing.
+        ``strategy.base.size_by_risk`` via the multi-strategy path;
+        this legacy helper is retained for the single-strategy codepath
+        and tests. Pass ``fractional=True`` to skip the whole-share
+        floors when callers want Alpaca-fractional sizing.
         """
         if signal_price <= 0 or stop_loss_pct <= 0:
             return 0, 0.0
