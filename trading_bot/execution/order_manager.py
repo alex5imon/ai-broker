@@ -235,22 +235,32 @@ class OrderManager:
         operate on the same set of positions the prior tick left open.
 
         The trades-table primary key is resolved via a LEFT JOIN on
-        ``(ticker, entry_time)`` so we only read rows for non-terminal
-        positions. Pre-V13 this scanned the entire ``trades`` table on
-        every tick and built the pair map in Python; the JOIN + the V13
-        ``idx_trades_ticker_entry_time`` index reduce wall-time from
-        O(trades) to O(active positions).
+        ``(ticker, entry_time, strategy_id)`` so we only read rows for
+        non-terminal positions. Pre-V13 this scanned the entire
+        ``trades`` table on every tick and built the pair map in Python;
+        the JOIN + the V13 ``idx_trades_ticker_entry_time`` index reduce
+        wall-time from O(trades) to O(active positions).
+
+        ``MIN(t.id)`` + ``GROUP BY p.id`` deterministically pick the
+        lowest-id matching trades row. Production has duplicates on
+        ``(ticker, entry_time)`` (recovery path over-inserts stub rows);
+        the entry row is always written before any stub, so the lowest
+        id is the entry row. Including ``strategy_id`` in the JOIN
+        predicate is defense in depth against future cross-strategy
+        collisions (issue #128).
         """
         try:
             with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
                 conn.row_factory = sqlite3.Row
                 rows = conn.execute(
-                    "SELECT p.*, t.id AS db_trade_id "
+                    "SELECT p.*, MIN(t.id) AS db_trade_id "
                     "FROM positions p "
                     "LEFT JOIN trades t "
                     "  ON t.ticker = p.ticker "
                     " AND t.entry_time = p.entry_time "
-                    "WHERE p.status NOT IN (?, ?)",
+                    " AND t.strategy_id = p.strategy_id "
+                    "WHERE p.status NOT IN (?, ?) "
+                    "GROUP BY p.id",
                     (
                         PositionStatus.CLOSED.value,
                         PositionStatus.ENTRY_FAILED.value,
