@@ -160,6 +160,157 @@ class TestHydration:
         finally:
             conn.close()
 
+    @pytest.mark.parametrize("stub_first", [False, True])
+    def test_hydrate_picks_lowest_id_when_trades_dup(
+        self,
+        config,
+        tmp_db_path: str,
+        mock_notifier,
+        stub_first: bool,
+    ):
+        """Issue #128: prod has duplicate trades rows on (ticker, entry_time,
+        strategy_id). The recovery path inserts a stub (qty=0, exit_reason=
+        'manual') alongside the entry row. Hydration must pick the entry row
+        deterministically — not whichever rowid SQLite happens to return first.
+
+        Parametrised on insertion order to prove the fix is robust regardless
+        of whether the stub or the entry was created first.
+        """
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        position_trade_id = om._create_position_record(_entry("SPY"))
+        assert position_trade_id is not None
+
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            # Read the (entry_time, strategy_id) the production helper used.
+            prow = conn.execute(
+                "SELECT entry_time, strategy_id FROM positions WHERE id = ?",
+                (position_trade_id,),
+            ).fetchone()
+            entry_time, strategy_id = prow
+
+            # _create_position_record inserted the entry trades row; capture
+            # its id, then either keep it or delete-and-reinsert it last so
+            # the stub gets the lower id.
+            entry_row = conn.execute(
+                "SELECT id FROM trades "
+                "WHERE ticker = ? AND entry_time = ? AND strategy_id = ?",
+                ("SPY", entry_time, strategy_id),
+            ).fetchone()
+            entry_trade_id_before = int(entry_row[0])
+
+            stub_row_sql = (
+                "INSERT INTO trades "
+                "(ticker, exchange, currency, side, entry_time, entry_price, "
+                " quantity, hold_type, phase, signal_price, sentiment_score, "
+                " signals, strategy_id, exit_reason, pnl_usd) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            )
+            stub_params = (
+                "SPY", "US", "USD", "BUY", entry_time, 10.0,
+                0, "intraday", 1, 10.0, 0.0,
+                "recovery", strategy_id, "manual", 0.0,
+            )
+
+            if stub_first:
+                # Delete the entry row, insert the stub, then reinsert the
+                # entry row last so the stub has the lower trades.id.
+                conn.execute("DELETE FROM trades WHERE id = ?", (entry_trade_id_before,))
+                stub_cur = conn.execute(stub_row_sql, stub_params)
+                stub_id = int(stub_cur.lastrowid)
+                entry_cur = conn.execute(
+                    "INSERT INTO trades "
+                    "(ticker, exchange, currency, side, entry_time, entry_price, "
+                    " quantity, hold_type, phase, signal_price, sentiment_score, "
+                    " signals, strategy_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "SPY", "US", "USD", "BUY", entry_time, 10.0,
+                        100, "intraday", 1, 10.0, 0.2,
+                        "test", strategy_id,
+                    ),
+                )
+                entry_id = int(entry_cur.lastrowid)
+                # Stub inserted first → lower id; entry has higher id.
+                assert stub_id < entry_id
+                expected_winner = stub_id
+            else:
+                # Natural order: entry already in (lower id), append stub.
+                stub_cur = conn.execute(stub_row_sql, stub_params)
+                stub_id = int(stub_cur.lastrowid)
+                entry_id = entry_trade_id_before
+                assert entry_id < stub_id
+                expected_winner = entry_id
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Force hydration to consult the JOIN, not the in-memory cache.
+        om._pending_db_trade_ids.clear()
+        om._active_orders.clear()
+        om._alpaca_to_trade.clear()
+
+        om._hydrate_active_orders()
+
+        active = om._active_orders[position_trade_id]
+        # MIN(t.id) wins deterministically regardless of insertion order.
+        assert active.db_trade_id == expected_winner
+
+    def test_hydrate_join_filters_by_strategy_id(
+        self, config, tmp_db_path: str, mock_notifier
+    ):
+        """Issue #128 defense-in-depth: a trades row that shares
+        (ticker, entry_time) but has a different strategy_id must NOT match
+        the position. Prevents cross-strategy false attribution if a future
+        bug ever creates a colliding row.
+        """
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        position_trade_id = om._create_position_record(_entry("SPY"))
+        assert position_trade_id is not None
+
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            prow = conn.execute(
+                "SELECT entry_time, strategy_id FROM positions WHERE id = ?",
+                (position_trade_id,),
+            ).fetchone()
+            entry_time, strategy_id = prow
+            assert strategy_id == "mean_reversion"
+
+            # Insert a foreign-strategy trades row with the same
+            # (ticker, entry_time). Without the strategy_id predicate on
+            # the JOIN this would be a false match.
+            conn.execute(
+                "INSERT INTO trades "
+                "(ticker, exchange, currency, side, entry_time, entry_price, "
+                " quantity, hold_type, phase, signal_price, sentiment_score, "
+                " signals, strategy_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "SPY", "US", "USD", "BUY", entry_time, 10.0,
+                    50, "intraday", 1, 10.0, 0.0,
+                    "foreign", "overnight_drift",
+                ),
+            )
+            conn.commit()
+
+            expected_entry_trade_id = int(conn.execute(
+                "SELECT id FROM trades "
+                "WHERE ticker = ? AND entry_time = ? AND strategy_id = ?",
+                ("SPY", entry_time, "mean_reversion"),
+            ).fetchone()[0])
+        finally:
+            conn.close()
+
+        om._pending_db_trade_ids.clear()
+        om._active_orders.clear()
+        om._alpaca_to_trade.clear()
+
+        om._hydrate_active_orders()
+
+        active = om._active_orders[position_trade_id]
+        assert active.db_trade_id == expected_entry_trade_id
+
 
 # ---------------------------------------------------------------------------
 # Entry fill → standalone stop attach
