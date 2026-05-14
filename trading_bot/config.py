@@ -513,7 +513,7 @@ class Config:
 
     @property
     def multi_strategy_enabled(self) -> bool:
-        return bool(self._get("multi_strategy", "enabled", default=False))
+        return bool(self._get("multi_strategy", "enabled", default=True))
 
     @property
     def multi_strategy_total_allocation(self) -> float:
