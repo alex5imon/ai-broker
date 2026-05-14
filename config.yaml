@@ -358,6 +358,14 @@ entry:
   partial_fill_min_pct: 0.50      # Accept partial fill >= 50%
   cooldown_minutes: 30            # Cooldown after exiting a ticker
   earnings_blackout_hours: 48     # Hours before/after earnings to skip
+  # Watchlist ranking composite = (offset + sentiment) * (1 + gap_pct).
+  # Sentiment is normalized to [-1, +1]. With offset=0.0 (default),
+  # neutral sentiment zero-weights the gap, negative sentiment penalises
+  # ranking, and positive sentiment rewards it — matching the stated
+  # semantics in the strategy docs. Set to 0.5 to restore the legacy
+  # behavior where a max-negative-sentiment ticker still scores positive
+  # whenever gap_pct > 0. See ai-broker#58 (M-2).
+  sentiment_composite_offset: 0.0
 
 # -----------------------------------------------------------------------------
 # Sentiment
