@@ -21,6 +21,7 @@ unrelated code paths still surface.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import sqlite3
 from dataclasses import dataclass
@@ -234,9 +235,8 @@ class OrderManager:
         operate on the same set of positions the prior tick left open.
         """
         try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-            conn.row_factory = sqlite3.Row
-            try:
+            with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
+                conn.row_factory = sqlite3.Row
                 rows = conn.execute(
                     "SELECT * FROM positions "
                     "WHERE status NOT IN (?, ?)",
@@ -254,8 +254,6 @@ class OrderManager:
                         "SELECT id, ticker, entry_time FROM trades"
                     ).fetchall()
                 }
-            finally:
-                conn.close()
         except sqlite3.OperationalError:
             logger.warning("positions table not found during hydration")
             return
@@ -334,16 +332,13 @@ class OrderManager:
             seconds=timeout_seconds * 2,
         )
         try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-            try:
+            with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
                 conn.row_factory = sqlite3.Row
                 rows = conn.execute(
                     "SELECT id, ticker, entry_time FROM positions "
                     "WHERE status = ? AND alpaca_order_id IS NULL",
                     (PositionStatus.ENTRY_PENDING.value,),
                 ).fetchall()
-            finally:
-                conn.close()
         except sqlite3.OperationalError:
             logger.warning(
                 "uninitiated-entry sweep: positions table unreadable",
@@ -1807,8 +1802,7 @@ class OrderManager:
             )
         else:
             try:
-                conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-                try:
+                with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
                     cur = conn.execute(
                         "UPDATE trades SET exit_time = ?, exit_price = ?, "
                         "exit_reason = ?, gross_pnl = ?, net_pnl = ? "
@@ -1830,8 +1824,6 @@ class OrderManager:
                             "trade_id=%d",
                             db_trade_id, cur.rowcount, active.ticker, trade_id,
                         )
-                finally:
-                    conn.close()
             except Exception:
                 logger.exception(
                     "Failed to update trade record for db_trade_id=%d "
@@ -1858,8 +1850,7 @@ class OrderManager:
     def _create_position_record(self, decision: EntryDecision) -> int | None:
         now_str: str = datetime.now(tz=ET).isoformat()
         try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-            try:
+            with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
                 # Both inserts share a single transaction. If the trades
                 # insert fails we ROLLBACK so we never leave a positions
                 # row without its matching trades audit row.
@@ -1934,8 +1925,6 @@ class OrderManager:
                 # carry the trades.id forward.
                 self._pending_db_trade_ids[trade_id] = db_trade_id
                 return trade_id
-            finally:
-                conn.close()
         except Exception:
             logger.exception("Failed to create position record for %s", decision.ticker)
             return None
@@ -1952,8 +1941,7 @@ class OrderManager:
         """
         now_str: str = datetime.now(tz=ET).isoformat()
         try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-            try:
+            with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
                 cursor = conn.execute(
                     """
                     UPDATE trades
@@ -1969,8 +1957,6 @@ class OrderManager:
                 )
                 conn.commit()
                 rows_affected: int = cursor.rowcount
-            finally:
-                conn.close()
         except Exception:
             logger.exception(
                 "Failed to mark trade entry_failed for db_trade_id=%d",
@@ -2012,13 +1998,10 @@ class OrderManager:
 
         now_str: str = datetime.now(tz=ET).isoformat()
         try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-            try:
+            with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
                 cursor = conn.execute(sql, (value, now_str, trade_id))
                 conn.commit()
                 rows_affected: int = cursor.rowcount
-            finally:
-                conn.close()
         except Exception:
             logger.exception(
                 "Failed to update positions.%s for trade_id=%d",
@@ -2060,8 +2043,7 @@ class OrderManager:
         failures and no forensic trail. This helper closes that gap.
         """
         try:
-            conn: sqlite3.Connection = sqlite3.connect(self._db_path)
-            try:
+            with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
                 repo.save_order_rejection(
                     conn,
                     {
@@ -2075,8 +2057,6 @@ class OrderManager:
                         "resolved": 0,
                     },
                 )
-            finally:
-                conn.close()
         except Exception:
             logger.exception(
                 "Failed to persist rejection for %s (%s)", ticker, reason
