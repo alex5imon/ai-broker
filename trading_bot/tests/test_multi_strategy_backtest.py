@@ -1229,3 +1229,70 @@ class TestFractionalShares:
         )
         # Integer capped: floor(3.6) = 3
         assert shares == 3.0
+
+
+# ---------------------------------------------------------------------------
+# Regression: run_spy_intraday must track MaxDD (2026-05-14)
+# ---------------------------------------------------------------------------
+
+class TestSpyIntradayDrawdownTracking:
+    """Pre-2026-05-14 ``run_spy_intraday`` had two related bugs in its
+    day-boundary block:
+
+    1. Open positions were marked at ``entry_price`` (cost basis) so
+       equity never reflected price moves on held positions.
+    2. The peak-equity / max-drawdown update block was simply missing.
+
+    Net effect: every ``--spy`` backtest reported MaxDD = 0.0%
+    regardless of actual equity excursions, while ``--multi-intraday``
+    and ``--daily`` modes were unaffected. The fix aligns
+    ``run_spy_intraday`` with the other two handlers."""
+
+    @pytest.mark.asyncio
+    async def test_max_drawdown_is_nonzero_over_a_lossy_window(
+        self, config: Config,
+    ) -> None:
+        """A 1-year SPY window includes the 2018 Q4 selloff — a
+        strategy that takes any losing trade in that window must
+        produce MaxDD > 0. Pre-fix this assertion failed (MaxDD
+        always reported as 0.0); post-fix the peak/DD tracking at
+        the day-boundary block records real equity excursions."""
+        # Skip if the real SPY dataset isn't present (CI without it
+        # would otherwise fail noisily). The integration test only
+        # makes sense against real bars — synthetic data wouldn't
+        # exercise the strategy's signal-generation path.
+        try:
+            from trading_bot.data.spy_intraday_loader import load_spy_range
+            spy_check = load_spy_range(date(2018, 1, 1), date(2018, 1, 5))
+            if spy_check.empty:
+                pytest.skip("SPY 1-min dataset not available in this env")
+        except Exception:
+            pytest.skip("SPY 1-min dataset not loadable in this env")
+
+        engine = MultiStrategyBacktester(config)
+        result = await engine.run_spy_intraday(
+            from_date=date(2018, 1, 1),
+            to_date=date(2018, 12, 31),
+            cash_per_strategy_usd=1000.0,
+            regime_filter=True,
+        )
+
+        # Find the mean_reversion strategy result. The default config
+        # always includes it.
+        mr = next(
+            (s for s in result.strategies if s.strategy_id == "mean_reversion"),
+            None,
+        )
+        assert mr is not None, "mean_reversion must be present"
+        assert mr.total_trades > 0, (
+            "regression test requires at least one trade in the 2018 "
+            "window — if this fails the strategy config has drifted "
+            "and the test no longer exercises the bug"
+        )
+        assert mr.max_drawdown_pct > 0, (
+            f"MaxDD must be > 0 over a year that includes 2018 Q4 "
+            f"selloff and {mr.losses} losing trades. Pre-fix this was "
+            f"silently 0.0 because the day-boundary block marked open "
+            f"positions at entry_price and never updated "
+            f"peak_equity_usd / max_drawdown_pct."
+        )
