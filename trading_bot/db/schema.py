@@ -47,6 +47,11 @@ CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades(ticker);
 CREATE INDEX IF NOT EXISTS idx_trades_entry_time ON trades(entry_time);
 CREATE INDEX IF NOT EXISTS idx_trades_exit_reason ON trades(exit_reason);
 CREATE INDEX IF NOT EXISTS idx_trades_phase ON trades(phase);
+-- V13: composite index used by OrderManager._hydrate_active_orders to
+-- LEFT JOIN trades onto non-terminal positions in O(active positions)
+-- rather than O(trades) per tick.
+CREATE INDEX IF NOT EXISTS idx_trades_ticker_entry_time
+    ON trades(ticker, entry_time);
 
 -- Positions table: currently open positions and their management state
 CREATE TABLE IF NOT EXISTS positions (
@@ -267,7 +272,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 
 _SEED_VERSION_SQL: str = (
     "INSERT OR IGNORE INTO schema_version (version, description) "
-    "VALUES (?, 'V10 schema - USD-only column rename');"
+    "VALUES (?, 'V13 schema - idx_trades_ticker_entry_time for hydration JOIN');"
 )
 
 # Expected tables — used for quick health check

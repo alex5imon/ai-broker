@@ -233,27 +233,29 @@ class OrderManager:
         Each tick starts with an empty in-memory dict; we rehydrate from
         the DB so ``_check_order_statuses`` and entry-timeout sweeps can
         operate on the same set of positions the prior tick left open.
+
+        The trades-table primary key is resolved via a LEFT JOIN on
+        ``(ticker, entry_time)`` so we only read rows for non-terminal
+        positions. Pre-V13 this scanned the entire ``trades`` table on
+        every tick and built the pair map in Python; the JOIN + the V13
+        ``idx_trades_ticker_entry_time`` index reduce wall-time from
+        O(trades) to O(active positions).
         """
         try:
             with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
                 conn.row_factory = sqlite3.Row
                 rows = conn.execute(
-                    "SELECT * FROM positions "
-                    "WHERE status NOT IN (?, ?)",
+                    "SELECT p.*, t.id AS db_trade_id "
+                    "FROM positions p "
+                    "LEFT JOIN trades t "
+                    "  ON t.ticker = p.ticker "
+                    " AND t.entry_time = p.entry_time "
+                    "WHERE p.status NOT IN (?, ?)",
                     (
                         PositionStatus.CLOSED.value,
                         PositionStatus.ENTRY_FAILED.value,
                     ),
                 ).fetchall()
-                # Pair-key index for trades.id lookup. Same pairing the
-                # alpaca_backfill tool uses (ticker, entry_time) since
-                # there is no FK between the tables.
-                trades_index: dict[tuple[str, str], int] = {
-                    (str(t["ticker"]), str(t["entry_time"])): int(t["id"])
-                    for t in conn.execute(
-                        "SELECT id, ticker, entry_time FROM trades"
-                    ).fetchall()
-                }
         except sqlite3.OperationalError:
             logger.warning("positions table not found during hydration")
             return
@@ -280,6 +282,11 @@ class OrderManager:
                 else None
             )
 
+            db_trade_id_raw = row["db_trade_id"]
+            db_trade_id: int | None = (
+                int(db_trade_id_raw) if db_trade_id_raw is not None else None
+            )
+
             active = _ActiveOrder(
                 trade_id=trade_id,
                 ticker=str(row["ticker"]),
@@ -299,9 +306,7 @@ class OrderManager:
                 target_price=float(row["target_price"] or 0),
                 hold_type=str(row["hold_type"]),
                 strategy_id=row["strategy_id"],
-                db_trade_id=trades_index.get(
-                    (str(row["ticker"]), str(row["entry_time"]))
-                ),
+                db_trade_id=db_trade_id,
             )
             self._active_orders[trade_id] = active
             for oid in (

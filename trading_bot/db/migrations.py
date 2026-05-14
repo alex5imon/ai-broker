@@ -425,6 +425,36 @@ def _migration_v12(conn: sqlite3.Connection) -> None:
     logger.info("Applied migration V12: status rename")
 
 
+def _migration_v13(conn: sqlite3.Connection) -> None:
+    """V13: add ``idx_trades_ticker_entry_time`` composite index.
+
+    ``OrderManager._hydrate_active_orders`` resolves the trades-table
+    primary key for each non-terminal position via a LEFT JOIN on
+    ``(ticker, entry_time)``. Pre-V13 it instead scanned the whole
+    ``trades`` table on every tick and built a Python dict — O(trades)
+    per tick, which grows unbounded as the historical record grows.
+
+    This index makes the JOIN O(active positions). The columns mirror
+    the ``(ticker, entry_time)`` pair used in
+    ``trading_bot/tools/alpaca_backfill`` and a few other places that
+    also pair the two tables.
+
+    Idempotent: ``CREATE INDEX IF NOT EXISTS`` is a no-op when run
+    against a fresh DB that already has the index from
+    ``_SCHEMA_SQL``.
+    """
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_trades_ticker_entry_time "
+        "ON trades(ticker, entry_time)"
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_version (version, description) "
+        "VALUES (13, "
+        "'V13 schema - idx_trades_ticker_entry_time for hydration JOIN')"
+    )
+    logger.info("Applied migration V13: idx_trades_ticker_entry_time")
+
+
 _MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (4, "V4 schema - multi-market adaptive trading bot", _migration_v4),
     (5, "V5 schema - multi-strategy Alpaca trading bot", _migration_v5),
@@ -437,6 +467,8 @@ _MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
      _migration_v11),
     (12, "V12 schema - rename STOP_AND_TARGET_ACTIVE → STOP_ACTIVE",
      _migration_v12),
+    (13, "V13 schema - idx_trades_ticker_entry_time for hydration JOIN",
+     _migration_v13),
 ]
 
 

@@ -95,6 +95,71 @@ class TestHydration:
         om._hydrate_active_orders()
         assert len(om._active_orders) == 0
 
+    def test_hydrate_join_returns_only_non_terminal_positions(
+        self, config, tmp_db_path: str, mock_notifier
+    ):
+        """H-2: the (positions LEFT JOIN trades) rewrite must materialise
+        exactly the non-terminal positions and resolve db_trade_id from
+        the matching trades row in one pass.
+
+        Seeds a mix of CLOSED / ENTRY_FAILED / POSITION_OPEN /
+        STOP_ACTIVE / ENTRY_PENDING positions and asserts:
+
+        - terminal rows (CLOSED, ENTRY_FAILED) are excluded
+        - non-terminal rows are present
+        - each non-terminal row's db_trade_id points at the trades row
+          that shares its (ticker, entry_time) pair
+        """
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        # Drop the per-position pending-trade-id cache so hydration is
+        # forced to resolve db_trade_id via the JOIN.
+        seeds = {
+            "AAPL": PositionStatus.ENTRY_PENDING,
+            "MSFT": PositionStatus.POSITION_OPEN,
+            "GOOG": PositionStatus.STOP_ACTIVE,
+            "TSLA": PositionStatus.CLOSED,
+            "NVDA": PositionStatus.ENTRY_FAILED,
+        }
+        trade_ids: dict[str, int] = {}
+        for ticker, status in seeds.items():
+            tid = om._create_position_record(_entry(ticker))
+            assert tid is not None
+            trade_ids[ticker] = tid
+            if status != PositionStatus.ENTRY_PENDING:
+                om._update_position_status(tid, status)
+
+        # Clear the in-memory cache so hydration cannot satisfy
+        # db_trade_id from _pending_db_trade_ids — the JOIN must
+        # populate it from the trades table.
+        om._pending_db_trade_ids.clear()
+        om._active_orders.clear()
+        om._alpaca_to_trade.clear()
+
+        om._hydrate_active_orders()
+
+        live_tickers = {a.ticker for a in om._active_orders.values()}
+        assert live_tickers == {"AAPL", "MSFT", "GOOG"}
+        assert "TSLA" not in live_tickers
+        assert "NVDA" not in live_tickers
+
+        # Look up the trades.id for each non-terminal position and
+        # assert the JOIN populated db_trade_id.
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            for ticker in ("AAPL", "MSFT", "GOOG"):
+                row = conn.execute(
+                    "SELECT t.id "
+                    "FROM positions p JOIN trades t "
+                    "  ON t.ticker = p.ticker AND t.entry_time = p.entry_time "
+                    "WHERE p.ticker = ?",
+                    (ticker,),
+                ).fetchone()
+                expected_trade_id = int(row[0])
+                tid = trade_ids[ticker]
+                assert om._active_orders[tid].db_trade_id == expected_trade_id
+        finally:
+            conn.close()
+
 
 # ---------------------------------------------------------------------------
 # Entry fill → standalone stop attach
