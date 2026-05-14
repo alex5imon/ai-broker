@@ -51,6 +51,106 @@ def _today_eastern() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Trades — close-or-insert
+# ---------------------------------------------------------------------------
+
+def close_or_insert_trade_row(
+    conn: sqlite3.Connection,
+    *,
+    position_row: sqlite3.Row,
+    exit_time: str,
+    exit_reason: str,
+    notes: str,
+) -> tuple[str, int]:
+    """Close the entry trades row for *position_row*, or insert a stub.
+
+    Issue #132: the recovery / orphan-drain code paths used to blindly
+    ``INSERT INTO trades`` every time they CLOSED a position. The
+    normal entry flow (``OrderManager._create_position_record``) had
+    already written an entry trades row carrying the strategy metadata,
+    so the second INSERT produced duplicate rows on
+    ``(ticker, entry_time, strategy_id)`` — 25% of prod rows
+    (2026-05-14 audit). The hydration JOIN had to lean on ``MIN(t.id)``
+    for determinism (#128).
+
+    New contract: locate the entry trades row by
+    ``(ticker, entry_time, strategy_id, exit_time IS NULL)`` and UPDATE
+    its exit columns. Only INSERT a stub if no entry row exists — the
+    legitimate case for positions discovered by recovery from a stray
+    Alpaca holding (``gateway/recovery.py:_create_db_position``).
+
+    Picks ``MIN(trades.id)`` when multiple legacy duplicates remain so
+    the choice is stable and matches the JOIN convention in
+    ``OrderManager._hydrate_active_orders``.
+
+    Returns ``("update", trades.id)`` or ``("insert", trades.id)`` so
+    callers can log which branch fired.
+
+    Caller owns the transaction — wrap in ``with conn:`` or commit
+    explicitly afterwards.
+    """
+    ticker: str = position_row["ticker"]
+    entry_time: str = position_row["entry_time"]
+    strategy_id: str = position_row["strategy_id"] or "unknown"
+    # Float-typed: positions.quantity may be fractional. int() truncation
+    # of -0.43 → 0 would mis-derive side as BUY. Sign-of-the-float is
+    # the only invariant we need here.
+    qty: float = float(position_row["quantity"] or 0)
+    # The bot is long-only at the strategy layer, but the schema
+    # technically allows shorts — derive rather than assume. Positive
+    # qty == long entry.
+    entry_side: str = "BUY" if qty >= 0 else "SELL"
+
+    existing = conn.execute(
+        "SELECT MIN(id) FROM trades "
+        "WHERE ticker = ? AND entry_time = ? "
+        "  AND strategy_id = ? AND exit_time IS NULL",
+        (ticker, entry_time, strategy_id),
+    ).fetchone()
+    existing_id: int | None = (
+        int(existing[0]) if existing is not None and existing[0] is not None
+        else None
+    )
+
+    if existing_id is not None:
+        conn.execute(
+            "UPDATE trades "
+            "SET exit_time = ?, exit_reason = ?, notes = ? "
+            "WHERE id = ?",
+            (exit_time, exit_reason, notes, existing_id),
+        )
+        return ("update", existing_id)
+
+    cur = conn.execute(
+        "INSERT INTO trades "
+        "(ticker, exchange, currency, side, entry_time, "
+        " entry_price, quantity, exit_time, exit_reason, "
+        " hold_type, phase, strategy_id, notes) "
+        "VALUES (:ticker, :exchange, :currency, :side, "
+        "        :entry_time, :entry_price, :quantity, "
+        "        :exit_time, :exit_reason, :hold_type, "
+        "        :phase, :strategy_id, :notes)",
+        {
+            "ticker": ticker,
+            "exchange": position_row["exchange"],
+            "currency": position_row["currency"],
+            "side": entry_side,
+            "entry_time": entry_time,
+            "entry_price": position_row["entry_price"],
+            "quantity": abs(qty),
+            "exit_time": exit_time,
+            "exit_reason": exit_reason,
+            "hold_type": position_row["hold_type"],
+            "phase": position_row["phase"],
+            "strategy_id": strategy_id,
+            "notes": notes,
+        },
+    )
+    new_id: int = cur.lastrowid  # type: ignore[assignment]
+    return ("insert", new_id)
+
+
+# ---------------------------------------------------------------------------
 # Trades
 # ---------------------------------------------------------------------------
 
