@@ -9,6 +9,17 @@ recovery (see ``OrderManager._recover_missing_stop``) silently heals it.
 This is intended to run once per tick — it's cheap (one Alpaca query
 per recorded stop, plus the open-orders scan that the recovery layer
 already performs). It does NOT mutate state; it only reports.
+
+Notification suppression: overnight_drift entries fire at 15:45 ET and
+intentionally land in ``POSITION_OPEN`` with ``stop_price > 0`` and
+``alpaca_stop_order_id IS NULL`` until the next tick's
+``_transition_to_open`` call attaches the standalone stop. Inside that
+brief grace window the reconciler still detects the row and the
+emergency stop-attach logic still fires, but the priority-4 push
+notification is suppressed (a WARNING log line is emitted instead) so
+the operator isn't desensitised to real signals by a recurring
+false-alarm flood (issue #129). Do not "fix" the suppression thinking
+it's a bug — past the grace window, both log and notification fire.
 """
 
 from __future__ import annotations
@@ -17,11 +28,12 @@ import asyncio
 import logging
 import sqlite3
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 from alpaca.trading.models import Order as AlpacaOrder
 
-from trading_bot.constants import PositionStatus
+from trading_bot.constants import TZ_EASTERN, PositionStatus
 
 if TYPE_CHECKING:
     from trading_bot.gateway import GatewayConnection
@@ -51,6 +63,8 @@ class NakedPosition:
     stop_price: float
     alpaca_stop_order_id: str | None
     broker_status: str  # 'missing' / 'canceled' / 'expired' / 'rejected' / 'filled' / etc.
+    strategy_id: str | None = None
+    entry_time: str | None = None
 
     def describe(self) -> str:
         sid: str = self.alpaca_stop_order_id or "NULL"
@@ -59,6 +73,43 @@ class NakedPosition:
             f"entry=${self.entry_price:.4f}, stop=${self.stop_price:.4f}, "
             f"stop_order_id={sid}, broker_status={self.broker_status})"
         )
+
+
+# overnight_drift entries fire at 15:45 ET; the next tick (15:50 ET) is
+# where ``_transition_to_open`` attaches the standalone stop. A 10-minute
+# grace window covers that one-tick gap with safety margin without
+# masking a real failure (which persists for many ticks).
+_OVERNIGHT_DRIFT_GRACE_MINUTES: int = 10
+
+
+def _is_expected_naked_window(
+    position: NakedPosition,
+    now: datetime,
+    *,
+    grace_minutes: int = _OVERNIGHT_DRIFT_GRACE_MINUTES,
+) -> bool:
+    """True iff this naked state is the legitimate brief post-fill window.
+
+    overnight_drift enters at 15:45 ET and gets its stop attached on the
+    next tick. During that single-tick window the row legitimately has
+    ``POSITION_OPEN`` + ``alpaca_stop_order_id IS NULL``. Any other
+    strategy, or overnight_drift past the grace window, is treated as a
+    real naked-position event.
+    """
+    if position.strategy_id != "overnight_drift":
+        return False
+    if not position.entry_time:
+        return False
+    try:
+        entry_dt: datetime = datetime.fromisoformat(str(position.entry_time))
+    except ValueError:
+        return False
+    if entry_dt.tzinfo is None:
+        entry_dt = entry_dt.replace(tzinfo=TZ_EASTERN)
+    else:
+        entry_dt = entry_dt.astimezone(TZ_EASTERN)
+    delta: timedelta = now - entry_dt
+    return timedelta(0) <= delta <= timedelta(minutes=grace_minutes)
 
 
 @dataclass
@@ -108,7 +159,7 @@ def _load_open_positions(db_path: str) -> list[sqlite3.Row]:
             placeholders: str = ",".join("?" * len(_STATUSES_NEEDING_STOP))
             rows: list[sqlite3.Row] = conn.execute(
                 f"SELECT id, ticker, status, quantity, entry_price, "  # nosec B608
-                f"stop_price, alpaca_stop_order_id "
+                f"stop_price, alpaca_stop_order_id, strategy_id, entry_time "
                 f"FROM positions WHERE status IN ({placeholders})",
                 _STATUSES_NEEDING_STOP,
             ).fetchall()
@@ -169,6 +220,12 @@ async def reconcile_open_position_stops(
         # the in-tick recovery may have just attached one, but if this
         # check runs before the recovery branch (or outside the
         # market-hours window) the row is still naked at the broker.
+        strategy_id: str | None = (
+            str(row["strategy_id"]) if row["strategy_id"] else None
+        )
+        entry_time: str | None = (
+            str(row["entry_time"]) if row["entry_time"] else None
+        )
         if not stop_oid:
             naked: NakedPosition = NakedPosition(
                 trade_id=int(row["id"]),
@@ -179,6 +236,8 @@ async def reconcile_open_position_stops(
                 stop_price=float(row["stop_price"] or 0),
                 alpaca_stop_order_id=None,
                 broker_status="missing",
+                strategy_id=strategy_id,
+                entry_time=entry_time,
             )
             result.naked.append(naked)
             continue
@@ -196,6 +255,8 @@ async def reconcile_open_position_stops(
                 stop_price=float(row["stop_price"] or 0),
                 alpaca_stop_order_id=stop_oid,
                 broker_status=broker_status,
+                strategy_id=strategy_id,
+                entry_time=entry_time,
             )
         )
 
@@ -206,12 +267,25 @@ async def reconcile_open_position_stops(
         )
         for naked in result.naked:
             logger.warning("  naked: %s", naked.describe())
-        if notifier is not None:
-            body: str = "\n".join(n.describe() for n in result.naked)
+
+        now: datetime = datetime.now(tz=TZ_EASTERN)
+        notifiable: list[NakedPosition] = [
+            n for n in result.naked
+            if not _is_expected_naked_window(n, now=now)
+        ]
+        for suppressed in result.naked:
+            if suppressed not in notifiable:
+                logger.warning(
+                    "stop reconciler: suppressing notification for "
+                    "overnight_drift in expected grace window: %s",
+                    suppressed.describe(),
+                )
+        if notifier is not None and notifiable:
+            body: str = "\n".join(n.describe() for n in notifiable)
             await notifier.send(
                 "Naked Position Detected",
                 (
-                    f"Found {len(result.naked)} DB-open "
+                    f"Found {len(notifiable)} DB-open "
                     f"position(s) without an active broker-side stop. "
                     f"Issue #117 surface — in-tick recovery should "
                     f"heal during market hours; verify and "
