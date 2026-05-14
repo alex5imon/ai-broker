@@ -12,6 +12,24 @@ says "exercise extreme care with all order logic."
   `StopOrderRequest` on fill; take-profit is managed by the tick-loop's
   `check_exits` polling against `target_price`. The PR #38 whole-share floor
   has been removed — fractional shares pass through end-to-end.
+
+  **Accepted tradeoff — 5-min take-profit polling gap (decision 2026-05-14, ai-broker#39 re-audit).**
+  Issue #39 flagged "tick-cadence gap on take-profit" as needing an explicit
+  decision. PR #53 shipped tick-loop polling against `target_price` in place
+  of a broker-side take-profit limb because Alpaca rejects fractional+bracket
+  combos with code 42210000. The polling cadence is the bot's main-loop tick
+  (5 min during NYSE hours on GHA cron), so a fast print past the target
+  between ticks can exit at a worse price than a broker-side limit would have.
+  We accept this for the $1k live account: (a) PR #53's backtest A/B is
+  byte-identical at the strategy level — the cost is realized fill quality,
+  not signal selection; (b) fractional entries on $1k are small enough that
+  worst-case slippage on a 5-min window is bounded by the strategy's own
+  stop distance; (c) the alternative (broker-side TP for whole-qty + polled
+  TP for fractional) doubles the entry-path code surface for a single live
+  sleeve (mean_reversion, ~60 trades/year), which is a worse foot-gun than
+  the slippage it avoids. **Revisit only if** (i) live equity rises far
+  enough that whole-share entries become the norm, or (ii) postmortems
+  surface a pattern of take-profit slippage beyond the stop-distance bound.
 - **#40 — `PerformanceCalculator` not surfacing closed trades.** Two pre-existing
   test failures reproduce the same pattern as the live `daily_summaries` showing
   0/0/0 wins/losses despite closed entries. Probably the load-bearing reason

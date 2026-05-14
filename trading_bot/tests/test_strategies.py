@@ -165,6 +165,18 @@ class TestMeanReversion:
         result = strategy.evaluate_entry("PLTR", "US", df, df, 10.5, 250.0)
         assert result is None
 
+    def test_fractional_shares_default_is_true(self) -> None:
+        """Regression: mean_reversion must default fractional_shares=True.
+
+        The $1k live account requires fractional shares — whole-share rounding
+        at SPY/QQQ/XLK >$400 floors to 0 and drops ~50% of mean_reversion
+        signals (see ai-broker#39). If a config ever omits the explicit
+        ``fractional_shares: true`` override, this default keeps the sleeve
+        from silently regressing to whole-share sizing.
+        """
+        strategy = MeanReversionStrategy(config=_mr_config())
+        assert strategy._fractional_shares is True
+
     def test_entry_on_rsi_recovery(self) -> None:
         strategy = MeanReversionStrategy(config=_mr_config())
         df = _make_oversold_bars(60)
