@@ -535,9 +535,16 @@ class TestStopReconciliation:
         ticker: str,
         status: PositionStatus,
         stop_order_id: str | None,
+        *,
+        strategy_id: str = "mean_reversion",
+        entry_time: datetime | None = None,
     ) -> int:
         conn = sqlite3.connect(db_path)
         try:
+            entry_iso: str = (
+                entry_time.isoformat() if entry_time is not None
+                else datetime.now(tz=ET).isoformat()
+            )
             now: str = datetime.now(tz=ET).isoformat()
             cur = conn.execute(
                 "INSERT INTO positions "
@@ -548,9 +555,9 @@ class TestStopReconciliation:
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     ticker, "US", "USD", "Industrials",
-                    0.5, 100.0, now, status.value,
+                    0.5, 100.0, entry_iso, status.value,
                     98.0, 102.0, "intraday",
-                    3, "mean_reversion", 100.0, now,
+                    3, strategy_id, 100.0, now,
                     stop_order_id,
                 ),
             )
@@ -650,6 +657,125 @@ class TestStopReconciliation:
 
         assert result.has_naked
         assert result.naked[0].broker_status == "missing"
+
+    # ------------------------------------------------------------------
+    # Issue #129: strategy-aware notification suppression for the
+    # legitimate overnight_drift entry → next-tick stop-attach window.
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_reconciler_notifies_naked_mean_reversion(
+        self, tmp_db_path: str, mock_notifier
+    ) -> None:
+        """Baseline: mean_reversion entries have no grace window — a
+        naked row fires the priority-4 notification regardless of how
+        recent the entry is."""
+        self._seed_open_position(
+            tmp_db_path, "XLI", PositionStatus.POSITION_OPEN, None,
+            strategy_id="mean_reversion",
+            entry_time=datetime.now(tz=ET) - timedelta(minutes=2),
+        )
+
+        gw = MagicMock()
+        gw.client = MagicMock()
+
+        result = await reconcile_open_position_stops(
+            db_path=tmp_db_path, gateway=gw, notifier=mock_notifier,
+        )
+
+        assert result.has_naked
+        mock_notifier.send.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_reconciler_suppresses_overnight_drift_in_grace_window(
+        self, tmp_db_path: str, mock_notifier, caplog
+    ) -> None:
+        """An overnight_drift entry timestamped within the 10-minute
+        grace window is detected and logged but does NOT fire the push
+        notification — that's the operator-fatigue mitigation from
+        issue #129."""
+        import logging
+        self._seed_open_position(
+            tmp_db_path, "XLK", PositionStatus.POSITION_OPEN, None,
+            strategy_id="overnight_drift",
+            entry_time=datetime.now(tz=ET) - timedelta(minutes=2),
+        )
+
+        gw = MagicMock()
+        gw.client = MagicMock()
+
+        with caplog.at_level(logging.WARNING):
+            result = await reconcile_open_position_stops(
+                db_path=tmp_db_path, gateway=gw, notifier=mock_notifier,
+            )
+
+        # Detection still happens — emergency stop-attach path still fires.
+        assert result.has_naked
+        assert result.naked[0].strategy_id == "overnight_drift"
+        # Notification suppressed.
+        mock_notifier.send.assert_not_awaited()
+        # Operator can grep the log for the suppressed event.
+        assert any(
+            "suppressing notification" in record.message
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_reconciler_notifies_overnight_drift_past_grace_window(
+        self, tmp_db_path: str, mock_notifier
+    ) -> None:
+        """An overnight_drift entry older than the grace window is a
+        real failure of the stop-attach path — both log and
+        notification must fire. Guards against silently masking the
+        very class of bug the reconciler exists to catch (#117 mode C)."""
+        self._seed_open_position(
+            tmp_db_path, "XLF", PositionStatus.POSITION_OPEN, None,
+            strategy_id="overnight_drift",
+            entry_time=datetime.now(tz=ET) - timedelta(minutes=30),
+        )
+
+        gw = MagicMock()
+        gw.client = MagicMock()
+
+        result = await reconcile_open_position_stops(
+            db_path=tmp_db_path, gateway=gw, notifier=mock_notifier,
+        )
+
+        assert result.has_naked
+        mock_notifier.send.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_reconciler_mixed_batch_notifies_only_non_grace(
+        self, tmp_db_path: str, mock_notifier
+    ) -> None:
+        """When one overnight_drift row is in grace and one
+        mean_reversion row is naked, exactly one notification fires and
+        its body excludes the suppressed row."""
+        self._seed_open_position(
+            tmp_db_path, "XLK", PositionStatus.POSITION_OPEN, None,
+            strategy_id="overnight_drift",
+            entry_time=datetime.now(tz=ET) - timedelta(minutes=2),
+        )
+        self._seed_open_position(
+            tmp_db_path, "XLI", PositionStatus.POSITION_OPEN, None,
+            strategy_id="mean_reversion",
+            entry_time=datetime.now(tz=ET) - timedelta(minutes=2),
+        )
+
+        gw = MagicMock()
+        gw.client = MagicMock()
+
+        result = await reconcile_open_position_stops(
+            db_path=tmp_db_path, gateway=gw, notifier=mock_notifier,
+        )
+
+        assert len(result.naked) == 2
+        mock_notifier.send.assert_awaited_once()
+        # Inspect the body — only the mean_reversion ticker should appear.
+        call_args = mock_notifier.send.await_args
+        body: str = call_args.args[1]
+        assert "XLI" in body
+        assert "XLK" not in body
 
 
 # ---------------------------------------------------------------------------
