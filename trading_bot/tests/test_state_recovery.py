@@ -295,6 +295,144 @@ class TestStateRecovery:
         gw.client.submit_order.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_emergency_stop_persists_order_id_to_db(
+        self, tmp_db_path: str, mock_notifier,
+    ) -> None:
+        """Regression for 2026-05-15 untracked-emergency-stop bug.
+
+        ``_place_emergency_stop`` submitted a stop to Alpaca and dropped
+        the returned order_id on the floor, leaving
+        ``positions.alpaca_stop_order_id`` NULL forever. Every subsequent
+        tick saw the position as naked, accumulated broker-side stops,
+        and when one finally filled, recovery wrote
+        ``exit_reason='reconciliation_mismatch'`` with NULL exit_price/
+        pnl — wiping the realized-P&L attribution from
+        ``daily_summaries``.
+
+        Fix: capture ``order.id`` from ``submit_order`` and write it
+        back via ``_persist_emergency_stop_id``.
+        """
+        conn = sqlite3.connect(tmp_db_path)
+        position_id = _insert_db_position(conn, "PLTR", qty=100, entry_price=10.0)
+        conn.close()
+
+        pos = _alpaca_position("PLTR", qty=100, avg_entry_price=10.0)
+        gw = self._make_gateway(positions=[pos], orders=[])
+        # Mock the broker's submit_order to return an order with an id —
+        # the real Alpaca SDK does this; the prior mock setup was lenient
+        # enough that the dropped return value went unnoticed.
+        submitted_order = MagicMock()
+        submitted_order.id = "broker-stop-id-xyz"
+        gw.client.submit_order = MagicMock(return_value=submitted_order)
+
+        mid_session = datetime(2026, 5, 11, 11, 0, tzinfo=ET)
+        recovery = _make_recovery(
+            gw, tmp_db_path, mock_notifier, now=mid_session,
+        )
+        result = await recovery.recover()
+        assert "PLTR" in result.stops_placed
+
+        conn = sqlite3.connect(tmp_db_path)
+        row = conn.execute(
+            "SELECT alpaca_stop_order_id, stop_price FROM positions "
+            "WHERE id = ?",
+            (position_id,),
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row[0] == "broker-stop-id-xyz", (
+            "emergency stop's order_id must be persisted so "
+            "_check_order_statuses can poll for fills cleanly"
+        )
+        # 2% default stop_loss_pct applied to entry $10.00.
+        assert row[1] == pytest.approx(9.80, abs=1e-6)
+
+    @pytest.mark.asyncio
+    async def test_emergency_stop_does_not_clobber_existing_stop_price(
+        self, tmp_db_path: str, mock_notifier,
+    ) -> None:
+        """When a strategy already set a custom stop_price on the row,
+        the emergency-stop writeback must preserve it (COALESCE).
+
+        Recovery's stop price comes from a generic default-pct config and
+        is intentionally a fallback. If a strategy chose a tighter or
+        looser stop, that intent must survive the writeback — otherwise
+        every emergency-stop placement would silently retune the row to
+        the default.
+        """
+        conn = sqlite3.connect(tmp_db_path)
+        cur = conn.execute(
+            """INSERT INTO positions
+               (ticker, exchange, currency, quantity, entry_price,
+                entry_time, status, stop_price, hold_type, phase,
+                strategy_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "PLTR", "NASDAQ", "USD", 100, 10.0,
+                datetime.now(ET).isoformat(),
+                "POSITION_OPEN", 9.50, "swing", 1, "mr",
+            ),
+        )
+        position_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+
+        pos = _alpaca_position("PLTR", qty=100, avg_entry_price=10.0)
+        gw = self._make_gateway(positions=[pos], orders=[])
+        submitted_order = MagicMock()
+        submitted_order.id = "broker-stop-id-xyz"
+        gw.client.submit_order = MagicMock(return_value=submitted_order)
+
+        mid_session = datetime(2026, 5, 11, 11, 0, tzinfo=ET)
+        recovery = _make_recovery(
+            gw, tmp_db_path, mock_notifier, now=mid_session,
+        )
+        await recovery.recover()
+
+        conn = sqlite3.connect(tmp_db_path)
+        row = conn.execute(
+            "SELECT alpaca_stop_order_id, stop_price FROM positions "
+            "WHERE id = ?",
+            (position_id,),
+        ).fetchone()
+        conn.close()
+        assert row[0] == "broker-stop-id-xyz"
+        assert row[1] == pytest.approx(9.50, abs=1e-6), (
+            "strategy-set stop_price 9.50 must survive; recovery's "
+            "default 9.80 must not overwrite"
+        )
+
+    @pytest.mark.asyncio
+    async def test_emergency_stop_persistence_handles_missing_db_row(
+        self, tmp_db_path: str, mock_notifier,
+    ) -> None:
+        """If the broker has a position with no DB row, recovery first
+        creates a row via ``_create_db_position`` and then places a
+        stop. The persistence writeback must succeed against that
+        freshly-created row.
+        """
+        pos = _alpaca_position("PLTR", qty=100, avg_entry_price=10.0)
+        gw = self._make_gateway(positions=[pos], orders=[])
+        submitted_order = MagicMock()
+        submitted_order.id = "broker-stop-id-xyz"
+        gw.client.submit_order = MagicMock(return_value=submitted_order)
+
+        mid_session = datetime(2026, 5, 11, 11, 0, tzinfo=ET)
+        recovery = _make_recovery(
+            gw, tmp_db_path, mock_notifier, now=mid_session,
+        )
+        result = await recovery.recover()
+        assert "PLTR" in result.positions_created
+        assert "PLTR" in result.stops_placed
+
+        conn = sqlite3.connect(tmp_db_path)
+        row = conn.execute(
+            "SELECT alpaca_stop_order_id FROM positions WHERE ticker='PLTR'"
+        ).fetchone()
+        conn.close()
+        assert row is not None and row[0] == "broker-stop-id-xyz"
+
+    @pytest.mark.asyncio
     async def test_stop_verify_skipped_at_close_of_day_tick(
         self, tmp_db_path: str, mock_notifier
     ) -> None:

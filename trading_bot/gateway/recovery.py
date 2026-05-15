@@ -421,10 +421,98 @@ class StateRecovery:
             )
             # Alpaca SDK is sync — offload to a worker thread so we don't
             # block the event loop on the HTTP submit.
-            await asyncio.to_thread(self._gw.client.submit_order, order_data=request)
-            logger.info("Emergency stop placed for %s: %s %.6f @ stop %.2f", ticker, side.value, order_qty, stop_price)
+            order = await asyncio.to_thread(
+                self._gw.client.submit_order, order_data=request,
+            )
+            stop_order_id: str = str(getattr(order, "id", "") or "")
+            logger.info(
+                "Emergency stop placed for %s: %s %.6f @ stop %.2f (id=%s)",
+                ticker, side.value, order_qty, stop_price,
+                stop_order_id or "?",
+            )
+            # Without this writeback, ``positions.alpaca_stop_order_id``
+            # stays NULL and every subsequent tick sees the position as
+            # naked → places another emergency stop → accumulates broker-
+            # side stops the bot has no record of. When one of those
+            # untracked stops eventually fills, `_check_order_statuses`
+            # has no ``order_id`` to poll, so recovery later writes
+            # ``exit_reason='reconciliation_mismatch'`` with NULL
+            # exit_price/pnl, losing the realized P&L attribution.
+            if stop_order_id:
+                self._persist_emergency_stop_id(
+                    ticker, stop_order_id, stop_price,
+                )
         except Exception:
             logger.exception("Failed to place emergency stop for %s", ticker)
+
+    def _persist_emergency_stop_id(
+        self,
+        ticker: str,
+        stop_order_id: str,
+        stop_price: float,
+    ) -> None:
+        """Write the broker-side stop order_id back onto the DB row.
+
+        Targets the unique non-terminal positions row for ``ticker`` that
+        is currently missing an ``alpaca_stop_order_id``. ``stop_price``
+        is only written when the existing value is NULL — recovery's
+        default-stop-pct calculation must not clobber a strategy-set
+        target. Multi-row matches log a warning rather than mass-update,
+        so a schema accident never blindly applies one order_id to
+        multiple positions.
+        """
+        now: str = datetime.now(tz=ET).isoformat()
+        conn: sqlite3.Connection = sqlite3.connect(self._db_path)
+        try:
+            try:
+                with conn:
+                    cur = conn.execute(
+                        """SELECT id FROM positions
+                            WHERE ticker = ?
+                              AND status NOT IN ('CLOSED', 'ENTRY_FAILED')
+                              AND alpaca_stop_order_id IS NULL""",
+                        (ticker,),
+                    )
+                    rows = cur.fetchall()
+                    if not rows:
+                        logger.warning(
+                            "Emergency stop persistence: no matching "
+                            "POSITION row for %s with NULL "
+                            "alpaca_stop_order_id — stop_order_id=%s "
+                            "left at broker but untracked",
+                            ticker, stop_order_id,
+                        )
+                        return
+                    if len(rows) > 1:
+                        logger.warning(
+                            "Emergency stop persistence: %d non-terminal "
+                            "rows for %s — refusing to write stop_order_id "
+                            "to all; manual reconciliation needed",
+                            len(rows), ticker,
+                        )
+                        return
+                    position_id: int = int(rows[0][0])
+                    conn.execute(
+                        """UPDATE positions
+                            SET alpaca_stop_order_id = ?,
+                                stop_price = COALESCE(stop_price, ?),
+                                updated_at = ?
+                            WHERE id = ?""",
+                        (stop_order_id, stop_price, now, position_id),
+                    )
+                    logger.info(
+                        "Emergency stop persisted: %s position_id=%d "
+                        "stop_order_id=%s stop_price=%.4f",
+                        ticker, position_id, stop_order_id, stop_price,
+                    )
+            except sqlite3.OperationalError:
+                logger.warning(
+                    "Could not persist emergency stop_order_id for %s "
+                    "(stop_order_id=%s)",
+                    ticker, stop_order_id,
+                )
+        finally:
+            conn.close()
 
     async def _cancel_stale_entry_orders(
         self,
