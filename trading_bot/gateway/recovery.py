@@ -36,6 +36,25 @@ _DEFAULT_EOD_FLATTEN_TIME: str = "15:55"
 # branch. Override via config.recovery.fresh_entry_grace_minutes.
 _DEFAULT_FRESH_ENTRY_GRACE_MINUTES: int = 10
 
+# Position statuses that indicate an exit order is already on the
+# broker book. When Alpaca shows no position for a ticker in one of
+# these states AND the corresponding alpaca_*_order_id is set, defer
+# the close to `_check_order_statuses` — it will poll the order_id,
+# detect the fill, and write the real exit_price/exit_reason/pnl onto
+# the trades row. Without this defer, recovery races
+# `_check_order_statuses` on the same tick and clobbers the proper
+# exit attribution with 'reconciliation_mismatch' + NULL pnl
+# (regression observed 2026-05-15 — see PR #140).
+_EXIT_IN_FLIGHT_STATUSES: frozenset[str] = frozenset(
+    {"CLOSING", "STOP_ACTIVE", "TRAILING_ACTIVE"}
+)
+_EXIT_ORDER_ID_COLUMNS: tuple[str, ...] = (
+    "alpaca_exit_order_id",
+    "alpaca_stop_order_id",
+    "alpaca_trail_order_id",
+    "alpaca_target_order_id",
+)
+
 
 @dataclass
 class RecoveryResult:
@@ -48,6 +67,13 @@ class RecoveryResult:
     positions_created: list[str] = field(default_factory=list)
     positions_closed_mismatch: list[str] = field(default_factory=list)
     positions_deferred_fresh: list[str] = field(default_factory=list)
+    # Rows whose status indicates an exit order is already on the broker
+    # book (CLOSING, STOP_ACTIVE, TRAILING_ACTIVE) and that order_id is
+    # non-NULL. Deferring lets the next tick's `_check_order_statuses`
+    # poll the order and write the real exit_price/exit_reason/pnl
+    # rather than recovery clobbering the trades row with
+    # 'reconciliation_mismatch' + NULL pnl.
+    positions_deferred_exit_inflight: list[str] = field(default_factory=list)
     quantities_updated: list[str] = field(default_factory=list)
     stops_placed: list[str] = field(default_factory=list)
     stale_orders_cancelled: list[str] = field(default_factory=list)
@@ -87,6 +113,11 @@ class RecoveryResult:
             lines.append(
                 f"Deferred fresh DB-only positions (Alpaca lag): "
                 f"{', '.join(self.positions_deferred_fresh)}"
+            )
+        if self.positions_deferred_exit_inflight:
+            lines.append(
+                f"Deferred DB-only positions (exit in flight): "
+                f"{', '.join(self.positions_deferred_exit_inflight)}"
             )
         if self.quantities_updated:
             lines.append(f"Updated quantities: {', '.join(self.quantities_updated)}")
@@ -279,6 +310,37 @@ class StateRecovery:
                 )
                 result.positions_deferred_fresh.append(ticker)
                 continue
+            # Exit-in-flight defer: if the DB row indicates an exit
+            # order is on the broker (CLOSING / STOP_ACTIVE /
+            # TRAILING_ACTIVE) and has a non-NULL order_id to poll,
+            # defer the close. `_check_order_statuses` (later in the
+            # same tick — see main.tick step 6) will pull the filled
+            # order from Alpaca and write the real
+            # exit_price/exit_reason/pnl onto the trades row.
+            #
+            # Without this defer, recovery wins the race and writes
+            # `exit_reason='reconciliation_mismatch'` with NULL pnl,
+            # silently dropping the realized P&L from
+            # `daily_summaries`. Observed 2026-05-15 — see PR #140.
+            status_val: str = str(db_row.get("status", "") or "")
+            if status_val in _EXIT_IN_FLIGHT_STATUSES:
+                tracked_oid: str | None = None
+                tracked_col: str | None = None
+                for col in _EXIT_ORDER_ID_COLUMNS:
+                    val = db_row.get(col)
+                    if val:
+                        tracked_oid = str(val)
+                        tracked_col = col
+                        break
+                if tracked_oid is not None:
+                    logger.info(
+                        "DB has position %s (status=%s, %s=%s) not on "
+                        "Alpaca — deferring to order-status poll for "
+                        "exit attribution",
+                        ticker, status_val, tracked_col, tracked_oid,
+                    )
+                    result.positions_deferred_exit_inflight.append(ticker)
+                    continue
             logger.warning(
                 "DB has position %s not in Alpaca - marking CLOSED",
                 ticker,

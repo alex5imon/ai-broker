@@ -239,6 +239,163 @@ class TestStateRecovery:
         assert "PLTR" not in result.positions_deferred_fresh
 
     @pytest.mark.asyncio
+    async def test_db_position_closing_with_exit_order_deferred(
+        self, tmp_db_path: str, mock_notifier
+    ) -> None:
+        """Regression for 2026-05-15 reconciliation_mismatch overwrite.
+
+        Sequence observed in production:
+          1. Tick 1 (09:30 ET): strategy fires market exit → submits to
+             Alpaca, sets `positions.status='CLOSING'` and writes the
+             returned order_id to `alpaca_exit_order_id`. Order fills
+             within the same tick.
+          2. Tick 2 (09:35 ET): recovery loads positions where status
+             NOT IN ('CLOSED','ENTRY_FAILED'), sees CLOSING row whose
+             ticker is no longer on Alpaca, and writes
+             `exit_reason='reconciliation_mismatch'` with NULL
+             exit_price/pnl — clobbering the proper exit attribution
+             the next-step `_check_order_statuses` was about to write.
+
+        Fix: when status indicates an exit-in-flight AND the row has
+        a non-NULL alpaca_*_order_id to poll, defer the close to
+        `_check_order_statuses` so it can write the real exit row.
+        """
+        conn = sqlite3.connect(tmp_db_path)
+        conn.execute(
+            """INSERT INTO positions
+               (ticker, exchange, currency, quantity, entry_price,
+                entry_time, status, hold_type, phase, strategy_id,
+                alpaca_exit_order_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "SPY", "NASDAQ", "USD", 1, 700.0,
+                (datetime.now(ET) - timedelta(hours=1)).isoformat(),
+                "CLOSING", "swing", 1, "overnight_drift",
+                "broker-exit-order-id",
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        gw = self._make_gateway(positions=[])
+        recovery = _make_recovery(
+            gw, tmp_db_path, mock_notifier,
+            now=datetime.now(ET) + timedelta(hours=1),
+        )
+        result = await recovery.recover()
+
+        assert "SPY" in result.positions_deferred_exit_inflight, (
+            "CLOSING + exit_order_id must defer to _check_order_statuses "
+            "instead of writing reconciliation_mismatch"
+        )
+        assert "SPY" not in result.positions_closed_mismatch
+
+        conn = sqlite3.connect(tmp_db_path)
+        row = conn.execute(
+            "SELECT status FROM positions WHERE ticker='SPY'"
+        ).fetchone()
+        conn.close()
+        assert row[0] == "CLOSING", (
+            "deferred row must remain CLOSING so the next tick's "
+            "_check_order_statuses can transition it to CLOSED with "
+            "real exit_price/pnl"
+        )
+
+    @pytest.mark.asyncio
+    async def test_db_position_stop_active_with_stop_order_deferred(
+        self, tmp_db_path: str, mock_notifier
+    ) -> None:
+        """STOP_ACTIVE with a stop_order_id: a broker-side stop almost
+        certainly filled when Alpaca no longer shows the position. Defer
+        so `_check_order_statuses` writes `exit_reason='stop_loss'` with
+        the real exit_price, not reconciliation_mismatch with NULL pnl.
+        """
+        conn = sqlite3.connect(tmp_db_path)
+        conn.execute(
+            """INSERT INTO positions
+               (ticker, exchange, currency, quantity, entry_price,
+                entry_time, status, hold_type, phase, strategy_id,
+                alpaca_stop_order_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "AAPL", "NASDAQ", "USD", 1, 200.0,
+                (datetime.now(ET) - timedelta(hours=2)).isoformat(),
+                "STOP_ACTIVE", "swing", 1, "mean_reversion",
+                "broker-stop-order-id",
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        gw = self._make_gateway(positions=[])
+        recovery = _make_recovery(
+            gw, tmp_db_path, mock_notifier,
+            now=datetime.now(ET) + timedelta(hours=1),
+        )
+        result = await recovery.recover()
+
+        assert "AAPL" in result.positions_deferred_exit_inflight
+        assert "AAPL" not in result.positions_closed_mismatch
+
+    @pytest.mark.asyncio
+    async def test_db_position_exit_inflight_without_order_id_falls_through(
+        self, tmp_db_path: str, mock_notifier
+    ) -> None:
+        """Defence-in-depth: a row in an exit-in-flight status but with
+        NULL order_id can't be reconciled by `_check_order_statuses`
+        (no order to poll). Fall through to reconciliation_mismatch
+        rather than deferring indefinitely. Pre-PR (a) emergency stops
+        would land in this shape; post-PR (a) they shouldn't.
+        """
+        conn = sqlite3.connect(tmp_db_path)
+        conn.execute(
+            """INSERT INTO positions
+               (ticker, exchange, currency, quantity, entry_price,
+                entry_time, status, hold_type, phase, strategy_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "MSFT", "NASDAQ", "USD", 1, 400.0,
+                (datetime.now(ET) - timedelta(hours=1)).isoformat(),
+                "STOP_ACTIVE", "swing", 1, "mean_reversion",
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        gw = self._make_gateway(positions=[])
+        recovery = _make_recovery(
+            gw, tmp_db_path, mock_notifier,
+            now=datetime.now(ET) + timedelta(hours=1),
+        )
+        result = await recovery.recover()
+
+        assert "MSFT" not in result.positions_deferred_exit_inflight, (
+            "no order_id means nothing to poll — must not defer"
+        )
+        assert "MSFT" in result.positions_closed_mismatch
+
+    @pytest.mark.asyncio
+    async def test_db_position_open_status_not_deferred(
+        self, tmp_db_path: str, mock_notifier
+    ) -> None:
+        """Sanity check: POSITION_OPEN (not exit-in-flight) still
+        reconciles to mismatch when the broker doesn't show the
+        position. The defer only applies to exit-in-flight statuses.
+        """
+        conn = sqlite3.connect(tmp_db_path)
+        _insert_db_position(conn, "GOOGL")
+        conn.close()
+
+        gw = self._make_gateway(positions=[])
+        recovery = _make_recovery(
+            gw, tmp_db_path, mock_notifier,
+            now=datetime.now(ET) + timedelta(hours=1),
+        )
+        result = await recovery.recover()
+        assert "GOOGL" in result.positions_closed_mismatch
+        assert "GOOGL" not in result.positions_deferred_exit_inflight
+
+    @pytest.mark.asyncio
     async def test_quantity_mismatch_updated(
         self, tmp_db_path: str, mock_notifier
     ) -> None:
