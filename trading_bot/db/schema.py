@@ -80,6 +80,14 @@ CREATE TABLE IF NOT EXISTS positions (
     -- stateless tick can rehydrate the pending exit instead of
     -- re-evaluating and double-submitting. Added in V11.
     alpaca_exit_order_id TEXT,
+    -- The strategy-supplied reason for the in-flight exit
+    -- (``overnight_exit``, ``stop_loss``, etc.). Set in lockstep with
+    -- ``alpaca_exit_order_id``. Pre-V14 this lived only on the
+    -- in-memory ``_ActiveOrder`` and was lost across the tick that
+    -- placed the exit and the tick that observed the fill — so every
+    -- strategy-driven exit landed in ``trades`` as ``strategy_exit``
+    -- regardless of the real reason. Added in V14.
+    exit_reason     TEXT,
     highest_price   REAL,
     strategy_id     TEXT NOT NULL,
     updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
