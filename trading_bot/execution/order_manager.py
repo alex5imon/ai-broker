@@ -291,6 +291,18 @@ class OrderManager:
                 if "alpaca_exit_order_id" in row_keys
                 else None
             )
+            # exit_reason added in V14. Pre-V14 the in-memory
+            # ``_ActiveOrder.exit_reason`` was set in ``place_exit``
+            # but never persisted, so the fill-detection tick rebuilt
+            # the dict from the DB with ``exit_reason=None`` and the
+            # fallback ``"strategy_exit"`` won (regression observed
+            # 2026-05-18: overnight_drift exits landed as
+            # ``strategy_exit`` instead of ``overnight_exit``).
+            exit_reason_persisted: str | None = (
+                row["exit_reason"]
+                if "exit_reason" in row_keys
+                else None
+            )
 
             db_trade_id_raw = row["db_trade_id"]
             db_trade_id: int | None = (
@@ -306,6 +318,7 @@ class OrderManager:
                 alpaca_target_order_id=row["alpaca_target_order_id"],
                 alpaca_trail_order_id=row["alpaca_trail_order_id"],
                 alpaca_exit_order_id=exit_oid,
+                exit_reason=exit_reason_persisted,
                 status=status,
                 entry_shares=float(row["quantity"] or 0),
                 filled_shares=float(row["quantity"] or 0)
@@ -689,8 +702,15 @@ class OrderManager:
                         # so the next tick re-evaluates the exit
                         # condition cleanly instead of seeing a stale
                         # alpaca_exit_order_id and refusing to act.
+                        # V14+: clear the persisted ``exit_reason`` in
+                        # the same step or the next ``place_exit`` would
+                        # inherit the old reason if it raced ahead of
+                        # the new assignment.
                         self._update_position_field(
                             trade_id, "alpaca_exit_order_id", None,
+                        )
+                        self._update_position_field(
+                            trade_id, "exit_reason", None,
                         )
                         self._update_position_status(
                             trade_id, PositionStatus.STOP_ACTIVE,
@@ -1185,8 +1205,14 @@ class OrderManager:
                 # row still STOP_ACTIVE with the order id
                 # set, which the next tick's rehydration handles
                 # gracefully. V11+: column lives on positions table.
+                # Persist ``exit_reason`` in the same step (V14+) so the
+                # fill-detection tick can rehydrate it instead of
+                # falling back to ``"strategy_exit"``.
                 self._update_position_field(
                     matching_trade_id, "alpaca_exit_order_id", order_id,
+                )
+                self._update_position_field(
+                    matching_trade_id, "exit_reason", reason,
                 )
                 self._update_position_status(
                     matching_trade_id, PositionStatus.CLOSING,
@@ -1321,8 +1347,14 @@ class OrderManager:
                     matching_active.exit_reason = reason
                 # V11+: persist exit order_id before status flip so a
                 # crash between the two writes is recoverable from DB.
+                # V14+: persist ``exit_reason`` in the same step so the
+                # fill-detection tick uses the real reason instead of
+                # the ``"strategy_exit"`` fallback.
                 self._update_position_field(
                     matching_trade_id, "alpaca_exit_order_id", order_id,
+                )
+                self._update_position_field(
+                    matching_trade_id, "exit_reason", reason,
                 )
                 self._update_position_status(
                     matching_trade_id, PositionStatus.CLOSING,
@@ -1818,14 +1850,26 @@ class OrderManager:
         else:
             try:
                 with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
+                    # ``pnl_usd`` must be written in lockstep with
+                    # ``net_pnl`` — downstream readers
+                    # (``performance.calculate_daily_metrics``,
+                    # ``repo.get_daily_pnl_usd``, the daily-loss
+                    # circuit breaker, ``_save_daily_summary``) key off
+                    # ``pnl_usd`` and silently treat NULL as zero,
+                    # which classified every live exit as neither win
+                    # nor loss and zeroed the daily-loss circuit's view
+                    # of realised P&L. The bot is commission-free so
+                    # gross/net/pnl_usd are equal at close time.
                     cur = conn.execute(
                         "UPDATE trades SET exit_time = ?, exit_price = ?, "
-                        "exit_reason = ?, gross_pnl = ?, net_pnl = ? "
+                        "exit_reason = ?, gross_pnl = ?, net_pnl = ?, "
+                        "pnl_usd = ? "
                         "WHERE id = ?",
                         (
                             now_str,
                             exit_price,
                             exit_reason,
+                            gross_pnl,
                             gross_pnl,
                             gross_pnl,
                             db_trade_id,
@@ -1999,7 +2043,7 @@ class OrderManager:
         for col in (
             "status", "alpaca_order_id", "alpaca_stop_order_id",
             "alpaca_target_order_id", "alpaca_trail_order_id",
-            "alpaca_exit_order_id", "oca_group",
+            "alpaca_exit_order_id", "exit_reason", "oca_group",
             "quantity", "entry_price", "stop_price", "target_price",
             "trailing_active", "trailing_distance", "highest_price",
         )

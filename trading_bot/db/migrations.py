@@ -455,6 +455,62 @@ def _migration_v13(conn: sqlite3.Connection) -> None:
     logger.info("Applied migration V13: idx_trades_ticker_entry_time")
 
 
+def _migration_v14(conn: sqlite3.Connection) -> None:
+    """V14: add ``positions.exit_reason`` + backfill legacy NULL ``trades.pnl_usd``.
+
+    Two related correctness fixes uncovered 2026-05-18:
+
+    1. **``positions.exit_reason``** — pre-V14 the strategy-supplied
+       exit reason (e.g. ``overnight_exit``) lived only on the
+       in-memory ``_ActiveOrder``. Because each tick rebuilds
+       ``_active_orders`` from ``positions``, the reason was lost
+       across the tick boundary that separates ``place_exit`` from the
+       eventual fill — fills then defaulted to ``strategy_exit`` in
+       ``trades``. Adding a persisted column lets the next tick
+       rehydrate the real reason. The companion code change in
+       ``OrderManager`` writes/clears this column alongside
+       ``alpaca_exit_order_id`` and reads it during hydration.
+
+    2. **``trades.pnl_usd`` backfill** — ``_close_position`` wrote
+       ``gross_pnl`` / ``net_pnl`` but forgot ``pnl_usd``, so every
+       live exit produced a row with ``pnl_usd IS NULL``. Downstream
+       readers (``performance.calculate_daily_metrics``,
+       ``repo.get_daily_pnl_usd`` powering the daily-loss circuit
+       breaker, ``main._save_daily_summary``) all key off ``pnl_usd``
+       and silently classified those exits as neither win nor loss
+       (and the daily-loss limit saw $0.00 P&L regardless of actual
+       drawdown). The companion code change writes ``pnl_usd`` going
+       forward. This backfill heals the rows the bug already produced
+       — bounded to ``exit_time IS NOT NULL`` so it can't accidentally
+       overwrite open positions, and to ``pnl_usd IS NULL`` so it's a
+       no-op on rerun.
+
+    Idempotent. Fresh installs via ``_SCHEMA_SQL`` already have the
+    column; the backfill UPDATE matches zero rows on a clean DB.
+    """
+    rows = conn.execute("PRAGMA table_info(positions)").fetchall()
+    if not any(r[1] == "exit_reason" for r in rows):
+        conn.execute(
+            "ALTER TABLE positions ADD COLUMN exit_reason TEXT"
+        )
+
+    conn.execute(
+        "UPDATE trades SET pnl_usd = net_pnl "
+        "WHERE pnl_usd IS NULL "
+        "  AND net_pnl IS NOT NULL "
+        "  AND exit_time IS NOT NULL"
+    )
+
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_version (version, description) "
+        "VALUES (14, "
+        "'V14 schema - positions.exit_reason + trades.pnl_usd backfill')"
+    )
+    logger.info(
+        "Applied migration V14: positions.exit_reason + trades.pnl_usd backfill"
+    )
+
+
 _MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (4, "V4 schema - multi-market adaptive trading bot", _migration_v4),
     (5, "V5 schema - multi-strategy Alpaca trading bot", _migration_v5),
@@ -469,6 +525,8 @@ _MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
      _migration_v12),
     (13, "V13 schema - idx_trades_ticker_entry_time for hydration JOIN",
      _migration_v13),
+    (14, "V14 schema - positions.exit_reason + trades.pnl_usd backfill",
+     _migration_v14),
 ]
 
 
