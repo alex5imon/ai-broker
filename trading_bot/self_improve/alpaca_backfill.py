@@ -102,11 +102,32 @@ def _parse_iso(value: str | None) -> datetime | None:
 
 
 def load_candidates(conn: sqlite3.Connection) -> list[ClosedPositionRow]:
-    """Closed positions with a strategy_id, not yet backfilled."""
-    # `BACKFILL_MARKER_PREFIX` is a hardcoded module-level constant, not
-    # user input. Concatenating it into the SQL is safe; the alternative
-    # (passing it as a parameter) would require SQLite to recompute the
-    # `||` for every row in the EXISTS subquery.
+    """Closed positions with a strategy_id, not yet backfilled.
+
+    Two exclusion criteria, both via NOT EXISTS:
+
+    1. **Backfill-marker present** — a previous backfill run already
+       repaired (or inserted) this position's trades row, marker set in
+       ``trades.notes``.
+    2. **Live writer already produced a complete row** — the live
+       ``_close_position`` UPDATEs the entry-time trades row in place
+       with a real ``exit_reason`` and populated ``exit_time``/
+       ``exit_price``. Pre-2026-05-20 this case fell through to the
+       backfill INSERT branch (which only knew to UPDATE
+       ``reconciliation_mismatch`` rows) and produced a phantom
+       ``exit_reason='manual'`` duplicate per live-closed position per
+       nightly run. Matched on ``(ticker, strategy_id,
+       substr(entry_time, 1, 19))`` — the same 19-char prefix the
+       backfill INSERT itself uses, tolerant of microsecond drift /
+       writer-vs-reader rounding. ``reconciliation_mismatch`` rows are
+       intentionally left in the candidate set because that's exactly
+       what the backfill is supposed to repair.
+
+    `BACKFILL_MARKER_PREFIX` is a hardcoded module-level constant, not
+    user input. Concatenating it into the SQL is safe; the alternative
+    (passing it as a parameter) would require SQLite to recompute the
+    `||` for every row in the EXISTS subquery.
+    """
     cur = conn.execute(
         f"""
         SELECT p.id, p.ticker, p.exchange, p.currency, p.strategy_id,
@@ -120,6 +141,16 @@ def load_candidates(conn: sqlite3.Connection) -> list[ClosedPositionRow]:
            AND NOT EXISTS (
                  SELECT 1 FROM trades t
                   WHERE t.notes = '{BACKFILL_MARKER_PREFIX}' || p.id
+               )
+           AND NOT EXISTS (
+                 SELECT 1 FROM trades t
+                  WHERE t.ticker = p.ticker
+                    AND t.strategy_id = p.strategy_id
+                    AND substr(t.entry_time, 1, 19) = substr(p.entry_time, 1, 19)
+                    AND t.exit_time IS NOT NULL
+                    AND t.exit_price IS NOT NULL
+                    AND t.exit_reason IS NOT NULL
+                    AND t.exit_reason != 'reconciliation_mismatch'
                )
          ORDER BY p.entry_time
         """  # nosec B608

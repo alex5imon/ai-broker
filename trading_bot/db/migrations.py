@@ -511,6 +511,76 @@ def _migration_v14(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_v15(conn: sqlite3.Connection) -> None:
+    """V15: one-shot dedupe of phantom backfill rows shadowing live-closed trades.
+
+    Pre-2026-05-20 the nightly ``alpaca_backfill`` candidate query
+    matched "already backfilled" only by a notes marker that the live
+    ``_close_position`` writer never sets. Every correctly closed
+    position therefore re-entered the candidate set every night; the
+    backfill's UPDATE branch only knew how to UPDATE
+    ``exit_reason='reconciliation_mismatch'`` rows and fell through to
+    INSERT a phantom duplicate with ``exit_reason='manual'`` per
+    correctly-closed position per nightly run.
+
+    The companion code change in ``self_improve/alpaca_backfill.py``
+    tightens ``load_candidates`` so positions with a complete
+    live-closed row are excluded going forward. This migration heals
+    rows the bug already produced — observed 2026-05-15, 2026-05-18,
+    2026-05-19 (5 phantom rows shadowing 5 real exits, inflating
+    ``daily_summaries`` totals by 2×).
+
+    Dedupe criterion: a row whose ``notes`` carries the
+    ``backfill:position:`` marker is deleted iff another trades row
+    exists for the same ``(ticker, strategy_id, substr(entry_time, 1,
+    19))`` that is fully closed (exit_time + exit_price set) and not
+    itself a backfill row. The 19-char ``entry_time`` prefix matches
+    the same precision the backfill's UPDATE branch already uses (per
+    its own comment: "A strategy never opens two positions on the
+    same ticker in the same second").
+
+    Bounded by construction:
+      - Only touches rows already tagged with the backfill marker —
+        original live-closed rows are never the DELETE target.
+      - Requires a non-backfill sibling to exist — backfills that
+        genuinely substitute for a missing live close survive.
+
+    Idempotent: once the phantoms are gone, the DELETE matches zero
+    rows on rerun.
+    """
+    # Marker literal pinned here (not imported) — migrations are
+    # append-only history. If self_improve.alpaca_backfill renames its
+    # marker prefix in the future, this migration's behaviour must
+    # remain identical to the historical run.
+    deleted = conn.execute(
+        """
+        DELETE FROM trades
+         WHERE notes LIKE 'backfill:position:%'
+           AND EXISTS (
+                 SELECT 1 FROM trades t2
+                  WHERE t2.id != trades.id
+                    AND t2.ticker = trades.ticker
+                    AND t2.strategy_id = trades.strategy_id
+                    AND substr(t2.entry_time, 1, 19)
+                        = substr(trades.entry_time, 1, 19)
+                    AND t2.exit_time IS NOT NULL
+                    AND t2.exit_price IS NOT NULL
+                    AND (t2.notes IS NULL
+                         OR t2.notes NOT LIKE 'backfill:position:%')
+               )
+        """
+    ).rowcount
+
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_version (version, description) "
+        "VALUES (15, "
+        "'V15 schema - dedupe phantom backfill rows shadowing live closes')"
+    )
+    logger.info(
+        "Applied migration V15: deleted %d phantom backfill row(s)", deleted,
+    )
+
+
 _MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (4, "V4 schema - multi-market adaptive trading bot", _migration_v4),
     (5, "V5 schema - multi-strategy Alpaca trading bot", _migration_v5),
@@ -527,6 +597,8 @@ _MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
      _migration_v13),
     (14, "V14 schema - positions.exit_reason + trades.pnl_usd backfill",
      _migration_v14),
+    (15, "V15 schema - dedupe phantom backfill rows shadowing live closes",
+     _migration_v15),
 ]
 
 
