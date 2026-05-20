@@ -129,6 +129,77 @@ def test_load_candidates_skips_already_backfilled(tmp_db):
     assert load_candidates(tmp_db) == []
 
 
+@pytest.mark.unit
+def test_load_candidates_skips_when_live_writer_already_closed_row(tmp_db):
+    """Regression for 2026-05-19 phantom-dup bug.
+
+    Pre-fix ``load_candidates`` matched "already backfilled" only by
+    the ``backfill:position:`` notes marker. The live
+    ``_close_position`` writer never sets that marker, so every
+    correctly-closed position re-entered the candidate set every
+    night — and the backfill's UPDATE branch only handled
+    ``reconciliation_mismatch`` rows, falling through to INSERT a
+    phantom duplicate with ``exit_reason='manual'``.
+
+    The candidate query must also exclude positions whose entry-time
+    matches an already-complete trades row with a real
+    ``exit_reason``.
+    """
+    entry_time = datetime(2026, 5, 18, 15, 45, 32, tzinfo=TZ_EASTERN)
+    _insert_position(tmp_db, position_id=42, entry_time=entry_time)
+    tmp_db.execute(
+        """
+        INSERT INTO trades (
+            ticker, exchange, currency, side, entry_time, entry_price,
+            quantity, exit_time, exit_price, exit_reason,
+            gross_pnl, net_pnl, pnl_usd,
+            hold_type, phase, strategy_id, notes
+        ) VALUES (
+            'SPY','NYSE','USD','BUY', ?, 100, 10,
+            '2026-05-19T09:35:34-04:00', 99.0, 'overnight_exit',
+            -10, -10, -10, 'swing', 1, 'overnight_drift', NULL
+        )
+        """,
+        (entry_time.isoformat(),),
+    )
+    tmp_db.commit()
+
+    assert load_candidates(tmp_db) == [], (
+        "a position with a complete live-closed row must not be a "
+        "backfill candidate"
+    )
+
+
+@pytest.mark.unit
+def test_load_candidates_still_returns_reconciliation_mismatch_rows(tmp_db):
+    """``reconciliation_mismatch`` rows are exactly what the backfill
+    is supposed to repair — they must stay in the candidate set even
+    though they have an exit_reason set."""
+    entry_time = datetime(2026, 5, 12, 11, 45, 43, tzinfo=TZ_EASTERN)
+    _insert_position(tmp_db, position_id=77, entry_time=entry_time)
+    tmp_db.execute(
+        """
+        INSERT INTO trades (
+            ticker, exchange, currency, side, entry_time, entry_price,
+            quantity, exit_time, exit_price, exit_reason,
+            hold_type, phase, strategy_id, notes
+        ) VALUES (
+            'SPY','NYSE','USD','BUY', ?, 100, 10,
+            NULL, NULL, 'reconciliation_mismatch',
+            'swing', 1, 'overnight_drift', NULL
+        )
+        """,
+        (entry_time.isoformat(),),
+    )
+    tmp_db.commit()
+
+    candidates = load_candidates(tmp_db)
+    assert {c.position_id for c in candidates} == {77}, (
+        "reconciliation_mismatch row should not exclude its position "
+        "from the candidate set"
+    )
+
+
 # ---------------------------------------------------------------------------
 # _infer_exit_reason
 # ---------------------------------------------------------------------------
