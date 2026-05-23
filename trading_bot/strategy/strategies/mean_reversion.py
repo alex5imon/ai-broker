@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import logging
 import math
+from datetime import datetime
 from typing import Any
 
 import pandas as pd
 
-from trading_bot.constants import HoldType
+from trading_bot.constants import HoldType, TZ_EASTERN
+from trading_bot.data.holiday_calendar import HolidayCalendar
 from trading_bot.strategy.base import ExitSignal, StrategyBase, StrategyDecision
 from trading_bot.strategy.technical import TechnicalAnalyzer
 from trading_bot.utils import coalesce
+from trading_bot.utils.time import count_trading_days_between
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -84,6 +87,11 @@ class MeanReversionStrategy(StrategyBase):
         self._bb_period: int = int(config.get("bb_period", 20))
         self._bb_std: float = float(config.get("bb_std", 2.0))
         self._bb_lookback_bars: int = int(config.get("bb_lookback_bars", 3))
+        # Time stop: maximum trading-day hold before force-exit.  Prevents
+        # breakeven positions from sitting indefinitely when neither the stop,
+        # target, nor RSI normalisation triggers.  Default 5 trading days
+        # matches ExitManager.check_time_stop's swing default.
+        self._max_hold_days: int = int(config.get("max_hold_days", 5))
 
     @staticmethod
     def _realized_vol_pct(df_daily: pd.DataFrame, lookback_days: int = 20) -> float | None:
@@ -320,6 +328,36 @@ class MeanReversionStrategy(StrategyBase):
             target: float = entry_price * (1.0 + self._take_profit_pct)
             if current_price >= target:
                 return ExitSignal(should_exit=True, reason="take_profit")
+
+        # Time stop — prevent indefinite holds at breakeven.  Counts actual
+        # trading days so weekends / NYSE holidays do not consume the budget.
+        # Fires before the RSI check so a stalled position is always released
+        # within _max_hold_days sessions regardless of RSI state.
+        entry_time_raw: Any = position.get("entry_time")
+        if entry_time_raw is not None:
+            try:
+                entry_dt: datetime = datetime.fromisoformat(str(entry_time_raw))
+                if entry_dt.tzinfo is None:
+                    entry_dt = entry_dt.replace(tzinfo=TZ_EASTERN)
+                now_et: datetime = datetime.now(tz=TZ_EASTERN)
+                cal: HolidayCalendar = HolidayCalendar()
+                elapsed_days: int = count_trading_days_between(
+                    cal,
+                    entry_dt.astimezone(TZ_EASTERN).date(),
+                    now_et.date(),
+                )
+                if elapsed_days >= self._max_hold_days:
+                    logger.info(
+                        "[mean_reversion] time_stop: %s held %d trading days "
+                        "(max=%d) — exiting",
+                        position.get("ticker", "?"), elapsed_days, self._max_hold_days,
+                    )
+                    return ExitSignal(should_exit=True, reason="time_stop")
+            except Exception:
+                logger.warning(
+                    "time_stop check failed for position id=%s",
+                    position.get("id"), exc_info=True,
+                )
 
         # RSI-based exit — fully disabled when let_winners_run is on, so the
         # trailing stop (set up at entry with activation threshold) becomes the
