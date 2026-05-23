@@ -34,6 +34,7 @@ import pandas as pd
 from trading_bot.config import Config
 from trading_bot.constants import (
     Exchange,
+    HoldType,
     TICKER_EXCHANGE,
     TZ_EASTERN,
 )
@@ -223,6 +224,59 @@ class MultiStrategyBacktester:
                 self._regime_high_vol_threshold * 100,
                 self._regime_vol_lookback,
             )
+
+    def _resolve_swing_decision_params(
+        self,
+        decision: StrategyDecision,
+        fill_price: float,
+        cash_usd: float,
+        fractional: bool,
+    ) -> tuple[float, float | None, float | None, float] | None:
+        """For SWING strategies that supply their own risk params, mirror
+        the live order_manager: honor decision.stop_price, target_price,
+        trail_pct, and shares directly instead of overriding with the
+        backtester's intraday-ATR-anchored logic.
+
+        Returns ``(stop, target, trail_pct, shares)`` when the decision
+        is a SWING with explicit ``stop_price > 0`` and ``shares > 0``;
+        ``None`` when the caller should fall back to ATR-based sizing
+        and stops (existing intraday behavior).
+
+        ``shares`` is capped by what the strategy's allocated cash can
+        actually afford at ``fill_price``; below the fractional/integer
+        floor we return ``None`` so the trade is skipped cleanly.
+
+        This bridges the gap reported during #44 A/B integration: the
+        backtester's universal ATR override turned monthly cross-sectional
+        positions into 5-min noise traps that exited on trail-stop
+        seconds after entry. INTRADAY strategies still get ATR overrides
+        as before.
+        """
+        if decision.hold_type != HoldType.SWING:
+            return None
+        if decision.stop_price <= 0 or decision.shares <= 0:
+            return None
+        if fill_price <= 0:
+            return None
+
+        shares: float = float(decision.shares)
+        max_affordable: float
+        if fractional:
+            max_affordable = round(cash_usd / fill_price, 4)
+        else:
+            max_affordable = float(int(cash_usd / fill_price))
+        if shares > max_affordable:
+            shares = max_affordable
+        min_sh: float = 0.001 if fractional else 1.0
+        if shares < min_sh:
+            return None
+
+        return (
+            float(decision.stop_price),
+            decision.target_price,
+            decision.trail_pct,
+            shares,
+        )
 
     def _wire_backtest_universe_loaders(self) -> None:
         """Inject a daily-cache loader into any cross-sectional strategy.
@@ -787,6 +841,7 @@ class MultiStrategyBacktester:
 
         # Delegate to strategy's own evaluate_exit
         position_dict: dict[str, Any] = {
+            "ticker": trade.ticker,
             "entry_price": trade.entry_price,
             "stop_price": trade.stop_price,
             "highest_price": trade.highest_price,
@@ -1704,6 +1759,9 @@ class MultiStrategyBacktester:
 
         # Rolling 5-min history per ticker across days
         rolling_5min: dict[str, pd.DataFrame] = {t: pd.DataFrame() for t in tickers}
+        # Track the last seen close per ticker so SWING positions can be
+        # marked at market when the backtest ends, instead of at entry.
+        last_close_by_ticker: dict[str, float] = {}
         entries_blocked: int = 0
 
         for day_idx, day in enumerate(trading_days):
@@ -1762,6 +1820,7 @@ class MultiStrategyBacktester:
                 existing = rolling_5min.get(ticker, pd.DataFrame())
                 new_row = df_5.loc[[ts]]
                 rolling_5min[ticker] = pd.concat([existing, new_row]).tail(LOOKBACK_BARS * 2)
+                last_close_by_ticker[ticker] = bar_close
 
                 df_slice = rolling_5min[ticker].tail(LOOKBACK_BARS)
                 if len(df_slice) < 30:
@@ -1825,31 +1884,50 @@ class MultiStrategyBacktester:
                         continue
 
                     fill_price = self._simulate_fill(bar_close, "buy", ticker)
-                    atr_stop, atr_target, atr_trail, atr_activation = self._atr_adjusted_stops(
-                        fill_price, df_slice, strat.strategy_id,
-                    )
 
-                    # Honour "let winners run" signal (decision.target_price=None)
-                    if decision.target_price is None:
-                        effective_target: float | None = None
-                        effective_activation_pct = max(
-                            (atr_target - fill_price) / fill_price, 0.0
-                        ) if fill_price > 0 else atr_activation
+                    swing_params = self._resolve_swing_decision_params(
+                        decision, fill_price, st.cash_usd, fractional=True,
+                    )
+                    if swing_params is not None:
+                        trade_stop, trade_target, trade_trail, shares = swing_params
+                        trade_activation_pct: float | None = (
+                            decision.trail_activation_price
+                            if decision.trail_activation_price is not None
+                            else 0.0
+                        )
+                        extra_signals: dict[str, Any] = {}
                     else:
-                        effective_target = atr_target
-                        effective_activation_pct = atr_activation
+                        atr_stop, atr_target, atr_trail, atr_activation = self._atr_adjusted_stops(
+                            fill_price, df_slice, strat.strategy_id,
+                        )
 
-                    equity = st.cash_usd + sum(
-                        t.entry_price * t.shares for t in st.open_positions
-                    )
-                    vt = self._compute_vol_multiplier(st)
-                    shares = self._size_by_risk(
-                        fill_price, atr_stop, equity,
-                        risk_per_trade_pct=0.02,
-                        max_position_pct=0.40,
-                        fractional=True,
-                        vol_multiplier=vt.multiplier,
-                    )
+                        # Honour "let winners run" signal (decision.target_price=None)
+                        if decision.target_price is None:
+                            effective_target: float | None = None
+                            effective_activation_pct = max(
+                                (atr_target - fill_price) / fill_price, 0.0
+                            ) if fill_price > 0 else atr_activation
+                        else:
+                            effective_target = atr_target
+                            effective_activation_pct = atr_activation
+
+                        equity = st.cash_usd + sum(
+                            t.entry_price * t.shares for t in st.open_positions
+                        )
+                        vt = self._compute_vol_multiplier(st)
+                        shares = self._size_by_risk(
+                            fill_price, atr_stop, equity,
+                            risk_per_trade_pct=0.02,
+                            max_position_pct=0.40,
+                            fractional=True,
+                            vol_multiplier=vt.multiplier,
+                        )
+                        trade_stop, trade_target, trade_trail = (
+                            atr_stop, effective_target, atr_trail,
+                        )
+                        trade_activation_pct = effective_activation_pct
+                        extra_signals = {"atr_stop": atr_stop}
+
                     if ovl_mult != 1.0:
                         shares = round(shares * ovl_mult, 4)
                     if shares <= 0.001:
@@ -1868,13 +1946,13 @@ class MultiStrategyBacktester:
                         entry_time=bar_dt,
                         entry_price=fill_price,
                         shares=shares,
-                        stop_price=atr_stop,
-                        target_price=effective_target,
-                        trail_pct=atr_trail,
-                        signals={**decision.signals, "atr_stop": atr_stop},
+                        stop_price=trade_stop,
+                        target_price=trade_target,
+                        trail_pct=trade_trail,
+                        signals={**decision.signals, **extra_signals},
                         hold_type=decision.hold_type.value,
                         sentiment_score=decision.sentiment_score,
-                        trail_activation_pct=effective_activation_pct,
+                        trail_activation_pct=trade_activation_pct,
                         highest_price=fill_price,
                     )
                     st.open_positions.append(trade)
@@ -1911,7 +1989,8 @@ class MultiStrategyBacktester:
                     day_idx + 1, len(trading_days), day.isoformat(), carried,
                 )
 
-        # Force-close remaining
+        # Force-close remaining at last seen market price (was entry_price,
+        # which masked all SWING P&L — exit price equal to entry => $0 P&L).
         for strat in self._strategies:
             st = states[strat.strategy_id]
             for trade in list(st.open_positions):
@@ -1919,7 +1998,10 @@ class MultiStrategyBacktester:
                     to_date.year, to_date.month, to_date.day,
                     16, 0, 0, tzinfo=TZ_EASTERN,
                 )
-                self._close_trade(st, trade, trade.entry_price, "backtest_end", end_time)
+                close_px = last_close_by_ticker.get(
+                    trade.ticker, trade.entry_price,
+                )
+                self._close_trade(st, trade, close_px, "backtest_end", end_time)
 
         if regime_filter:
             logger.info("Regime filter blocked %d entry evaluations", entries_blocked)
