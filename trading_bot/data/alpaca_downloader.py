@@ -333,6 +333,7 @@ async def download_all(
     to_date: date,
     rate_limit_per_min: int = 180,
     full_daily_history: bool = False,
+    daily_lookback_days: int = 120,
 ) -> dict[str, int]:
     """Download intraday + daily bars for all tickers across the date range.
 
@@ -384,7 +385,7 @@ async def download_all(
             await _respect_rate_limit()
             result: DailyHistoryResult = await download_daily_history(
                 client, ticker, from_date, to_date, config,
-                lookback_days=120, feed=feed,
+                lookback_days=daily_lookback_days, feed=feed,
             )
             stats["daily_written"] += result.written
             stats["daily_skipped"] += result.skipped
@@ -454,6 +455,19 @@ async def main() -> None:
             "must calibrate against more than the last 120 days)."
         ),
     )
+    parser.add_argument(
+        "--daily-lookback",
+        type=int,
+        default=120,
+        help=(
+            "Lookback (trading days) baked into each per-day daily parquet "
+            "in --full-daily-history mode. Default 120 is enough for the "
+            "regime-filter 50-SMA. Strategies that need deeper history (e.g. "
+            "cross_sectional_momentum with lookback_days=126, skip=21 = 148 "
+            "rows) should pass --daily-lookback 200 or higher and "
+            "delete the existing daily cache before re-running."
+        ),
+    )
     args = parser.parse_args()
 
     from dotenv import load_dotenv
@@ -472,6 +486,7 @@ async def main() -> None:
     stats = await download_all(
         config, tickers, d_from, d_to,
         full_daily_history=args.full_daily_history,
+        daily_lookback_days=args.daily_lookback,
     )
     print(f"\nDownload complete: {stats}")
     print(f"Log file: {log_path}")
