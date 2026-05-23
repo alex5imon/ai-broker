@@ -107,6 +107,72 @@ python -m trading_bot.multi_strategy_backtest \
 
 Either way, the strategy plumbing (loader injection, backtester SWING-honor patch, ticker-in-position-dict fix) lands as it has independent value for #45 (pair stat-arb) and any future cross-sectional sleeve. The strategy module itself stays in tree as disabled, ready to enable when the data and acceptance criteria align.
 
+## Update — 2026-05-23 evening: ticket-spec lookback A/B (126/21)
+
+After deepening the daily cache to 200 rows per file (via the new
+`alpaca_downloader --daily-lookback 200` flag) and re-running with the
+ticket-spec params, results were **substantially worse** than the 60/0
+variant:
+
+| Criterion | Bar | 60/0 | 126/21 (ticket spec) |
+|---|---|---:|---:|
+| Trades | — | 60 | 45 |
+| Portfolio PF | ≥ 1.10 | **2.334** ✅ | **0.915** ❌ |
+| PF CI lower bound | ≥ 1.00 | 1.123 ✅ | 0.389 ❌ |
+| OOS Return | — | +39.08% | **-7.44%** |
+| Positive OOS windows | ≥ 4 of 6 | 5/6 ✅ | **2/6** ❌ |
+| Max drawdown | ≤ 15% | 13.57% ✅ | 15.45% ❌ (marginal) |
+| Sharpe (point) | ≥ 0.40 | 0.273 ❌ | -0.033 ❌ |
+| Sharpe CI lower | > 0 | 0.041 ✅ | -0.347 ❌ |
+
+Per-window for 126/21:
+
+| Window | Trades | WR% | PF | Return% | MaxDD% |
+|---|---:|---:|---:|---:|---:|
+| 2020-07-27 → 2021-07-26 | 7 | 85.7 | 326.582 | +6.80 | 5.36 |
+| 2021-07-27 → 2022-07-26 | 9 | 11.1 | 0.027 | -13.20 | 15.45 |
+| 2022-07-27 → 2023-07-26 | 11 | 54.5 | 0.684 | -2.84 | 10.50 |
+| 2023-07-27 → 2024-07-25 | 5 | 100.0 | — | +10.44 | 3.78 |
+| 2024-07-26 → 2025-07-25 | 9 | 44.4 | 0.540 | -3.76 | 11.78 |
+| 2025-07-26 → 2026-04-16 | 4 | 25.0 | 0.102 | -3.31 | 5.67 |
+
+**Interpretation:** the ticket-spec parameters (126-day lookback,
+21-day skip — Asness/Moskowitz convention) do not work on this
+universe in this regime:
+
+- The 21-day skip *removes* the very recent trend continuation that
+  drives near-term sector rotation. Sector momentum is faster than
+  single-name momentum, where the skip-month variant is well-supported.
+- 126 days is too long a lookback for sector rotation that turns over
+  in months, not quarters.
+- 2022 bear market clobbered the strategy harder under 126/21 (11.1%
+  WR, PF 0.027) — the longer-horizon signal anchored on stale bullish
+  trends as the regime shifted.
+
+The 60-day, no-skip variant captures faster sector momentum and was
+the only configuration that cleared the PF / MaxDD / OOS-positive bars.
+
+## Final disposition
+
+The strategy is **shelved** under the literal ticket-spec parameters.
+Two open paths:
+
+1. **Re-spec the ticket** with the empirical 60/0 finding and decide
+   whether 60/0 (which cleared PF, MaxDD, OOS-positive but missed
+   Sharpe 0.40) is enough to enable. This is a scope decision on the
+   Sharpe acceptance bar for low-turnover monthly strategies
+   (precedent: overnight_drift enabled with PF CI lower bound 0.964 —
+   below the strict 1.10 bar — based on other supporting metrics).
+
+2. **Shelve and try a different signal.** Sector momentum may
+   simply not have an exploitable edge with the structure ticket #44
+   described. Alternative: top-N relative-strength rotation on a
+   60-day window (basically the 60/0 variant under a different
+   ticket), or move on to #45 / #46 / #48 / #138.
+
+Either way, the plumbing and backtester fixes shipped in PR #155
+have value beyond this one strategy.
+
 ## Artifacts
 
 - Walkforward JSON: `backtest_results/walkforward_2020-07-27_to_2026-04-16_20260523T215604.json`
