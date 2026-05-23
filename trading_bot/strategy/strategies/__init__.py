@@ -13,6 +13,9 @@ from trading_bot.strategy.strategies.overnight_drift import OvernightDriftStrate
 from trading_bot.strategy.strategies.opening_range_breakout import (
     OpeningRangeBreakoutStrategy,
 )
+from trading_bot.strategy.strategies.cross_sectional_momentum import (
+    CrossSectionalMomentumStrategy,
+)
 
 STRATEGY_REGISTRY: dict[str, type[StrategyBase]] = {
     "mean_reversion": MeanReversionStrategy,
@@ -21,6 +24,7 @@ STRATEGY_REGISTRY: dict[str, type[StrategyBase]] = {
     "sentiment_combo": SentimentComboStrategy,
     "overnight_drift": OvernightDriftStrategy,
     "opening_range_breakout": OpeningRangeBreakoutStrategy,
+    "cross_sectional_momentum": CrossSectionalMomentumStrategy,
 }
 
 

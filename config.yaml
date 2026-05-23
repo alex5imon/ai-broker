@@ -756,3 +756,43 @@ multi_strategy:
       stop_loss_pct: 0.03
       position_pct: 0.95
       fractional_shares: true
+
+    # Cross-sectional momentum (sleeve #6, issue #44).
+    # Ranks the 11 SPDR sector ETFs by trailing total return and holds
+    # the top N on the first trading day of each month. Daily bars,
+    # monthly cadence — genuinely uncorrelated with the two active
+    # intraday/overnight sleeves.
+    #
+    # SHIPPED DISABLED — regime-matched walkforward A/B per #44 must
+    # clear the acceptance bar (PF >= 1.10 with CI lower bound >= 1.00,
+    # OOS return positive in >= 4 of 6 yearly windows, Sharpe >= 0.40
+    # with positive lower CI, max DD <= 15%) before enabling.
+    #
+    # Live wiring note: the strategy reads universe-wide daily bars
+    # via an injected loader. The default loader hits the local parquet
+    # cache; the live path will need an explicit loader passed through
+    # create_strategies / strategy_manager when this sleeve is enabled.
+    cross_sectional_momentum:
+      enabled: false
+      allocation_usd: 0.0
+      max_positions: 3
+      universe:
+        - XLF
+        - XLK
+        - XLE
+        - XLV
+        - XLI
+        - XLY
+        - XLP
+        - XLU
+        - XLB
+        - XLRE
+        - XLC
+      lookback_days: 126
+      skip_recent_days: 21
+      top_n: 3
+      rebalance_day_of_month: 1
+      rebalance_time_et: "09:35"
+      disaster_stop_pct: 0.15
+      fractional_shares: true
+      position_pct: 0.95
