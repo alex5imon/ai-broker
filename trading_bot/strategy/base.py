@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any
 
 import pandas as pd
 
 from trading_bot.constants import HoldType
+
+
+UniverseDailyLoader = Callable[[str, "date"], "pd.DataFrame | None"]
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -99,6 +104,31 @@ class StrategyBase(ABC):
     @abstractmethod
     def get_max_positions(self) -> int:
         """Max concurrent positions for this strategy."""
+
+    # ------------------------------------------------------------------
+    # Universe-aware hooks (override in cross-sectional strategies)
+    # ------------------------------------------------------------------
+
+    def get_universe_tickers(self) -> tuple[str, ...]:
+        """Tickers whose daily bars this strategy needs universe-wide.
+
+        Default empty — single-ticker strategies don't need universe
+        context. Cross-sectional strategies (ranking, pair-trading)
+        override to declare the universe so the orchestrator can
+        pre-fetch bars once per tick and inject a sync loader.
+        """
+        return ()
+
+    def set_universe_daily_loader(
+        self, loader: UniverseDailyLoader,
+    ) -> None:
+        """Receive a sync loader for universe-wide daily bars.
+
+        Default no-op. Cross-sectional subclasses override to wire the
+        loader into their ranking logic. Called by the orchestrator
+        once per tick after the universe bars have been pre-fetched.
+        """
+        del loader  # unused in base
 
     def _compute_shares(
         self,

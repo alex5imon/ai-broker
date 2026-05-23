@@ -18,7 +18,6 @@ clear the bar in issue #44 before ``enabled: true`` in config.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 from datetime import date, datetime, time, timedelta
 from typing import Any
 
@@ -26,12 +25,14 @@ import pandas as pd
 
 from trading_bot.constants import TZ_EASTERN, HoldType
 from trading_bot.data.holiday_calendar import HolidayCalendar
-from trading_bot.strategy.base import ExitSignal, StrategyBase, StrategyDecision
+from trading_bot.strategy.base import (
+    ExitSignal,
+    StrategyBase,
+    StrategyDecision,
+    UniverseDailyLoader,
+)
 
 logger: logging.Logger = logging.getLogger(__name__)
-
-
-UniverseDailyLoader = Callable[[str, date], "pd.DataFrame | None"]
 
 
 def _default_universe_loader(ticker: str, as_of: date) -> pd.DataFrame | None:
@@ -216,6 +217,23 @@ class CrossSectionalMomentumStrategy(StrategyBase):
 
     def get_max_positions(self) -> int:
         return self._max_positions
+
+    # ------------------------------------------------------------------
+    # Universe-aware hooks (used by the orchestrator)
+    # ------------------------------------------------------------------
+
+    def get_universe_tickers(self) -> tuple[str, ...]:
+        return self._universe
+
+    def set_universe_daily_loader(self, loader: UniverseDailyLoader) -> None:
+        """Swap the universe loader and invalidate the cached ranking.
+
+        The orchestrator calls this once per tick with a sync closure
+        backed by freshly-fetched daily bars. The memo is invalidated so
+        the next ranking call reflects the new data.
+        """
+        self._loader = loader
+        self._ranking_memo = None
 
     # ------------------------------------------------------------------
     # Helpers

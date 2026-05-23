@@ -177,6 +177,11 @@ class MultiStrategyBacktester:
             len(self._strategies),
             [s.strategy_id for s in self._strategies],
         )
+        # Inject a backtest-mode universe loader into any cross-sectional
+        # strategy. The loader serves daily series from the existing
+        # per-day daily parquet cache so cross-sectional rankings work
+        # without any extra wiring at the operator's call site.
+        self._wire_backtest_universe_loaders()
         # Vol-target settings live under risk.vol_target in config; if
         # absent, the multiplier collapses to 1.0 (legacy behaviour).
         risk_cfg: dict[str, Any] = self._config._raw.get("risk", {}) or {}
@@ -218,6 +223,33 @@ class MultiStrategyBacktester:
                 self._regime_high_vol_threshold * 100,
                 self._regime_vol_lookback,
             )
+
+    def _wire_backtest_universe_loaders(self) -> None:
+        """Inject a daily-cache loader into any cross-sectional strategy.
+
+        The loader hits ``data/cache/{TICKER}/{as_of}_daily.parquet`` —
+        the format written by ``alpaca_downloader --full-daily-history``.
+        Cache miss is silent: the strategy treats a None return as
+        "exclude this ticker from the ranking this period".
+
+        Mirrors the strategy's default loader but injects it explicitly
+        so the dependency is visible at the backtester's call site and
+        future loader swaps (e.g., resample-from-intraday) plug in
+        without touching the strategy.
+        """
+        if not any(s.get_universe_tickers() for s in self._strategies):
+            return
+
+        def _loader(ticker: str, as_of: date) -> pd.DataFrame | None:
+            return load_cached(ticker, as_of, "daily")
+
+        for strat in self._strategies:
+            if strat.get_universe_tickers():
+                strat.set_universe_daily_loader(_loader)
+                logger.info(
+                    "[%s] Backtest universe loader wired (%d tickers)",
+                    strat.strategy_id, len(strat.get_universe_tickers()),
+                )
 
     def _compute_vol_multiplier(self, st: "_StrategyState") -> Any:
         """Per-strategy vol-target multiplier from recent closed trades.

@@ -22,7 +22,14 @@ from trading_bot.strategy import calendar_overlay
 from trading_bot.execution.loss_cooldown import LossCooldownTracker
 from trading_bot.execution.order_manager import EntryDecision as OMEntryDecision
 from trading_bot.execution.virtual_portfolio import PortfolioManager, VirtualPortfolio
-from trading_bot.strategy.base import ExitSignal, StrategyBase, StrategyDecision
+from datetime import date as _date
+
+from trading_bot.strategy.base import (
+    ExitSignal,
+    StrategyBase,
+    StrategyDecision,
+    UniverseDailyLoader,
+)
 from trading_bot.strategy.regime_filter import RegimeFilter
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -156,6 +163,57 @@ class StrategyManager:
     def strategies(self) -> list[StrategyBase]:
         return list(self._strategies)
 
+    async def _refresh_universe_loaders(self, get_daily_bars: Any) -> None:
+        """Pre-fetch universe daily bars and inject a sync loader.
+
+        For any strategy that declares a non-empty ``get_universe_tickers``,
+        gather the union of tickers it asks for, fetch daily bars for each
+        in parallel via the supplied ``get_daily_bars`` coroutine, and
+        inject a sync closure-loader that does dict-lookup.
+
+        No-op when no strategy declares a universe (the common case for the
+        existing intraday sleeves). The pre-fetch is per-call by design:
+        each tick gets fresh bars and an invalidated ranking memo.
+
+        Failures on individual tickers degrade gracefully — the missing
+        ticker is silently excluded from the ranking, mirroring the
+        strategy's existing tolerance for ``loader returns None``.
+        """
+        if get_daily_bars is None:
+            return
+
+        wanted: set[str] = set()
+        for strat in self._strategies:
+            wanted.update(strat.get_universe_tickers())
+        if not wanted:
+            return
+
+        ordered: list[str] = sorted(wanted)
+
+        async def _fetch(ticker: str) -> tuple[str, pd.DataFrame | None]:
+            try:
+                df = await get_daily_bars(ticker, "US")
+            except Exception:
+                logger.warning(
+                    "Universe daily-bars fetch failed for %s", ticker,
+                    exc_info=True,
+                )
+                return ticker, None
+            return ticker, df
+
+        results: list[tuple[str, pd.DataFrame | None]] = await asyncio.gather(
+            *(_fetch(t) for t in ordered),
+        )
+        bars: dict[str, pd.DataFrame | None] = dict(results)
+
+        def _loader(ticker: str, _as_of: _date) -> pd.DataFrame | None:
+            return bars.get(ticker)
+
+        loader: UniverseDailyLoader = _loader
+        for strat in self._strategies:
+            if strat.get_universe_tickers():
+                strat.set_universe_daily_loader(loader)
+
     async def scan_for_entries(
         self,
         watchlist: list[str],
@@ -182,6 +240,10 @@ class StrategyManager:
         if self._market_data.trading_paused:
             logger.warning("Market data paused — skipping multi-strategy entry scan")
             return 0
+
+        # Inject fresh universe daily bars for cross-sectional strategies
+        # (no-op when no strategy declares a universe).
+        await self._refresh_universe_loaders(get_daily_bars)
 
         if self._regime_filter is not None:
             try:
@@ -398,6 +460,10 @@ class StrategyManager:
     ) -> int:
         """Check exits for all strategies' positions. Returns exit count."""
         exits: int = 0
+
+        # Same per-tick refresh as scan_for_entries: cross-sectional
+        # rebalance-out exits need universe context too.
+        await self._refresh_universe_loaders(get_daily_bars)
 
         for strategy in self._strategies:
             portfolio: VirtualPortfolio | None = self._portfolio_manager.get_portfolio(strategy.strategy_id)
