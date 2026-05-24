@@ -333,13 +333,25 @@ class MeanReversionStrategy(StrategyBase):
         # trading days so weekends / NYSE holidays do not consume the budget.
         # Fires before the RSI check so a stalled position is always released
         # within _max_hold_days sessions regardless of RSI state.
+        #
+        # "Now" is derived from the bar timestamp (``df_5min.index[-1]``)
+        # rather than ``datetime.now()``. This is the *only* source that works
+        # in both live (where the latest bar is ~now) and backtest (where the
+        # latest bar is the historical bar being simulated).  PR #154 used
+        # ``datetime.now()`` unconditionally, which silently broke every
+        # backtest of mean_reversion since 2026-05-23: historical entry_time
+        # vs today's wall-clock made elapsed_days >> max_hold_days on every
+        # trade, so 100% of trades exited via time_stop ~1 bar after entry
+        # (single-pass 5.7yr run: -30% return, 30.8% WR, 2185 trades all
+        # tagged time_stop).  ``datetime.now()`` remains the fallback when
+        # no bars are passed (degraded live-path safety net only).
         entry_time_raw: Any = position.get("entry_time")
         if entry_time_raw is not None:
             try:
                 entry_dt: datetime = datetime.fromisoformat(str(entry_time_raw))
                 if entry_dt.tzinfo is None:
                     entry_dt = entry_dt.replace(tzinfo=TZ_EASTERN)
-                now_et: datetime = datetime.now(tz=TZ_EASTERN)
+                now_et: datetime = _bar_time_or_now(df_5min)
                 cal: HolidayCalendar = HolidayCalendar()
                 elapsed_days: int = count_trading_days_between(
                     cal,
@@ -375,3 +387,22 @@ class MeanReversionStrategy(StrategyBase):
 
     def get_max_positions(self) -> int:
         return self._max_positions
+
+
+def _bar_time_or_now(df_5min: pd.DataFrame | None) -> datetime:
+    """Return the timestamp of the last bar in ``df_5min`` (ET-localised),
+    or ``datetime.now(tz=ET)`` if no bars are available.
+
+    The bar timestamp is the correct "now" for any time-based exit check —
+    in live the latest bar IS approximately now, in backtest the latest
+    bar IS the simulation's current instant.  ``datetime.now()`` as the
+    primary clock is a backtest-breaker (see time_stop block).
+    """
+    if df_5min is not None and len(df_5min) > 0:
+        ts: Any = df_5min.index[-1]
+        dt: Any = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+        if isinstance(dt, datetime):
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=TZ_EASTERN)
+            return dt.astimezone(TZ_EASTERN)
+    return datetime.now(tz=TZ_EASTERN)
