@@ -378,12 +378,12 @@ class TestStateRecovery:
     async def test_db_position_open_status_not_deferred(
         self, tmp_db_path: str, mock_notifier
     ) -> None:
-        """Sanity check: POSITION_OPEN (not exit-in-flight) still
-        reconciles to mismatch when the broker doesn't show the
-        position. The defer only applies to exit-in-flight statuses.
+        """POSITION_OPEN WITHOUT a tracked stop still reconciles to
+        mismatch when the broker doesn't show the position — there's no
+        stop order to poll, so deferring would be indefinite.
         """
         conn = sqlite3.connect(tmp_db_path)
-        _insert_db_position(conn, "GOOGL")
+        _insert_db_position(conn, "GOOGL")  # no alpaca_stop_order_id
         conn.close()
 
         gw = self._make_gateway(positions=[])
@@ -394,6 +394,45 @@ class TestStateRecovery:
         result = await recovery.recover()
         assert "GOOGL" in result.positions_closed_mismatch
         assert "GOOGL" not in result.positions_deferred_exit_inflight
+
+    @pytest.mark.asyncio
+    async def test_db_position_open_with_stop_order_deferred(
+        self, tmp_db_path: str, mock_notifier
+    ) -> None:
+        """POSITION_OPEN WITH a standalone stop_order_id must defer.
+        Standalone-stop sleeves (mean_reversion / overnight_drift /
+        opening_range_breakout) never leave POSITION_OPEN, so when their
+        protective stop fills between ticks the row must defer to the
+        order-status poll for clean stop_loss attribution — not be swept
+        to reconciliation_mismatch with NULL pnl (the NVDA/XLF/XLB path
+        on 2026-05-29).
+        """
+        conn = sqlite3.connect(tmp_db_path)
+        conn.execute(
+            """INSERT INTO positions
+               (ticker, exchange, currency, quantity, entry_price,
+                entry_time, status, hold_type, phase, strategy_id,
+                alpaca_stop_order_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "NVDA", "NASDAQ", "USD", 1, 216.9,
+                (datetime.now(ET) - timedelta(hours=2)).isoformat(),
+                "POSITION_OPEN", "intraday", 3, "opening_range_breakout",
+                "orb-stop-order-id",
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        gw = self._make_gateway(positions=[])
+        recovery = _make_recovery(
+            gw, tmp_db_path, mock_notifier,
+            now=datetime.now(ET) + timedelta(hours=1),
+        )
+        result = await recovery.recover()
+
+        assert "NVDA" in result.positions_deferred_exit_inflight
+        assert "NVDA" not in result.positions_closed_mismatch
 
     @pytest.mark.asyncio
     async def test_quantity_mismatch_updated(

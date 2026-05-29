@@ -902,21 +902,22 @@ class TestFailureModeA_StopCancelledOnPositionOpen:
         assert row[1] == "stop-fresh-1"
 
     @pytest.mark.asyncio
-    async def test_filled_standalone_stop_on_position_open_not_cleared(
+    async def test_filled_standalone_stop_on_position_open_closes_as_stop_loss(
         self, config, tmp_db_path: str, mock_notifier
     ) -> None:
-        """A 'filled' standalone stop must NOT be treated as dead/cleared by
-        the re-arm path — that is a genuine exit (attributed elsewhere).
-        Clearing it would spawn a duplicate stop on a closed position."""
+        """A 'filled' standalone stop on a POSITION_OPEN row is a genuine
+        stop_loss exit and must be attributed cleanly (NOT re-armed, NOT
+        left for the state-recovery sweep to stamp reconciliation_mismatch
+        with NULL pnl — the NVDA/XLF/XLB path on 2026-05-29)."""
         om = _make_om(config, tmp_db_path, mock_notifier)
         _set_market_open(om)
 
         trade_id = om._create_position_record(
-            _entry("XLC", shares=0.1402, price=116.368)
+            _entry("NVDA", shares=0.4575, price=216.935)
         )
         om._update_position_status(trade_id, PositionStatus.POSITION_OPEN)
-        om._update_position_field(trade_id, "quantity", 0.1402)
-        om._update_position_field(trade_id, "entry_price", 116.368)
+        om._update_position_field(trade_id, "quantity", 0.4575)
+        om._update_position_field(trade_id, "entry_price", 216.935)
         om._update_position_field(trade_id, "alpaca_stop_order_id", "stop-filled")
 
         submits: list = []
@@ -928,13 +929,30 @@ class TestFailureModeA_StopCancelledOnPositionOpen:
         om._gw.client.submit_order = MagicMock(side_effect=_submit)
         om._gw.client.get_orders = MagicMock(return_value=[])
         om._gw.client.get_order_by_id = MagicMock(
-            side_effect=lambda oid: _alpaca_order(oid, "filled", 0.1402, 114.62)
+            side_effect=lambda oid: _alpaca_order(oid, "filled", 0.4575, 212.85)
         )
 
         await om._check_order_statuses()
 
-        # No re-arm submission — the re-arm path only clears dead-but-not-
-        # filled statuses.
+        # No re-arm submission — a filled stop is an exit, not a dead stop.
         assert len(submits) == 0
-        active = om._active_orders[trade_id]
-        assert active.alpaca_stop_order_id == "stop-filled"
+        # Closing removes the trade from the in-memory active map.
+        assert trade_id not in om._active_orders
+
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            pos = conn.execute(
+                "SELECT status FROM positions WHERE id = ?", (trade_id,),
+            ).fetchone()
+            trade = conn.execute(
+                "SELECT exit_reason, exit_price FROM trades "
+                "WHERE exit_reason IS NOT NULL ORDER BY id DESC LIMIT 1",
+            ).fetchone()
+        finally:
+            conn.close()
+        assert pos[0] == PositionStatus.CLOSED.value
+        # Clean stop_loss attribution with a real exit price — not
+        # reconciliation_mismatch / NULL.
+        assert trade is not None
+        assert trade[0] == "stop_loss"
+        assert trade[1] == pytest.approx(212.85)

@@ -597,9 +597,13 @@ class OrderManager:
             # naked overnight (XLC carried unprotected on 2026-05-29). Poll
             # the recorded stop here; if it's dead, clear the id so the
             # recovery branch below re-attaches a fresh stop this same tick.
-            # A 'filled' status is intentionally NOT handled here — that is a
-            # clean exit and is attributed separately; clearing it would be
-            # wrong. Only dead-but-not-filled statuses are cleared.
+            # Two outcomes are handled: a 'filled' stop is a genuine
+            # stop_loss exit (attribute it cleanly — pre-fix the
+            # POSITION_OPEN poll never checked, so the fill went
+            # unattributed and the next state-recovery pass swept it as
+            # reconciliation_mismatch with NULL pnl: NVDA/XLF/XLB on
+            # 2026-05-29). A canceled/expired/rejected stop is dead — clear
+            # the id so the recovery branch below re-attaches a fresh one.
             if (
                 active.status == PositionStatus.POSITION_OPEN
                 and active.alpaca_stop_order_id is not None
@@ -614,7 +618,33 @@ class OrderManager:
                     stop_status: str = (
                         getattr(stop_order.status, "value", "") or ""
                     ).lower()
-                    if stop_status in ("canceled", "expired", "rejected"):
+                    if stop_status == "filled":
+                        stop_exit_price: float = float(
+                            stop_order.filled_avg_price or 0
+                        )
+                        logger.info(
+                            "Standalone stop FILLED: %s @ %.4f reason=%s "
+                            "(trade_id=%d)",
+                            active.ticker, stop_exit_price,
+                            ExitReason.STOP_LOSS.value, trade_id,
+                        )
+                        await self._cancel_other_exits(
+                            trade_id, active, stop_oid,
+                        )
+                        await self._close_position(
+                            trade_id, active, stop_exit_price,
+                            ExitReason.STOP_LOSS.value,
+                        )
+                        stop_pnl: float = (
+                            (stop_exit_price - active.entry_price)
+                            * active.filled_shares
+                        )
+                        await self._notifier.position_closed(
+                            ticker=active.ticker, pnl=stop_pnl,
+                            hold_time="",
+                            exit_reason=ExitReason.STOP_LOSS.value,
+                        )
+                    elif stop_status in ("canceled", "expired", "rejected"):
                         logger.warning(
                             "Standalone stop %s for %s is %s while position is "
                             "POSITION_OPEN — clearing dead id so it re-attaches "
