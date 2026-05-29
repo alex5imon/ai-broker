@@ -22,6 +22,8 @@ from typing import Any
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+import numpy as np
+import pandas as pd
 import pytest
 
 from trading_bot.strategy.strategies.mean_reversion import MeanReversionStrategy
@@ -269,9 +271,6 @@ def test_weekend_not_counted_as_trading_day() -> None:
 # time_stop).  The fix derives "now" from ``df_5min.index[-1]`` when
 # bars are supplied.  These tests pin the new contract — no datetime
 # patching needed.
-
-import numpy as np
-import pandas as pd
 
 
 def _five_min_frame(end_dt: datetime, n_bars: int = 5) -> pd.DataFrame:
