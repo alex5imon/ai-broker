@@ -586,6 +586,53 @@ class OrderManager:
                             exc_info=True,
                         )
 
+            # Issue #117 failure mode A, POSITION_OPEN variant (2026-05-29):
+            # standalone protective stops for mean_reversion / overnight_drift
+            # / opening_range_breakout live on a row that stays POSITION_OPEN
+            # (they never transition to STOP_ACTIVE). The canceled/expired/
+            # rejected handler above only runs for STOP_ACTIVE/TRAILING_ACTIVE,
+            # and the re-attach branch below only fires when the id is already
+            # None — so a standalone stop that the broker cancels (DAY expiry,
+            # external cancel) was healed by NEITHER, leaving the position
+            # naked overnight (XLC carried unprotected on 2026-05-29). Poll
+            # the recorded stop here; if it's dead, clear the id so the
+            # recovery branch below re-attaches a fresh stop this same tick.
+            # A 'filled' status is intentionally NOT handled here — that is a
+            # clean exit and is attributed separately; clearing it would be
+            # wrong. Only dead-but-not-filled statuses are cleared.
+            if (
+                active.status == PositionStatus.POSITION_OPEN
+                and active.alpaca_stop_order_id is not None
+                and active.filled_shares > 0
+            ):
+                stop_oid: str = active.alpaca_stop_order_id
+                try:
+                    stop_order: AlpacaOrder = await asyncio.to_thread(
+                        client.get_order_by_id,  # type: ignore[arg-type]
+                        stop_oid,
+                    )
+                    stop_status: str = (
+                        getattr(stop_order.status, "value", "") or ""
+                    ).lower()
+                    if stop_status in ("canceled", "expired", "rejected"):
+                        logger.warning(
+                            "Standalone stop %s for %s is %s while position is "
+                            "POSITION_OPEN — clearing dead id so it re-attaches "
+                            "this tick (trade_id=%d)",
+                            stop_oid, active.ticker, stop_status, trade_id,
+                        )
+                        self._alpaca_to_trade.pop(stop_oid, None)
+                        active.alpaca_stop_order_id = None
+                        self._update_position_field(
+                            trade_id, "alpaca_stop_order_id", None,
+                        )
+                except Exception:
+                    logger.warning(
+                        "Error checking standalone stop %s for %s "
+                        "(trade_id=%d)",
+                        stop_oid, active.ticker, trade_id, exc_info=True,
+                    )
+
             # Issue #117 failure modes B & C: a position can land in
             # POSITION_OPEN with alpaca_stop_order_id=NULL when
             # _transition_to_open was interrupted between the status flip
