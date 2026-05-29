@@ -79,7 +79,9 @@ class StrategyBase(ABC):
         # shared watchlist expands to include individual mega-caps). Empty
         # / unset means "no restriction — trade the whole watchlist".
         raw_universe: Any = config.get("universe")
-        self._universe: frozenset[str] | None = (
+        # Named ``_universe_allowlist`` (not ``_universe``) to avoid colliding
+        # with cross_sectional_momentum's own ``_universe`` ranking set.
+        self._universe_allowlist: frozenset[str] | None = (
             frozenset(str(t).upper() for t in raw_universe)
             if isinstance(raw_universe, (list, tuple)) and raw_universe
             else None
@@ -91,9 +93,9 @@ class StrategyBase(ABC):
         Honours the optional per-strategy ``universe`` allow-list. With no
         allow-list configured, every ticker is allowed (legacy behaviour).
         """
-        if self._universe is None:
+        if self._universe_allowlist is None:
             return True
-        return ticker.upper() in self._universe
+        return ticker.upper() in self._universe_allowlist
 
     @abstractmethod
     def evaluate_entry(
