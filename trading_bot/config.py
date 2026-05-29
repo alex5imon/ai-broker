@@ -124,38 +124,52 @@ class Config:
     # Phase detection
     # -----------------------------------------------------------------------
 
-    def get_phase(self, equity_usd: float | None = None) -> Phase:
-        """Return the current operating phase.
+    def resolve_phase(self, equity_usd: float | None) -> Phase:
+        """Pure phase resolution — NO caching, NO side-effects.
 
-        Resolution order:
+        Resolution order (identical to ``get_phase``):
         1. ``account.phase_override`` (if set to an integer 0-3)
         2. Auto-detect from *equity_usd* against phase thresholds
-        3. If *equity_usd* is ``None`` and no override, default to ``Phase.MICRO``
-        """
-        if self._phase is not None and equity_usd is None:
-            return self._phase
+        3. If *equity_usd* is ``None`` and no override, ``Phase.MICRO``
 
+        Unlike ``get_phase`` this never reads or writes ``self._phase``,
+        so it is safe to call repeatedly with differing equity values
+        without leaking the last result into the shared cache. Callers
+        that need a per-equity answer (e.g. recomputing historical
+        daily_summaries across dates that may straddle phase boundaries)
+        should use this rather than ``get_phase(equity_usd=...)``.
+        """
         override: int | None = self._get("account", "phase_override")
         if override is not None:
-            phase = Phase(int(override))
-            self._phase = phase
-            return phase
+            return Phase(int(override))
 
         if equity_usd is None:
             # No equity supplied and no override -> conservative default
-            self._phase = Phase.MICRO
             return Phase.MICRO
 
         p2_threshold: float = float(self._require("phases", "phase1_to_phase2", "equity_usd"))
         p3_threshold: float = float(self._require("phases", "phase2_to_phase3", "equity_usd"))
 
         if equity_usd >= p3_threshold:
-            phase = Phase.FULL
-        elif equity_usd >= p2_threshold:
-            phase = Phase.SMALL
-        else:
-            phase = Phase.MICRO
+            return Phase.FULL
+        if equity_usd >= p2_threshold:
+            return Phase.SMALL
+        return Phase.MICRO
 
+    def get_phase(self, equity_usd: float | None = None) -> Phase:
+        """Return the current operating phase, caching the first answer.
+
+        Delegates the actual resolution to ``resolve_phase`` (override >
+        equity thresholds > MICRO default) and memoises it in
+        ``self._phase``. A no-arg call after the cache is warm returns the
+        cached value; passing *equity_usd* always re-resolves and updates
+        the cache. For a side-effect-free, per-equity answer use
+        ``resolve_phase`` directly.
+        """
+        if self._phase is not None and equity_usd is None:
+            return self._phase
+
+        phase: Phase = self.resolve_phase(equity_usd)
         self._phase = phase
         return phase
 
