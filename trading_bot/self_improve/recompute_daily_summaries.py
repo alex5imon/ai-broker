@@ -23,7 +23,7 @@ import sqlite3
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from trading_bot.config import Config
 from trading_bot.constants import TZ_EASTERN
@@ -94,12 +94,22 @@ def recompute_for_dates(
     conn: sqlite3.Connection,
     dates: Iterable[str],
     *,
-    phase: int,
+    phase_resolver: Callable[[float], int],
     dry_run: bool,
     db_path: str | None = None,
 ) -> int:
     """Recompute ``daily_summaries`` rows for ``dates``. Returns the
     number of rows written (or that would be written, in dry-run).
+
+    ``phase_resolver`` maps a date's ``account_equity_usd`` to its
+    operating phase. It MUST be equity-driven: this script runs in the
+    daily-review process, which never calls
+    ``main.py::_refresh_phase_from_equity``, so a bare
+    ``Config.get_phase()`` would return the load-time default
+    (``Phase.MICRO`` = 1) and stamp every recomputed row phase=1 —
+    overwriting the correct phase the live tick wrote. Resolving per-date
+    from the row's own equity keeps the ``phase`` column self-consistent
+    with the equity being written. See ``main`` for the canonical wiring.
 
     ``db_path`` is required when ``conn`` is in-memory or otherwise opaque
     to ``PerformanceCalculator`` (which opens its own read connection).
@@ -139,7 +149,7 @@ def recompute_for_dates(
             "avg_win_usd": metrics.get("avg_win"),
             "avg_loss_usd": metrics.get("avg_loss"),
             "profit_factor": metrics.get("profit_factor"),
-            "phase": phase,
+            "phase": phase_resolver(equity),
             "us_trades": metrics.get("us_trades", 0),
             "notes": "recomputed:post_backfill",
         }
@@ -199,9 +209,15 @@ def main(argv: list[str] | None = None) -> int:
                 logger.info("No closed-trade dates in the last %d days.",
                             args.days)
                 return 0
+        # Resolve phase per-date from each row's equity. A bare
+        # ``config.get_phase()`` here would return the load-time default
+        # (MICRO=1) because this process never anchors phase to live
+        # equity the way the main tick does — see recompute_for_dates.
         written = recompute_for_dates(
             conn, dates,
-            phase=config.get_phase().value,
+            phase_resolver=lambda equity: config.get_phase(
+                equity_usd=equity
+            ).value,
             dry_run=args.dry_run,
             db_path=db_path,
         )
