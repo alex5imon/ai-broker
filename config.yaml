@@ -661,6 +661,11 @@ multi_strategy:
       bb_period: 20
       bb_std: 2.0
       bb_lookback_bars: 3
+      # Strategy-level time stop: force-exit a position that has neither
+      # stopped, hit target, nor normalised after this many trading days.
+      # Distinct from exit_swing.max_hold_days (used by ExitManager); this
+      # one is read by MeanReversionStrategy.evaluate_exit directly.
+      max_hold_days: 5
 
     trend_following:
       # DISABLED 2026-04-28 (kept disabled after evening walkforward).

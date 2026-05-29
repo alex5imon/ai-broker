@@ -7,6 +7,7 @@ import math
 from datetime import datetime
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from trading_bot.constants import HoldType, TZ_EASTERN
@@ -17,6 +18,9 @@ from trading_bot.utils import coalesce
 from trading_bot.utils.time import count_trading_days_between
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+# Trading days per year — annualisation factor for realized volatility.
+_TRADING_DAYS_PER_YEAR: int = 252
 
 
 class MeanReversionStrategy(StrategyBase):
@@ -104,14 +108,13 @@ class MeanReversionStrategy(StrategyBase):
         """
         if df_daily is None or len(df_daily) < lookback_days + 1:
             return None
-        import numpy as np
         closes = df_daily["close"].astype(float).dropna()
         if len(closes) < lookback_days + 1:
             return None
         log_returns = np.log(closes / closes.shift(1)).dropna().iloc[-lookback_days:]
         if len(log_returns) < lookback_days // 2:
             return None
-        vol = float(log_returns.std() * (252 ** 0.5) * 100)
+        vol = float(log_returns.std() * (_TRADING_DAYS_PER_YEAR ** 0.5) * 100)
         return vol if vol > 0 else None
 
     def _adaptive_rsi_oversold(self, df_daily: pd.DataFrame) -> tuple[float, str]:

@@ -40,11 +40,13 @@ class OvernightDriftStrategy(StrategyBase):
             **kwargs,
         )
         self._max_positions: int = int(config.get("max_positions", 1))
-        # Entry window — last bar of the session. Default 15:45-15:55 ET
-        # brackets the 15:50 wind-down of intraday sleeves while still
-        # leaving room to fire once per day.
-        entry_start_str: str = str(config.get("entry_window_start", "15:45"))
-        entry_end_str: str = str(config.get("entry_window_end", "15:55"))
+        # Entry window — last bar of the session. Defaults match the live
+        # config.yaml (15:40-15:45 ET): the entry must fire BEFORE the
+        # 15:50 wind-down, since the backtester skips new entries once
+        # wind-down starts. The defaults exist so a config-missing
+        # deployment does not silently widen the window into wind-down.
+        entry_start_str: str = str(config.get("entry_window_start", "15:40"))
+        entry_end_str: str = str(config.get("entry_window_end", "15:45"))
         self._entry_window_start: time = _parse_time(entry_start_str)
         self._entry_window_end: time = _parse_time(entry_end_str)
         # Disaster stop on the overnight leg. The anomaly has positive
@@ -130,7 +132,6 @@ class OvernightDriftStrategy(StrategyBase):
         df_5min: pd.DataFrame | None = None,
         df_daily: pd.DataFrame | None = None,
     ) -> ExitSignal:
-        entry_price: float = float(position.get("entry_price", 0))
         stop_price: float = float(coalesce(position, "stop_price", 0))
 
         # Disaster stop — redundant with the backtester's intrabar stop
@@ -178,7 +179,6 @@ class OvernightDriftStrategy(StrategyBase):
                 use_market_order=True,
             )
 
-        _ = entry_price  # silence unused-warning in linters
         return ExitSignal(should_exit=False)
 
     def get_max_positions(self) -> int:
@@ -214,7 +214,11 @@ def _to_et_datetime(ts: Any) -> datetime | None:
         try:
             return dt.astimezone(TZ_EASTERN)
         except Exception:
-            return dt
+            # Returning the un-converted (non-ET) datetime would silently
+            # skew every wall-clock window/date check downstream. Callers
+            # all handle None, so propagate that instead.
+            logger.warning("Failed to convert %r to US/Eastern", dt, exc_info=True)
+            return None
     return dt
 
 
