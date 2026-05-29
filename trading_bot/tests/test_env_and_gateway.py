@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from trading_bot.env import resolve_alpaca_env
+from trading_bot.env import _reset_env_guard, resolve_alpaca_env
 from trading_bot.gateway.connection import GatewayConnection
 
 
@@ -28,7 +28,11 @@ def _isolate_env(monkeypatch):
         "ALPACA_LIVE_SECRET",
     ):
         monkeypatch.delenv(var, raising=False)
+    # The refuse latch is process-wide; clear it so a mismatch test does not
+    # leak a refusing state into the next test.
+    _reset_env_guard()
     yield
+    _reset_env_guard()
 
 
 def test_resolve_alpaca_env_paper_default(monkeypatch):
@@ -51,13 +55,80 @@ def test_resolve_alpaca_env_live_uses_live_pair(monkeypatch):
     assert (key, secret, is_paper) == ("lk1", "ls1", False)
 
 
-def test_resolve_alpaca_env_existing_legacy_keys_short_circuit(monkeypatch):
-    """If ALPACA_API_KEY/SECRET_KEY are already set, those win."""
-    monkeypatch.setenv("ALPACA_API_KEY", "preset-k")
-    monkeypatch.setenv("ALPACA_SECRET_KEY", "preset-s")
-    monkeypatch.setenv("ALPACA_PAPER_KEY_ID", "should-be-ignored")
-    key, secret, _ = resolve_alpaca_env()
-    assert (key, secret) == ("preset-k", "preset-s")
+def test_resolve_alpaca_env_legacy_matches_selected_pair_proceeds(monkeypatch):
+    """ALPACA_API_KEY that matches the env-selected key id is honored silently.
+
+    This is the steady state after the resolver re-exports the chosen pair.
+    """
+    monkeypatch.setenv("ALPACA_ENV", "paper")
+    monkeypatch.setenv("ALPACA_PAPER_KEY_ID", "pk1")
+    monkeypatch.setenv("ALPACA_PAPER_SECRET", "ps1")
+    monkeypatch.setenv("ALPACA_API_KEY", "pk1")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "ps1")
+    key, secret, is_paper = resolve_alpaca_env()
+    assert (key, secret, is_paper) == ("pk1", "ps1", True)
+
+
+def test_resolve_alpaca_env_legacy_matches_other_pair_refuses(monkeypatch, caplog):
+    """ALPACA_API_KEY == the *other* env's key id → refuse (confused deputy)."""
+    monkeypatch.setenv("ALPACA_ENV", "paper")
+    monkeypatch.setenv("ALPACA_PAPER_KEY_ID", "pk1")
+    monkeypatch.setenv("ALPACA_PAPER_SECRET", "ps1")
+    monkeypatch.setenv("ALPACA_LIVE_KEY_ID", "lk1")
+    # Operator accidentally exported the LIVE key while ALPACA_ENV=paper.
+    monkeypatch.setenv("ALPACA_API_KEY", "lk1")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "ls1")
+    with caplog.at_level("CRITICAL"):
+        key, secret, is_paper = resolve_alpaca_env()
+    assert (key, secret, is_paper) == ("", "", True)
+    assert any(r.levelname == "CRITICAL" for r in caplog.records)
+    # Legacy names scrubbed so GatewayConnection (reads os.environ) sees nothing.
+    assert "ALPACA_API_KEY" not in os.environ
+    assert "ALPACA_SECRET_KEY" not in os.environ
+
+
+def test_resolve_alpaca_env_legacy_matches_neither_pair_refuses(monkeypatch, caplog):
+    """ALPACA_API_KEY matches neither configured pair → refuse (stray export)."""
+    monkeypatch.setenv("ALPACA_ENV", "paper")
+    monkeypatch.setenv("ALPACA_PAPER_KEY_ID", "pk1")
+    monkeypatch.setenv("ALPACA_PAPER_SECRET", "ps1")
+    monkeypatch.setenv("ALPACA_API_KEY", "stray-key")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "stray-secret")
+    with caplog.at_level("CRITICAL"):
+        key, secret, is_paper = resolve_alpaca_env()
+    assert (key, secret, is_paper) == ("", "", True)
+    assert any(r.levelname == "CRITICAL" for r in caplog.records)
+    assert "ALPACA_API_KEY" not in os.environ
+
+
+def test_resolve_alpaca_env_refuse_latches_for_process(monkeypatch):
+    """Once refused, a subsequent call stays refused even if the env is fixed.
+
+    Models the import-time resolve()-then-CLI-resolve() sequence: a stray key
+    detected at import must not silently recover on a second call.
+    """
+    monkeypatch.setenv("ALPACA_ENV", "paper")
+    monkeypatch.setenv("ALPACA_PAPER_KEY_ID", "pk1")
+    monkeypatch.setenv("ALPACA_PAPER_SECRET", "ps1")
+    monkeypatch.setenv("ALPACA_API_KEY", "lk1")  # stray
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "ls1")
+    assert resolve_alpaca_env() == ("", "", True)
+    # _refuse scrubbed the stray names; without the latch the canonical pair
+    # would now be re-exported. The latch must keep us refused.
+    assert resolve_alpaca_env() == ("", "", True)
+
+
+def test_resolve_alpaca_env_direct_key_without_canonical_pair_proceeds(monkeypatch):
+    """Documented local-dev path: only ALPACA_API_KEY set, no canonical pair.
+
+    There is nothing to displace, so the direct key is honored.
+    """
+    # No-op load_dotenv so the project's real .env can't leak a canonical pair.
+    monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **k: False)
+    monkeypatch.setenv("ALPACA_API_KEY", "direct-k")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "direct-s")
+    key, secret, is_paper = resolve_alpaca_env()
+    assert (key, secret, is_paper) == ("direct-k", "direct-s", True)
 
 
 def test_resolve_alpaca_env_missing_returns_empty(monkeypatch):
