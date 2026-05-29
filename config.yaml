@@ -791,6 +791,25 @@ multi_strategy:
       risk_per_trade_pct: 0.01     # 1% equity risked per trade
       max_position_pct: 0.33
       fractional_shares: true
+      # Restrict ORB to the 13-ETF basket it was walkforward-validated on.
+      # Without this, at phase 3 the shared watchlist expands to include
+      # individual mega-caps (AAPL/MSFT/NVDA/GOOGL/AMZN/META) that ORB was
+      # never tested on — and they showed up on day one (2026-05-29: ORB
+      # traded MSFT/NVDA, with NVDA among the reconciliation_mismatch rows).
+      universe:
+        - "SPY"
+        - "QQQ"
+        - "XLK"
+        - "XLF"
+        - "XLV"
+        - "XLY"
+        - "XLP"
+        - "XLE"
+        - "XLI"
+        - "XLB"
+        - "XLU"
+        - "XLRE"
+        - "XLC"
 
     # Cross-sectional momentum (sleeve #6, issue #44).
     # Ranks the 11 SPDR sector ETFs by trailing total return and holds
