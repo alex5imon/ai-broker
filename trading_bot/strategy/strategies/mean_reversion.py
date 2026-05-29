@@ -395,8 +395,8 @@ def _bar_time_or_now(df_5min: pd.DataFrame | None) -> datetime:
 
     The bar timestamp is the correct "now" for any time-based exit check —
     in live the latest bar IS approximately now, in backtest the latest
-    bar IS the simulation's current instant.  ``datetime.now()`` as the
-    primary clock is a backtest-breaker (see time_stop block).
+    bar IS the simulation's current instant.  ``datetime.now(tz=ET)`` as
+    the primary clock is a backtest-breaker (see time_stop block).
     """
     if df_5min is not None and len(df_5min) > 0:
         ts: Any = df_5min.index[-1]
