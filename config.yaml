@@ -762,6 +762,36 @@ multi_strategy:
       position_pct: 0.95
       fractional_shares: true
 
+    # Opening-Range Breakout (sleeve #5, PR #156 → enabled 2026-05-29).
+    # Buy a breakout above the first 30-min range high (6 × 5-min bars),
+    # exit at 2R or stop at the range low. Different signal generator from
+    # the other intraday sleeve (MR fires on RSI dips; ORB on directional
+    # breakouts), so it diversifies rather than duplicates.
+    #
+    # 30min/R2 variant cleared the regime-matched walkforward gate on the
+    # 13-ETF universe (2020-07-27 → 2026-04-16, 6 yearly windows), RE-RUN
+    # 2026-05-29 on the time_stop-fixed code (post-#157):
+    #   2,348 trades, WR 54.94%, PF 1.176, CI [1.056, 1.309] ✓
+    #   5/6 OOS windows positive, worst-window MaxDD 9.91% ✓
+    #   OOS Return +43.55%. Only point-Sharpe (0.060) misses the 0.40 bar,
+    #   but its Sharpe CI lower is positive (0.020) — mechanical, 2.3k trades.
+    #   PF CI lower (1.056) is stronger than overnight_drift's (0.945).
+    # Enabled on the PAPER account first to confirm real fills/holds before
+    # any scale-up. Conservative $1k allocation to start (others run $2.5k);
+    # raise to 2500 after paper trades confirm clean execution.
+    opening_range_breakout:
+      enabled: true
+      allocation_usd: 1000.0       # conservative start; scale to 2500 after paper-confirm
+      max_positions: 3
+      range_bars: 6                # 6 × 5min = 30-min opening range
+      target_r_multiple: 2.0       # exit at 2× the range risk
+      entry_cutoff: "15:30"        # no new ORB entries after 15:30 ET
+      volume_multiplier: 0.0       # volume filter off (matches validated variant)
+      min_range_pct: 0.0           # min-range filter off (matches validated variant)
+      risk_per_trade_pct: 0.01     # 1% equity risked per trade
+      max_position_pct: 0.33
+      fractional_shares: true
+
     # Cross-sectional momentum (sleeve #6, issue #44).
     # Ranks the 11 SPDR sector ETFs by trailing total return and holds
     # the top N on the first trading day of each month. Daily bars,
