@@ -826,3 +826,115 @@ class TestStopRecoveryMarketHoursGate:
         # Result depends on wall-clock time; just verify no crash.
         result = await om._inside_market_hours_for_stop_attach()
         assert isinstance(result, bool)
+
+
+# ---------------------------------------------------------------------------
+# Failure mode A, POSITION_OPEN variant — standalone stop cancelled while
+# the row sits in POSITION_OPEN (2026-05-29, XLC)
+# ---------------------------------------------------------------------------
+
+
+class TestFailureModeA_StopCancelledOnPositionOpen:
+    """Standalone protective stops for mean_reversion / overnight_drift /
+    opening_range_breakout live on a row that stays POSITION_OPEN (they
+    never transition to STOP_ACTIVE). On 2026-05-29 XLC's standalone stop
+    was cancelled at the broker; pre-fix the cancelled-stop handler only
+    ran for STOP_ACTIVE/TRAILING_ACTIVE and the re-attach branch only fired
+    on a NULL id, so the position sat naked overnight. The fix polls the
+    standalone stop for POSITION_OPEN rows, clears the dead id, and lets the
+    recovery branch re-attach a fresh stop the same tick.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cancelled_standalone_stop_on_position_open_rearms(
+        self, config, tmp_db_path: str, mock_notifier
+    ) -> None:
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        _set_market_open(om)
+
+        trade_id = om._create_position_record(
+            _entry("XLC", shares=0.1402, price=116.368)
+        )
+        om._update_position_status(trade_id, PositionStatus.POSITION_OPEN)
+        om._update_position_field(trade_id, "quantity", 0.1402)
+        om._update_position_field(trade_id, "entry_price", 116.368)
+        om._update_position_field(trade_id, "stop_price", 114.62)
+        om._update_position_field(trade_id, "alpaca_stop_order_id", "stop-dead")
+
+        submits: list = []
+
+        def _submit(order_data):
+            submits.append(order_data)
+            return _alpaca_order(f"stop-fresh-{len(submits)}", "new")
+
+        om._gw.client.submit_order = MagicMock(side_effect=_submit)
+        om._gw.client.get_orders = MagicMock(return_value=[])
+
+        def _get_order_by_id(oid: str):
+            if oid == "stop-dead":
+                return _alpaca_order(oid, "canceled")
+            return _alpaca_order(oid, "new")
+
+        om._gw.client.get_order_by_id = MagicMock(side_effect=_get_order_by_id)
+
+        await om._check_order_statuses()
+
+        # Pre-fix: zero submits — POSITION_OPEN + canceled stop fell through
+        # every branch and the position stayed naked.
+        assert len(submits) == 1, (
+            "expected a fresh stop re-attach on the same tick; pre-fix the "
+            "POSITION_OPEN canceled-stop case was healed by no branch"
+        )
+        active = om._active_orders[trade_id]
+        assert active.status == PositionStatus.STOP_ACTIVE
+        assert active.alpaca_stop_order_id == "stop-fresh-1"
+
+        conn = sqlite3.connect(tmp_db_path)
+        try:
+            row = conn.execute(
+                "SELECT status, alpaca_stop_order_id FROM positions "
+                "WHERE id = ?",
+                (trade_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row[0] == PositionStatus.STOP_ACTIVE.value
+        assert row[1] == "stop-fresh-1"
+
+    @pytest.mark.asyncio
+    async def test_filled_standalone_stop_on_position_open_not_cleared(
+        self, config, tmp_db_path: str, mock_notifier
+    ) -> None:
+        """A 'filled' standalone stop must NOT be treated as dead/cleared by
+        the re-arm path — that is a genuine exit (attributed elsewhere).
+        Clearing it would spawn a duplicate stop on a closed position."""
+        om = _make_om(config, tmp_db_path, mock_notifier)
+        _set_market_open(om)
+
+        trade_id = om._create_position_record(
+            _entry("XLC", shares=0.1402, price=116.368)
+        )
+        om._update_position_status(trade_id, PositionStatus.POSITION_OPEN)
+        om._update_position_field(trade_id, "quantity", 0.1402)
+        om._update_position_field(trade_id, "entry_price", 116.368)
+        om._update_position_field(trade_id, "alpaca_stop_order_id", "stop-filled")
+
+        submits: list = []
+
+        def _submit(order_data):
+            submits.append(order_data)
+            return _alpaca_order(f"stop-fresh-{len(submits)}", "new")
+
+        om._gw.client.submit_order = MagicMock(side_effect=_submit)
+        om._gw.client.get_orders = MagicMock(return_value=[])
+        om._gw.client.get_order_by_id = MagicMock(
+            side_effect=lambda oid: _alpaca_order(oid, "filled", 0.1402, 114.62)
+        )
+
+        await om._check_order_statuses()
+
+        # No re-arm submission — the re-arm path only clears dead-but-not-
+        # filled statuses.
+        assert len(submits) == 0
+        active = om._active_orders[trade_id]
+        assert active.alpaca_stop_order_id == "stop-filled"
