@@ -72,6 +72,30 @@ class StrategyBase(ABC):
         # in-memory closed-trades buffer instead.
         self._db_path: str | None = db_path
         self._vol_target_config: dict[str, Any] = vol_target_config or {}
+        # Optional per-strategy universe allow-list. When set, this sleeve
+        # only trades tickers in the list — a guard against a sleeve being
+        # run on a wider universe than it was validated on (e.g. ORB was
+        # walkforward-validated on the 13-ETF basket, but at phase 3 the
+        # shared watchlist expands to include individual mega-caps). Empty
+        # / unset means "no restriction — trade the whole watchlist".
+        raw_universe: Any = config.get("universe")
+        # Named ``_universe_allowlist`` (not ``_universe``) to avoid colliding
+        # with cross_sectional_momentum's own ``_universe`` ranking set.
+        self._universe_allowlist: frozenset[str] | None = (
+            frozenset(str(t).upper() for t in raw_universe)
+            if isinstance(raw_universe, (list, tuple)) and raw_universe
+            else None
+        )
+
+    def allows_ticker(self, ticker: str) -> bool:
+        """Return True if this strategy may trade ``ticker``.
+
+        Honours the optional per-strategy ``universe`` allow-list. With no
+        allow-list configured, every ticker is allowed (legacy behaviour).
+        """
+        if self._universe_allowlist is None:
+            return True
+        return ticker.upper() in self._universe_allowlist
 
     @abstractmethod
     def evaluate_entry(

@@ -158,6 +158,36 @@ class TestTechnicalHelpers:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.unit
+class TestPerStrategyUniverse:
+    """StrategyBase.allows_ticker honours an optional config ``universe``
+    allow-list — the guard that keeps a sleeve (e.g. ORB, validated on the
+    13-ETF basket) from trading the wider phase-3 watchlist."""
+
+    def test_no_universe_allows_everything(self) -> None:
+        strat = MeanReversionStrategy(config=_mr_config())
+        assert strat.allows_ticker("SPY") is True
+        assert strat.allows_ticker("NVDA") is True
+
+    def test_universe_restricts_to_listed_tickers(self) -> None:
+        cfg = {**_mr_config(), "universe": ["SPY", "QQQ", "XLF"]}
+        strat = MeanReversionStrategy(config=cfg)
+        assert strat.allows_ticker("SPY") is True
+        assert strat.allows_ticker("XLF") is True
+        assert strat.allows_ticker("NVDA") is False
+        assert strat.allows_ticker("MSFT") is False
+
+    def test_universe_is_case_insensitive(self) -> None:
+        cfg = {**_mr_config(), "universe": ["spy"]}
+        strat = MeanReversionStrategy(config=cfg)
+        assert strat.allows_ticker("SPY") is True
+
+    def test_empty_universe_means_no_restriction(self) -> None:
+        cfg = {**_mr_config(), "universe": []}
+        strat = MeanReversionStrategy(config=cfg)
+        assert strat.allows_ticker("NVDA") is True
+
+
 class TestMeanReversion:
     def test_no_entry_without_oversold(self) -> None:
         strategy = MeanReversionStrategy(config=_mr_config())

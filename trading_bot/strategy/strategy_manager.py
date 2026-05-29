@@ -266,6 +266,14 @@ class StrategyManager:
                 if portfolio is None:
                     continue
 
+                # Per-strategy universe guard. A sleeve with a configured
+                # ``universe`` allow-list only trades those tickers — keeps
+                # a sleeve from trading a wider basket than it was validated
+                # on (ORB was walkforward-validated on the 13 ETFs, but the
+                # phase-3 watchlist also includes individual mega-caps).
+                if not strategy.allows_ticker(ticker):
+                    continue
+
                 # Per-strategy consecutive-loss cooldown — sit out the next
                 # tick window after N losing trades in a row.
                 if self._loss_cooldown is not None:
