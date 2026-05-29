@@ -125,9 +125,7 @@ def test_recompute_stamps_phase_from_equity_not_cached_default(
 
         written = recompute_for_dates(
             conn, ["2026-05-28"],
-            phase_resolver=lambda equity: config.get_phase(
-                equity_usd=equity
-            ).value,
+            phase_resolver=lambda equity: config.resolve_phase(equity).value,
             dry_run=False,
         )
         assert written == 1
@@ -136,6 +134,42 @@ def test_recompute_stamps_phase_from_equity_not_cached_default(
             "SELECT phase FROM daily_summaries WHERE date='2026-05-28'"
         ).fetchone()
     assert row[0] == 3  # FULL, not the cached MICRO=1
+
+
+@pytest.mark.unit
+def test_recompute_resolves_phase_independently_per_date(tmp_db_path, config):
+    """Each date must resolve phase from its OWN equity, not from a value
+    cached by an earlier date in the same run. This is the live-$1k
+    scenario: a 14-day window legitimately straddles phase boundaries as
+    the account grows. ``resolve_phase`` is pure, so order can't leak.
+    """
+    with _conn(tmp_db_path) as conn:
+        # $500 → MICRO(1); $8k → SMALL(2); $100k → FULL(3) under the
+        # config.yaml thresholds ($5k→P2, $20k→P3).
+        _seed_summary(conn, date="2026-05-01", equity=500.0)
+        _seed_summary(conn, date="2026-05-02", equity=8_000.0)
+        _seed_summary(conn, date="2026-05-03", equity=100_000.0)
+        for d in ("2026-05-01", "2026-05-02", "2026-05-03"):
+            _seed_trade(conn, ticker="SPY", exit_date=d, gross=1.0, pnl=1.0)
+        conn.commit()
+
+        # Pass dates in an order that would expose cache leakage if the
+        # resolver weren't pure (descending equity then back up).
+        written = recompute_for_dates(
+            conn, ["2026-05-03", "2026-05-01", "2026-05-02"],
+            phase_resolver=lambda equity: config.resolve_phase(equity).value,
+            dry_run=False,
+        )
+        assert written == 3
+
+        rows = {
+            r[0]: r[1] for r in conn.execute(
+                "SELECT date, phase FROM daily_summaries ORDER BY date"
+            ).fetchall()
+        }
+    assert rows["2026-05-01"] == 1  # MICRO
+    assert rows["2026-05-02"] == 2  # SMALL
+    assert rows["2026-05-03"] == 3  # FULL
 
 
 @pytest.mark.unit

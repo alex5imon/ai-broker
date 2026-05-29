@@ -64,6 +64,39 @@ class TestPhaseDetection:
         cfg._phase = None
         assert cfg.get_phase(equity_usd=25000.0) == Phase.FULL
 
+    def test_resolve_phase_does_not_mutate_cache(
+        self, config: Config
+    ) -> None:
+        """``resolve_phase`` is pure: repeated calls with differing equity
+        must never write ``_phase``, so the cache stays exactly as the
+        caller left it. This is what lets the daily_summaries recompute
+        map each date independently from its own equity.
+        """
+        cfg = Config(dict(config._raw))
+        cfg._phase = None  # known starting state
+
+        assert cfg.resolve_phase(500.0) == Phase.MICRO
+        assert cfg.resolve_phase(8_000.0) == Phase.SMALL
+        assert cfg.resolve_phase(100_000.0) == Phase.FULL
+        assert cfg.resolve_phase(None) == Phase.MICRO
+
+        # No call above may have touched the cache.
+        assert cfg._phase is None
+
+    def test_resolve_phase_honors_override(
+        self, raw_config: dict[str, Any]
+    ) -> None:
+        """Override wins over equity in the pure resolver too — equity is
+        ignored entirely when ``phase_override`` is set.
+        """
+        raw = dict(raw_config)
+        raw["account"] = dict(raw["account"])
+        raw["account"]["phase_override"] = 2
+        cfg = Config(raw)
+        # High equity would otherwise resolve FULL; override pins SMALL.
+        assert cfg.resolve_phase(100_000.0) == Phase.SMALL
+        assert cfg.resolve_phase(None) == Phase.SMALL
+
 
 # ---------------------------------------------------------------------------
 # Phase transition criteria (SPEC §phase transitions)

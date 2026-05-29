@@ -209,15 +209,16 @@ def main(argv: list[str] | None = None) -> int:
                 logger.info("No closed-trade dates in the last %d days.",
                             args.days)
                 return 0
-        # Resolve phase per-date from each row's equity. A bare
-        # ``config.get_phase()`` here would return the load-time default
-        # (MICRO=1) because this process never anchors phase to live
-        # equity the way the main tick does — see recompute_for_dates.
+        # Resolve phase per-date from each row's equity via the pure
+        # ``resolve_phase`` (no cache mutation). A bare ``get_phase()``
+        # here would return the load-time default (MICRO=1) because this
+        # process never anchors phase to live equity the way the main
+        # tick does; ``get_phase(equity_usd=...)`` would work but leaks
+        # the last date's phase into config._phase. See
+        # recompute_for_dates.
         written = recompute_for_dates(
             conn, dates,
-            phase_resolver=lambda equity: config.get_phase(
-                equity_usd=equity
-            ).value,
+            phase_resolver=lambda equity: config.resolve_phase(equity).value,
             dry_run=args.dry_run,
             db_path=db_path,
         )
