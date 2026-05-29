@@ -1,0 +1,75 @@
+name: recompute-summaries
+
+# One-shot maintenance job: recompute daily_summaries rows from the trades
+# table over a chosen window, against the live cached SQLite DB, and persist
+# the result back to the cache so the next bot tick picks it up.
+#
+# Why this exists separately from daily-review: daily-review runs the full
+# self-improvement agent (backfill + backtest + draft-PR) and recomputes only
+# a fixed 14-day window. This job does ONLY the recompute, over an
+# operator-chosen window — useful to heal older rows (e.g. a phase column
+# that was stamped wrong before PR #163/#164) without firing the research
+# agent or opening a spurious report PR.
+#
+# SAFETY: run ONLY outside the bot's operating window (bot.yml cron is
+# `*/5 13-21 * * 1-5` UTC). A bot tick saves its own `bot-db-<run_id>` cache
+# every 5 min; if this job runs concurrently, the next tick's save would
+# clobber the heal. Dispatch before 13:00 UTC or after ~22:00 UTC on a
+# weekday, or on a weekend.
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Recompute the last N days that have closed trades."
+        required: false
+        default: "30"
+
+concurrency:
+  group: recompute-summaries
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  recompute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Restore SQLite DB
+        # Read the latest bot DB and write back under the same prefix so the
+        # next bot.yml tick restores the healed rows (most-recent cache wins).
+        uses: actions/cache@v5
+        with:
+          path: trading_bot/data/trading_bot.db*
+          key: bot-db-${{ github.run_id }}
+          restore-keys: |
+            bot-db-
+
+      - name: Recompute daily_summaries
+        env:
+          BOT_LOG_DIR: logs
+        run: |
+          python -m trading_bot.self_improve.recompute_daily_summaries \
+            --days "${{ github.event.inputs.days || '30' }}"
+
+      - name: Upload DB for inspection
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: recompute-db-${{ github.run_id }}
+          path: trading_bot/data/trading_bot.db*
+          retention-days: 30
+          if-no-files-found: warn
