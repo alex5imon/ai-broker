@@ -84,7 +84,8 @@ def test_recompute_overwrites_stale_zeros_with_real_metrics(tmp_db_path):
         conn.commit()
 
         written = recompute_for_dates(
-            conn, ["2026-04-30"], phase=3, dry_run=False,
+            conn, ["2026-04-30"], phase_resolver=lambda _equity: 3,
+            dry_run=False,
         )
         assert written == 1
 
@@ -100,6 +101,44 @@ def test_recompute_overwrites_stale_zeros_with_real_metrics(tmp_db_path):
 
 
 @pytest.mark.unit
+def test_recompute_stamps_phase_from_equity_not_cached_default(
+    tmp_db_path, config,
+):
+    """Regression: the daily-review process never anchors phase to live
+    equity (no ``_refresh_phase_from_equity``), so a bare
+    ``config.get_phase()`` returns the load-time default MICRO=1. Before
+    the fix, recompute stamped every row phase=1, clobbering the correct
+    phase the live tick wrote. The phase_resolver must derive phase from
+    the row's own equity instead.
+    """
+    # Baseline: the equity-less cached phase IS the MICRO default that
+    # used to leak into every recomputed row.
+    assert config.get_phase().value == 1
+
+    with _conn(tmp_db_path) as conn:
+        # $100k equity → Phase.FULL (3) under config.yaml thresholds
+        # ($5k→P2, $20k→P3).
+        _seed_summary(conn, date="2026-05-28", equity=100_000.0)
+        _seed_trade(conn, ticker="SPY", exit_date="2026-05-28",
+                    gross=1.0, pnl=1.0)
+        conn.commit()
+
+        written = recompute_for_dates(
+            conn, ["2026-05-28"],
+            phase_resolver=lambda equity: config.get_phase(
+                equity_usd=equity
+            ).value,
+            dry_run=False,
+        )
+        assert written == 1
+
+        row = conn.execute(
+            "SELECT phase FROM daily_summaries WHERE date='2026-05-28'"
+        ).fetchone()
+    assert row[0] == 3  # FULL, not the cached MICRO=1
+
+
+@pytest.mark.unit
 def test_recompute_skips_dates_with_no_existing_summary(tmp_db_path):
     """Without an existing daily_summaries row we have no
     account_equity_usd to write — the column is NOT NULL. Skip rather
@@ -110,7 +149,8 @@ def test_recompute_skips_dates_with_no_existing_summary(tmp_db_path):
         conn.commit()
 
         written = recompute_for_dates(
-            conn, ["2026-04-29"], phase=3, dry_run=False,
+            conn, ["2026-04-29"], phase_resolver=lambda _equity: 3,
+            dry_run=False,
         )
         assert written == 0
 
@@ -129,7 +169,8 @@ def test_recompute_dry_run_makes_no_writes(tmp_db_path):
         conn.commit()
 
         written = recompute_for_dates(
-            conn, ["2026-05-01"], phase=3, dry_run=True,
+            conn, ["2026-05-01"], phase_resolver=lambda _equity: 3,
+            dry_run=True,
         )
         assert written == 1
 
