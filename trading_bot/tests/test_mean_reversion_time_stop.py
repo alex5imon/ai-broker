@@ -22,6 +22,8 @@ from typing import Any
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+import numpy as np
+import pandas as pd
 import pytest
 
 from trading_bot.strategy.strategies.mean_reversion import MeanReversionStrategy
@@ -255,3 +257,104 @@ def test_weekend_not_counted_as_trading_day() -> None:
 
     # 1 trading day < max_hold_days=2 → no exit
     assert signal.should_exit is False
+
+
+# ---------------------------------------------------------------------------
+# H. Regression: time_stop uses bar timestamp, not datetime.now()
+# ---------------------------------------------------------------------------
+#
+# PR #154 used ``datetime.now()`` unconditionally to compute elapsed
+# trading days.  That silently broke every backtest of mean_reversion:
+# historical entry_time vs today's wall-clock made elapsed_days >>
+# max_hold_days on every trade, so 100% exited via time_stop ~1 bar
+# after entry (single-pass 5.7yr run: -30% / 30.8% WR / 2185 trades all
+# time_stop).  The fix derives "now" from ``df_5min.index[-1]`` when
+# bars are supplied.  These tests pin the new contract — no datetime
+# patching needed.
+
+
+def _five_min_frame(end_dt: datetime, n_bars: int = 5) -> pd.DataFrame:
+    """Synthetic 5-min frame ending at end_dt (ET-localised)."""
+    idx = pd.date_range(end=pd.Timestamp(end_dt), periods=n_bars, freq="5min")
+    return pd.DataFrame(
+        {
+            "open": np.full(n_bars, 100.0),
+            "high": np.full(n_bars, 100.5),
+            "low": np.full(n_bars, 99.5),
+            "close": np.full(n_bars, 100.0),
+            "volume": np.full(n_bars, 100_000),
+        },
+        index=idx,
+    )
+
+
+@pytest.mark.unit
+def test_time_stop_uses_bar_time_not_wallclock() -> None:
+    """In backtest, ``df_5min.index[-1]`` is the simulated 'now' — not
+    today's wall-clock.  An entry from 2021 evaluated against a 2021 bar
+    must NOT exit via time_stop (because elapsed_days = 0 in bar-space)
+    even though wall-clock elapsed is years.
+    """
+    strategy = _strategy({"max_hold_days": 5})
+    # Historical entry: entry and bar both at the same simulated instant,
+    # so elapsed = 0 trading days.
+    historical_entry = datetime(2021, 3, 15, 10, 0, 0, tzinfo=ET)
+    historical_bar_time = datetime(2021, 3, 15, 10, 5, 0, tzinfo=ET)
+
+    pos = _position(entry_time=historical_entry, stop_price=90.0, target_price=120.0)
+    df_5min = _five_min_frame(end_dt=historical_bar_time)
+
+    # No datetime patching — this is the production code path the
+    # backtester hits.  Pre-fix this returned should_exit=True because
+    # datetime.now() returned today and elapsed_days >> 5.
+    signal = strategy.evaluate_exit(
+        position=pos,
+        current_price=100.0,
+        df_5min=df_5min,
+    )
+
+    assert signal.should_exit is False
+    # Sanity: also confirm reason isn't time_stop in any other branch.
+    assert signal.reason != "time_stop"
+
+
+@pytest.mark.unit
+def test_time_stop_fires_when_bar_time_advances_past_threshold() -> None:
+    """Same historical entry, but the bar is now 6 trading days later.
+    Must fire time_stop based on bar elapsed, regardless of wall-clock.
+    """
+    strategy = _strategy({"max_hold_days": 5})
+    historical_entry = datetime(2021, 3, 15, 10, 0, 0, tzinfo=ET)  # Mon
+    # 6 trading days later: 2021-03-15 (Mon) → 2021-03-23 (Tue) = 6 trading days
+    historical_bar_time = datetime(2021, 3, 23, 10, 5, 0, tzinfo=ET)
+
+    pos = _position(entry_time=historical_entry, stop_price=90.0, target_price=120.0)
+    df_5min = _five_min_frame(end_dt=historical_bar_time)
+
+    signal = strategy.evaluate_exit(
+        position=pos,
+        current_price=100.0,
+        df_5min=df_5min,
+    )
+
+    assert signal.should_exit is True
+    assert signal.reason == "time_stop"
+
+
+@pytest.mark.unit
+def test_time_stop_falls_back_to_wallclock_when_no_bars() -> None:
+    """Without df_5min, the helper falls back to ``datetime.now()`` — the
+    degraded live-path safety net.  Existing tests cover this path; this
+    one just pins that the absence of bars doesn't make the strategy
+    crash.
+    """
+    strategy = _strategy({"max_hold_days": 5})
+    entry = datetime(2026, 5, 18, 10, 0, 0, tzinfo=ET)
+    pos = _position(entry_time=entry, stop_price=90.0, target_price=120.0)
+
+    # Should not raise even without df_5min.
+    signal = strategy.evaluate_exit(position=pos, current_price=100.0)
+    # Either fires (wall-clock far past entry) or doesn't — we just want
+    # no exception and a valid ExitSignal.
+    assert signal is not None
+    assert hasattr(signal, "should_exit")
