@@ -216,6 +216,38 @@ async def test_tick_skips_entry_in_close_only_mode(trading_bot):
 
 
 @pytest.mark.asyncio
+async def test_tick_processes_exits_before_entries(trading_bot):
+    """Within a tick, exits MUST run before entries.
+
+    A closing position should free broker state (and, once filled, cash)
+    before new entries are evaluated. This is the exit-before-entry
+    contract the multi-strategy handoff relies on — e.g. ``overnight_drift``
+    selling its long at the open before ``gap_fill`` evaluates a short on
+    the same ticker at 09:35 (ai-broker#48). Pre-fix the tick ran the
+    entry scan (step 12) before the exit check (step 13).
+    """
+    trading_bot._config.is_trading_day = MagicMock(return_value=True)
+    _open_hours(trading_bot)
+    trading_bot._is_market_in_premarket = MagicMock(return_value=False)
+    trading_bot._is_market_in_execution = MagicMock(return_value=True)
+    trading_bot._is_market_in_winddown = MagicMock(return_value=False)
+
+    call_order: list[str] = []
+    trading_bot.check_exits = AsyncMock(
+        side_effect=lambda: call_order.append("exits"),
+    )
+    trading_bot.scan_for_entries = AsyncMock(
+        side_effect=lambda _market: call_order.append("entries"),
+    )
+
+    await trading_bot.tick()
+
+    assert call_order == ["exits", "entries"], (
+        f"exits must be processed before entries within a tick; got {call_order}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_tick_runs_wind_down_within_window(trading_bot):
     trading_bot._config.is_trading_day = MagicMock(return_value=True)
     _open_hours(trading_bot)
