@@ -130,6 +130,8 @@ close (via `.github/workflows/daily-review.yml`, 21:30 UTC weekdays). It:
 - `static-checks` AND `coverage` must report `success` before the merge button enables
 - No force-pushes, no branch deletion
 
+The ruleset lives in GitHub's UI, but its policy invariants are pinned in the repo at [.github/rulesets/main.json](.github/rulesets/main.json) (the source of truth for audits — not the UI). A weekly drift-detection workflow ([.github/workflows/ruleset-drift.yml](.github/workflows/ruleset-drift.yml)) re-fetches the live ruleset, normalizes it via `.github/rulesets/normalize.py`, and fails (emailing the admin) if it diverges from the snapshot. If you change the ruleset on purpose, regenerate the snapshot (see the workflow header) and commit it.
+
 **Always queue PRs for auto-merge rather than waiting on CI manually:**
 
 ```bash

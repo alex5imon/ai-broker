@@ -1,0 +1,70 @@
+name: ruleset-drift
+
+# Pre-live hardening (issue #149): the `master` branch ruleset that protects
+# `main` lives in GitHub's UI, not the repo. If it were ever silently relaxed
+# (bypass actors added, required checks removed, force-push/deletion allowed),
+# the codebase would be unaware. This job fetches the live ruleset weekly,
+# normalizes it to its policy invariants, and fails if it has drifted from the
+# committed snapshot at .github/rulesets/main.json. GitHub emails the repo
+# admin on workflow failure by default (same mechanism as heartbeat.yml).
+#
+# When drift is INTENTIONAL (you changed the ruleset on purpose), regenerate
+# the snapshot and commit it:
+#   RID=$(gh api /repos/${{ github.repository }}/rulesets --jq \
+#       '.[] | select(.name=="master") | .id')
+#   gh api /repos/${{ github.repository }}/rulesets/$RID \
+#       | python3 .github/rulesets/normalize.py > .github/rulesets/main.json
+
+on:
+  schedule:
+    # Mondays 12:00 UTC — quiet time, well outside NYSE hours.
+    - cron: "0 12 * * 1"
+  workflow_dispatch: {}
+
+# Least privilege: rulesets are read via the repo administration scope.
+permissions:
+  contents: read
+  administration: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SNAPSHOT: .github/rulesets/main.json
+      RULESET_NAME: master
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compare live ruleset against committed snapshot
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "$SNAPSHOT" ]; then
+            echo "::error::Committed snapshot $SNAPSHOT is missing."
+            exit 1
+          fi
+
+          # Resolve the ruleset id by name, then fetch the full policy.
+          rid=$(gh api "/repos/${{ github.repository }}/rulesets" \
+            --jq ".[] | select(.name==\"$RULESET_NAME\") | .id")
+
+          if [ -z "$rid" ]; then
+            echo "::error::No ruleset named '$RULESET_NAME' found. It may have "
+            echo "::error::been deleted — branch protection on main is GONE."
+            exit 1
+          fi
+
+          gh api "/repos/${{ github.repository }}/rulesets/$rid" \
+            | python3 .github/rulesets/normalize.py > /tmp/live_ruleset.json
+
+          if diff -u "$SNAPSHOT" /tmp/live_ruleset.json; then
+            echo "Ruleset matches the committed snapshot. No drift."
+          else
+            echo "::error::Branch-protection ruleset has DRIFTED from "
+            echo "::error::$SNAPSHOT (diff above). If intentional, regenerate "
+            echo "::error::the snapshot (see header of this workflow) and commit."
+            exit 1
+          fi
