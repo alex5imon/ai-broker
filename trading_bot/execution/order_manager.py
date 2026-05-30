@@ -1171,14 +1171,28 @@ class OrderManager:
         except Exception:
             logger.exception("Error cancelling orders for %s", ticker)
 
-    async def emergency_flatten(self, ticker: str, qty: float, exchange: str) -> None:
-        """Emergency market sell."""
+    async def emergency_flatten(
+        self, ticker: str, qty: float, exchange: str,
+        *, position_side: str = "BUY",
+    ) -> None:
+        """Emergency market flatten.
+
+        Flattens a long (``position_side == "BUY"``) by SELLing and a short
+        (``position_side == "SELL"``) by BUYing to cover. ``position_side``
+        defaults to BUY so existing callers are unchanged; callers that may
+        hold shorts (wind-down, the legacy exit path, ``_transition_to_open``)
+        pass the position's side. Flattening a short with the default SELL
+        would *double* the short — hence the explicit threading.
+        """
+        flatten_side: OrderSide = (
+            OrderSide.BUY if position_side == "SELL" else OrderSide.SELL
+        )
         client: TradingClient = self._gw.client
         try:
             request = MarketOrderRequest(
                 symbol=ticker,
                 qty=qty,
-                side=OrderSide.SELL,
+                side=flatten_side,
                 type=OrderType.MARKET,
                 time_in_force=tif_for_market(qty),
             )
@@ -1187,8 +1201,8 @@ class OrderManager:
                 order_data=request,
             )
             logger.warning(
-                "Emergency flatten: SELL %.6f %s @ MARKET (alpaca_id=%s)",
-                qty, ticker, str(order.id),
+                "Emergency flatten: %s %.6f %s @ MARKET (alpaca_id=%s)",
+                flatten_side.value, qty, ticker, str(order.id),
             )
         except Exception:
             logger.exception(
@@ -1270,20 +1284,26 @@ class OrderManager:
         # when an emergency-flatten path explicitly canceled all
         # orders for the symbol. Treat broker as source of truth.
         #
-        # SELL-side filter: only cancel SELL orders (existing
-        # stops/targets/trailing). If another strategy has an in-flight
-        # BUY entry on the same ticker (allowed by the multi-strategy
-        # framework once breakout/trend_following are re-enabled), we
-        # must not cancel it — only the bracket-leg sells reserve the
-        # qty that's blocking our SELL.
-        await self.cancel_all_for_ticker(ticker, side_filter=OrderSide.SELL)
+        # Direction-aware cover + cancel. Long: SELL to close, cancel the
+        # protective SELL stop (preserve any in-flight BUY entry from
+        # another sleeve). Short: BUY to cover, cancel the protective BUY
+        # stop (preserve any in-flight SELL entry). The cancel releases the
+        # held_for_orders qty that would otherwise reject the exit with
+        # code 40310000 ("insufficient qty available"). Falls back to long
+        # when there's no matching in-memory order (recovery/drain).
+        is_short: bool = (
+            matching_active is not None and matching_active.side == "SELL"
+        )
+        exit_side: OrderSide = OrderSide.BUY if is_short else OrderSide.SELL
+        protective_side: OrderSide = OrderSide.BUY if is_short else OrderSide.SELL
+        await self.cancel_all_for_ticker(ticker, side_filter=protective_side)
 
         client: TradingClient = self._gw.client
         try:
             request = MarketOrderRequest(
                 symbol=ticker,
                 qty=qty,
-                side=OrderSide.SELL,
+                side=exit_side,
                 type=OrderType.MARKET,
                 time_in_force=TimeInForce.DAY,
             )
@@ -1293,8 +1313,8 @@ class OrderManager:
             )
             order_id: str = str(order.id)
             logger.info(
-                "Strategy exit submitted: SELL %s %s @ MARKET (reason=%s, alpaca_id=%s)",
-                qty, ticker, reason, order_id,
+                "Strategy exit submitted: %s %s %s @ MARKET (reason=%s, alpaca_id=%s)",
+                exit_side.value, qty, ticker, reason, order_id,
             )
             # Pin order_id → trade_id and transition to CLOSING so the
             # next stateless tick doesn't re-evaluate the same exit and
@@ -1404,13 +1424,16 @@ class OrderManager:
             )
             return None
 
-        # Cancel SELL-side orders only for the ticker. Mirrors the
-        # change in place_exit — see that comment for rationale.
-        # Phantom stops not tracked in the local DB will otherwise hold
-        # the qty and reject this LIMIT submission with "insufficient
-        # qty available". The SELL filter protects an in-flight BUY
-        # entry from another strategy on the same ticker.
-        await self.cancel_all_for_ticker(ticker, side_filter=OrderSide.SELL)
+        # Direction-aware cover + cancel — mirrors place_exit. Long: SELL
+        # to close, cancel the protective SELL stop. Short: BUY to cover,
+        # cancel the protective BUY stop. The opposite side may be a
+        # concurrent sleeve's in-flight entry, so we never cancel it.
+        is_short: bool = (
+            matching_active is not None and matching_active.side == "SELL"
+        )
+        exit_side: OrderSide = OrderSide.BUY if is_short else OrderSide.SELL
+        protective_side: OrderSide = OrderSide.BUY if is_short else OrderSide.SELL
+        await self.cancel_all_for_ticker(ticker, side_filter=protective_side)
 
         # Snapshot the prior status so we can roll back if Alpaca
         # rejects the submission. Without this, a failed submit leaves
@@ -1427,7 +1450,7 @@ class OrderManager:
             request = LimitOrderRequest(
                 symbol=ticker,
                 qty=qty,
-                side=OrderSide.SELL,
+                side=exit_side,
                 type=OrderType.LIMIT,
                 time_in_force=TimeInForce.DAY,
                 limit_price=round(limit_price, 2),
@@ -1438,8 +1461,8 @@ class OrderManager:
             )
             order_id = str(order.id)
             logger.info(
-                "Limit exit submitted: SELL %s %s @ %.2f (reason=%s, alpaca_id=%s)",
-                qty, ticker, limit_price, reason, order_id,
+                "Limit exit submitted: %s %s %s @ %.2f (reason=%s, alpaca_id=%s)",
+                exit_side.value, qty, ticker, limit_price, reason, order_id,
             )
 
             # Pin order_id → trade_id and transition position state so
@@ -1530,6 +1553,7 @@ class OrderManager:
             # whether a matching stop is already live at Alpaca and adopt it.
             recovered_stop_id = await self._find_existing_stop(
                 active.ticker, filled_qty, stop_price=active.stop_price,
+                position_side=active.side,
             )
             if recovered_stop_id is not None:
                 logger.warning(
@@ -1555,7 +1579,10 @@ class OrderManager:
                 "(trade_id=%d). Emergency flattening.",
                 active.ticker, trade_id,
             )
-            await self.emergency_flatten(active.ticker, filled_qty, active.exchange)
+            await self.emergency_flatten(
+                active.ticker, filled_qty, active.exchange,
+                position_side=active.side,
+            )
             await self._notifier.send(
                 "Stop Attach Failed",
                 f"Could not attach protective stop for {active.ticker} "
@@ -1585,7 +1612,7 @@ class OrderManager:
 
         await self._notifier.trade_entry(
             ticker=active.ticker,
-            side="BUY",
+            side=active.side,
             price=active.entry_price,
             qty=filled_qty,
             reason=f"Phase {self._config.get_phase().value} | {active.hold_type}",
@@ -1594,7 +1621,12 @@ class OrderManager:
     async def _place_standalone_stop(
         self, trade_id: int, active: _ActiveOrder, qty: float,
     ) -> str | None:
-        """Submit a standalone sell-stop order. Returns Alpaca order id or None.
+        """Submit a standalone protective stop. Returns Alpaca order id or None.
+
+        A long (``side == "BUY"``) is protected by a SELL stop below entry;
+        a short (``side == "SELL"``) by a BUY stop above entry. The strategy
+        supplies a stop_price already on the correct side of entry — here we
+        only flip the order side.
 
         Catches all exceptions so the caller can choose the recovery path
         (emergency flatten + notification) without unwinding the transaction.
@@ -1605,11 +1637,14 @@ class OrderManager:
                 active.stop_price, active.ticker,
             )
             return None
+        stop_side: OrderSide = (
+            OrderSide.BUY if active.side == "SELL" else OrderSide.SELL
+        )
         try:
             request = StopOrderRequest(
                 symbol=active.ticker,
                 qty=qty,
-                side=OrderSide.SELL,
+                side=stop_side,
                 time_in_force=tif_for_stop(qty),
                 stop_price=round(active.stop_price, 2),
             )
@@ -1627,8 +1662,13 @@ class OrderManager:
 
     async def _find_existing_stop(
         self, ticker: str, qty: float, *, stop_price: float | None = None,
+        position_side: str = "BUY",
     ) -> str | None:
-        """Look up an open SELL stop on ``ticker`` matching ``qty`` at Alpaca.
+        """Look up an open protective stop on ``ticker`` matching ``qty``.
+
+        The protective side depends on the position: a long (``side ==
+        "BUY"``) is protected by a SELL stop, a short by a BUY stop.
+        Defaults to the long case.
 
         Used by ``_transition_to_open`` to recover from a submit-response
         loss: alpaca-py occasionally raises during response parsing after
@@ -1677,7 +1717,9 @@ class OrderManager:
                 order_qty: float = float(getattr(order, "qty", 0) or 0)
             except (TypeError, ValueError):
                 continue
-            if order_type_str != "stop" or side_str != "sell":
+            # A short's protective stop is a BUY; a long's a SELL.
+            expected_side: str = "buy" if position_side == "SELL" else "sell"
+            if order_type_str != "stop" or side_str != expected_side:
                 continue
             if abs(order_qty - qty) > 1e-6:
                 continue
