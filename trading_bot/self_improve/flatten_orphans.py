@@ -27,6 +27,12 @@ SAFETY:
   - --dry-run is the default. The script prints what it would do and
     exits without touching Alpaca or the DB.
   - --execute is required to actually submit orders.
+  - Risk-circuit gate: with --execute, the script reads risk_circuit_state
+    first and REFUSES if any kill switch is active (is_paused,
+    daily_loss_limit_hit, drawdown_breaker_active, commission_stop_active).
+    This guards against an operator flattening a stale ticker list right
+    after the bot tripped its loss limit. Override with --force-during-halt
+    (logs a WARNING). The halt read is offline, before any broker call.
   - --tickers can scope the run to a subset (default: SPY,XLRE,QQQ).
   - Each ticker runs independently; one failure does not block the rest.
   - Order TIF is chosen from Alpaca's clock:
@@ -37,6 +43,8 @@ Run:
     python -m trading_bot.self_improve.flatten_orphans               # dry-run
     python -m trading_bot.self_improve.flatten_orphans --execute     # send orders
     python -m trading_bot.self_improve.flatten_orphans --tickers QQQ # one only
+    python -m trading_bot.self_improve.flatten_orphans --execute \
+        --force-during-halt    # flatten even while a kill switch is active
 """
 
 from __future__ import annotations
@@ -52,6 +60,7 @@ from typing import Iterable
 from zoneinfo import ZoneInfo
 
 from trading_bot.config import Config
+from trading_bot.db import repository as repo
 from trading_bot.env import resolve_alpaca_env
 from trading_bot.log_setup import setup_logging
 
@@ -61,6 +70,45 @@ ET = ZoneInfo("US/Eastern")
 
 # Default scope. Edit only if reconcile shows different orphans.
 DEFAULT_ORPHAN_TICKERS: tuple[str, ...] = ("SPY", "XLRE", "QQQ")
+
+# Global risk-circuit key. Canonical definition is
+# trading_bot.execution.risk_manager._RISK_STATE_KEY; kept as a literal here so
+# this operational tool doesn't import the RiskManager. test_flatten_orphans
+# asserts the two stay in sync.
+_RISK_STATE_KEY: str = "risk_manager:global"
+
+# Halt flags in the persisted risk_circuit_state blob. If any is truthy the
+# bot has tripped a kill switch and a manual --execute flatten must not run
+# unless explicitly forced.
+_HALT_FLAGS: tuple[str, ...] = (
+    "is_paused",
+    "daily_loss_limit_hit",
+    "drawdown_breaker_active",
+    "commission_stop_active",
+)
+
+
+def _active_halts(db_path: str) -> list[str]:
+    """Return the names of any active risk-circuit halts, or ``[]`` if clear.
+
+    Reads ``risk_circuit_state`` directly from SQLite — no broker connection —
+    so the refusal path never opens an Alpaca session. A read failure is
+    treated as halted (fail-safe): better to block a flatten than to fire one
+    blind to the kill switch.
+    """
+    try:
+        with sqlite3.connect(db_path) as conn:
+            state_row = repo.load_risk_state(conn, _RISK_STATE_KEY)
+    except Exception:
+        logger.exception(
+            "Could not read risk_circuit_state from %s; treating as halted",
+            db_path,
+        )
+        return ["risk_state_unreadable"]
+    if state_row is None:
+        return []
+    blob: dict = state_row.get("state") or {}
+    return [flag for flag in _HALT_FLAGS if blob.get(flag)]
 
 
 @dataclass(frozen=True)
@@ -243,9 +291,35 @@ def plan_and_execute(
     db_path: str,
     tickers: Iterable[str],
     execute: bool,
+    force_during_halt: bool = False,
 ) -> int:
     """Return shell exit code. 0 = all planned/executed cleanly."""
     target_tickers = {t.upper() for t in tickers}
+
+    if not Path(db_path).exists():
+        logger.error("DB not found at %s", db_path)
+        return 2
+
+    # Risk-circuit gate — only when actually placing orders. The read is
+    # offline (SQLite) and happens BEFORE any broker call, so a refusal never
+    # opens an Alpaca session. dry-run is intentionally unaffected: it only
+    # lists positions and prints a plan.
+    if execute:
+        halts = _active_halts(db_path)
+        if halts and not force_during_halt:
+            logger.error(
+                "Risk circuit is HALTED (%s). Refusing --execute to protect the "
+                "account during an active kill switch. Re-run with "
+                "--force-during-halt to override (logs a WARNING).",
+                ", ".join(halts),
+            )
+            return 2
+        if halts and force_during_halt:
+            logger.warning(
+                "Risk circuit is HALTED (%s) but --force-during-halt was "
+                "supplied — proceeding with flatten anyway.",
+                ", ".join(halts),
+            )
 
     api_key, secret_key, is_paper = resolve_alpaca_env()
     if not api_key or not secret_key:
@@ -259,10 +333,6 @@ def plan_and_execute(
     client = TradingClient(api_key, secret_key, paper=is_paper)
     logger.info("Connected to Alpaca (%s, paper=%s)",
                 "live" if not is_paper else "paper", is_paper)
-
-    if not Path(db_path).exists():
-        logger.error("DB not found at %s", db_path)
-        return 2
 
     # Pull live Alpaca positions and the clock state up front. The clock
     # informs the TIF chosen for the flatten orders (see _choose_tif).
@@ -449,16 +519,34 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Comma-separated tickers to consider (default: SPY,XLRE,QQQ)")
     p.add_argument("--execute", action="store_true",
                    help="Actually submit orders. Without this flag the script is read-only.")
+    p.add_argument("--force-during-halt", action="store_true",
+                   help="Override the risk-circuit halt gate and flatten even when "
+                        "a kill switch is active. Requires --execute.")
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     setup_logging("flatten_orphans")
     args = _parse_args(argv)
+
+    # --force-during-halt only has meaning alongside --execute. On its own it's
+    # an operator mistake: warn and exit without touching the broker or DB.
+    if args.force_during_halt and not args.execute:
+        logger.warning(
+            "--force-during-halt has no effect without --execute (the halt gate "
+            "only applies when placing orders). Exiting without action."
+        )
+        return 0
+
     config = Config.load(args.config)
     db_path = args.db or config.db_path
     tickers = [t.strip() for t in args.tickers.split(",") if t.strip()]
-    return plan_and_execute(db_path=db_path, tickers=tickers, execute=args.execute)
+    return plan_and_execute(
+        db_path=db_path,
+        tickers=tickers,
+        execute=args.execute,
+        force_during_halt=args.force_during_halt,
+    )
 
 
 if __name__ == "__main__":

@@ -9,18 +9,24 @@ and TIF selection from clock state.
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
 
 import pytest
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+from trading_bot.db import repository as repo
 from trading_bot.self_improve.flatten_orphans import (
+    _HALT_FLAGS,
+    _RISK_STATE_KEY,
     OrphanPlan,
+    _active_halts,
     _build_plan,
     _choose_tif,
     _execute_bulk,
     _find_db_position,
+    plan_and_execute,
 )
 
 
@@ -295,3 +301,162 @@ def test_execute_bulk_does_not_mark_db_closed_on_http_202(tmp_db):
     assert row[0] == "POSITION_OPEN", (
         "HTTP 202 must NOT close the DB row — pre-fix regression"
     )
+
+
+# ---------------------------------------------------------------------------
+# Risk-circuit halt gate (issue #148)
+# ---------------------------------------------------------------------------
+
+
+def _seed_halt(db_path: str, **flags: bool) -> None:
+    """Write a risk_circuit_state row with the given halt flags set."""
+    conn = sqlite3.connect(db_path)
+    try:
+        repo.save_risk_state(
+            conn,
+            _RISK_STATE_KEY,
+            tripped=any(flags.values()),
+            reason="test halt",
+            state=dict(flags),
+        )
+    finally:
+        conn.close()
+
+
+@pytest.mark.unit
+def test_risk_state_key_matches_risk_manager():
+    """The hardcoded key must track risk_manager's canonical definition."""
+    from trading_bot.execution.risk_manager import _RISK_STATE_KEY as rm_key
+    assert _RISK_STATE_KEY == rm_key
+
+
+@pytest.mark.unit
+def test_active_halts_empty_when_no_row(tmp_db_path):
+    assert _active_halts(tmp_db_path) == []
+
+
+@pytest.mark.unit
+def test_active_halts_empty_when_all_flags_false(tmp_db_path):
+    _seed_halt(tmp_db_path, is_paused=False, daily_loss_limit_hit=False,
+               drawdown_breaker_active=False, commission_stop_active=False)
+    assert _active_halts(tmp_db_path) == []
+
+
+@pytest.mark.unit
+def test_active_halts_reports_each_set_flag(tmp_db_path):
+    _seed_halt(tmp_db_path, drawdown_breaker_active=True, is_paused=True)
+    halts = _active_halts(tmp_db_path)
+    assert set(halts) == {"is_paused", "drawdown_breaker_active"}
+    # Only known halt flags are reported, in declared order.
+    assert all(h in _HALT_FLAGS for h in halts)
+
+
+@pytest.mark.unit
+def test_active_halts_failsafe_on_unreadable_db():
+    halts = _active_halts("/nonexistent/path/to.db")
+    assert halts == ["risk_state_unreadable"]
+
+
+@pytest.mark.unit
+def test_execute_refused_when_halted(tmp_db_path, monkeypatch):
+    """halt + --execute → exit 2, and the broker is never contacted."""
+    _seed_halt(tmp_db_path, daily_loss_limit_hit=True)
+    resolve = MagicMock()
+    monkeypatch.setattr(
+        "trading_bot.self_improve.flatten_orphans.resolve_alpaca_env", resolve,
+    )
+    rc = plan_and_execute(
+        db_path=tmp_db_path, tickers=["SPY"], execute=True,
+        force_during_halt=False,
+    )
+    assert rc == 2
+    resolve.assert_not_called()  # refusal happened offline, before any broker call
+
+
+@pytest.mark.unit
+def test_execute_proceeds_past_gate_when_not_halted(tmp_db_path, monkeypatch):
+    """no halt + --execute → gate passes and the broker path is entered."""
+    # Clean risk state (no row).
+    resolve = MagicMock(return_value=("k", "s", True))
+    monkeypatch.setattr(
+        "trading_bot.self_improve.flatten_orphans.resolve_alpaca_env", resolve,
+    )
+    client = MagicMock()
+    client.get_all_positions.return_value = []  # no orphans → clean exit
+    with patch("alpaca.trading.client.TradingClient", return_value=client):
+        rc = plan_and_execute(
+            db_path=tmp_db_path, tickers=["SPY"], execute=True,
+            force_during_halt=False,
+        )
+    assert rc == 0
+    resolve.assert_called_once()  # gate let us through to the broker
+
+
+@pytest.mark.unit
+def test_execute_forced_during_halt_proceeds_with_warning(
+    tmp_db_path, monkeypatch, caplog,
+):
+    """halt + --execute + --force-during-halt → proceeds, logs WARNING."""
+    _seed_halt(tmp_db_path, commission_stop_active=True)
+    resolve = MagicMock(return_value=("k", "s", True))
+    monkeypatch.setattr(
+        "trading_bot.self_improve.flatten_orphans.resolve_alpaca_env", resolve,
+    )
+    client = MagicMock()
+    client.get_all_positions.return_value = []
+    with patch("alpaca.trading.client.TradingClient", return_value=client):
+        with caplog.at_level("WARNING"):
+            rc = plan_and_execute(
+                db_path=tmp_db_path, tickers=["SPY"], execute=True,
+                force_during_halt=True,
+            )
+    assert rc == 0
+    resolve.assert_called_once()
+    assert any(
+        "force-during-halt" in r.message and r.levelname == "WARNING"
+        for r in caplog.records
+    )
+
+
+@pytest.mark.unit
+def test_dry_run_unaffected_by_halt(tmp_db_path, monkeypatch):
+    """Halt state must not block a read-only dry-run."""
+    _seed_halt(tmp_db_path, is_paused=True, drawdown_breaker_active=True)
+    resolve = MagicMock(return_value=("k", "s", True))
+    monkeypatch.setattr(
+        "trading_bot.self_improve.flatten_orphans.resolve_alpaca_env", resolve,
+    )
+    client = MagicMock()
+    client.get_all_positions.return_value = []
+    with patch("alpaca.trading.client.TradingClient", return_value=client):
+        rc = plan_and_execute(
+            db_path=tmp_db_path, tickers=["SPY"], execute=False,
+            force_during_halt=False,
+        )
+    assert rc == 0
+    resolve.assert_called_once()  # dry-run still connects to list positions
+
+
+@pytest.mark.unit
+def test_force_during_halt_without_execute_is_noop(monkeypatch, caplog):
+    """--force-during-halt alone warns and exits without doing anything."""
+    called = MagicMock()
+    monkeypatch.setattr(
+        "trading_bot.self_improve.flatten_orphans.plan_and_execute", called,
+    )
+    monkeypatch.setattr(
+        "trading_bot.self_improve.flatten_orphans.Config.load",
+        lambda *a, **k: MagicMock(db_path=":memory:"),
+    )
+    # No-op setup_logging so it doesn't reconfigure handlers out from under
+    # caplog (which captures via root-logger propagation).
+    monkeypatch.setattr(
+        "trading_bot.self_improve.flatten_orphans.setup_logging",
+        lambda *a, **k: None,
+    )
+    from trading_bot.self_improve.flatten_orphans import main
+    with caplog.at_level("WARNING", logger="trading_bot.self_improve.flatten_orphans"):
+        rc = main(["--force-during-halt"])
+    assert rc == 0
+    called.assert_not_called()
+    assert any("no effect without --execute" in r.message for r in caplog.records)
