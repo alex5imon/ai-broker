@@ -323,7 +323,23 @@ class StateRecovery:
             # silently dropping the realized P&L from
             # `daily_summaries`. Observed 2026-05-15 — see PR #140.
             status_val: str = str(db_row.get("status", "") or "")
-            if status_val in _EXIT_IN_FLIGHT_STATUSES:
+            # Defer to the order-status poll for clean exit attribution when
+            # the row is exit-in-flight (CLOSING/STOP_ACTIVE/TRAILING_ACTIVE)
+            # OR POSITION_OPEN with a tracked standalone stop. The latter
+            # covers mean_reversion / overnight_drift / opening_range_breakout,
+            # whose protective stop lives on a POSITION_OPEN row (they never
+            # transition to STOP_ACTIVE). When that stop fills between ticks,
+            # recovery would otherwise win the race and stamp
+            # reconciliation_mismatch with NULL pnl — observed 2026-05-29 on
+            # ORB's NVDA/XLF/XLB. The fresh-entry grace above already shields
+            # just-opened rows, so a POSITION_OPEN row that is flat at the
+            # broker past the grace window is genuinely closed; deferring lets
+            # _check_order_statuses attribute the filled stop as stop_loss.
+            defer_for_attribution: bool = status_val in _EXIT_IN_FLIGHT_STATUSES or (
+                status_val == "POSITION_OPEN"
+                and bool(db_row.get("alpaca_stop_order_id"))
+            )
+            if defer_for_attribution:
                 tracked_oid: str | None = None
                 tracked_col: str | None = None
                 for col in _EXIT_ORDER_ID_COLUMNS:
