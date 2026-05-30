@@ -93,9 +93,16 @@ class StrategyTrade:
     trail_pct: float | None
     signals: dict[str, Any]
     hold_type: str = "swing"  # "intraday" or "swing"
+    # "long" (buy → sell) or "short" (sell → buy-to-cover). Defaults to
+    # long so every existing call site and persisted long trade is
+    # unchanged; only direction-aware sleeves (gap_fill) set "short".
+    direction: str = "long"
     sentiment_score: float | None = None
     trail_activation_pct: float | None = None
     highest_price: float | None = None
+    # Mirror of ``highest_price`` for shorts: the lowest price seen since
+    # entry, used to anchor a short trailing stop (trail above the low).
+    lowest_price: float | None = None
     exit_time: datetime | None = None
     exit_price: float | None = None
     exit_reason: str | None = None
@@ -533,7 +540,7 @@ class MultiStrategyBacktester:
             day_start_equity: dict[str, float] = {}
             for sid, st in states.items():
                 pos_value = sum(
-                    t.entry_price * t.shares for t in st.open_positions
+                    self._mark_value(t, t.entry_price) for t in st.open_positions
                 )
                 day_start_equity[sid] = st.cash_usd + pos_value
 
@@ -606,9 +613,17 @@ class MultiStrategyBacktester:
                                 decision = decision.__class__(
                                     **{**decision.__dict__, "shares": scaled}
                                 )
+                            is_short = decision.direction == "short"
+                            # Long entry BUYS (fill above close); short
+                            # entry SELLS to open (fill below close).
                             fill_price = self._simulate_fill(
-                                bar_close, "buy", ticker,
+                                bar_close, "sell" if is_short else "buy", ticker,
                             )
+                            # ``cost`` is the gross notional. For longs it's
+                            # capped by available cash; for shorts we use the
+                            # same cap as a conservative proxy for margin
+                            # (no true margin model) so a sleeve can't open
+                            # unbounded short notional.
                             cost = fill_price * decision.shares
                             if cost > st.cash_usd:
                                 adjusted_shares = int(st.cash_usd / fill_price)
@@ -631,11 +646,16 @@ class MultiStrategyBacktester:
                                 trail_pct=decision.trail_pct,
                                 signals=decision.signals,
                                 hold_type=decision.hold_type.value,
+                                direction=decision.direction,
                                 sentiment_score=decision.sentiment_score,
                                 highest_price=fill_price,
+                                lowest_price=fill_price,
                             )
                             st.open_positions.append(trade)
-                            st.cash_usd -= cost
+                            # Short sale ADDS proceeds to cash; the matching
+                            # cover in ``_close_trade`` subtracts the buy-back
+                            # cost, so net cash move = realized P&L.
+                            st.cash_usd += cost if is_short else -cost
                             st.trade_count += 1
 
             # --- End of day ---
@@ -670,9 +690,10 @@ class MultiStrategyBacktester:
                 pos_value = 0.0
                 for trade in st.open_positions:
                     if trade.ticker in last_bar_per_ticker:
-                        pos_value += float(last_bar_per_ticker[trade.ticker][0]["close"]) * trade.shares
+                        mark_px = float(last_bar_per_ticker[trade.ticker][0]["close"])
                     else:
-                        pos_value += trade.entry_price * trade.shares
+                        mark_px = trade.entry_price
+                    pos_value += self._mark_value(trade, mark_px)
                 total_now = st.cash_usd + pos_value
                 if total_now > st.peak_equity_usd:
                     st.peak_equity_usd = total_now
@@ -720,6 +741,19 @@ class MultiStrategyBacktester:
             strategies=strategy_results,
         )
 
+    @staticmethod
+    def _mark_value(trade: StrategyTrade, price: float) -> float:
+        """Signed mark-to-market equity contribution of an open position.
+
+        Long positions contribute ``+price * shares``. Short positions
+        contribute ``-price * shares`` because the short sale already
+        credited ``entry * shares`` to cash at entry, so the position's
+        standing equity is the (negative) cost to buy it back. Identical
+        to the legacy ``price * shares`` for the long path.
+        """
+        signed = -1.0 if trade.direction == "short" else 1.0
+        return signed * price * trade.shares
+
     def _check_trade_exit(
         self,
         trade: StrategyTrade,
@@ -732,26 +766,49 @@ class MultiStrategyBacktester:
         df_daily: pd.DataFrame,
     ) -> tuple[str, float] | None:
         """Check if a trade should exit. Returns (reason, exit_price) or None."""
-        # Update highest price
+        # Update high/low water marks (both tracked unconditionally; the
+        # long path only reads ``highest_price``, the short path only
+        # ``lowest_price``, so this is harmless for either direction).
         if trade.highest_price is None or bar_high > trade.highest_price:
             trade.highest_price = bar_high
+        if trade.lowest_price is None or bar_low < trade.lowest_price:
+            trade.lowest_price = bar_low
 
-        # Stop loss (intrabar check using bar low)
-        if trade.stop_price and bar_low <= trade.stop_price:
-            return "stop_loss", min(trade.stop_price, bar_close)
+        is_short: bool = trade.direction == "short"
 
-        # Take profit (intrabar check using bar high)
-        if trade.target_price and bar_high >= trade.target_price:
-            return "take_profit", trade.target_price
+        if is_short:
+            # Short: stop is ABOVE entry (price rising hurts), target is
+            # BELOW entry (price falling is profit). Cover fills are BUYs,
+            # so the conservative stop fill is at the stop or higher.
+            if trade.stop_price and bar_high >= trade.stop_price:
+                return "stop_loss", max(trade.stop_price, bar_close)
+            if trade.target_price and bar_low <= trade.target_price:
+                return "take_profit", trade.target_price
+            # Trailing stop anchored to the lowest price seen (trail above it).
+            if trade.trail_pct and trade.lowest_price:
+                activation_pct = trade.trail_activation_pct or 0.0
+                down_pct = (trade.entry_price - trade.lowest_price) / trade.entry_price
+                if down_pct >= activation_pct:
+                    trail_stop = trade.lowest_price * (1.0 + trade.trail_pct)
+                    if bar_high >= trail_stop:
+                        return "trailing_stop", max(trail_stop, bar_close)
+        else:
+            # Stop loss (intrabar check using bar low)
+            if trade.stop_price and bar_low <= trade.stop_price:
+                return "stop_loss", min(trade.stop_price, bar_close)
 
-        # Trailing stop (only after activation threshold is reached)
-        if trade.trail_pct and trade.highest_price:
-            activation_pct = trade.trail_activation_pct or 0.0
-            up_pct = (trade.highest_price - trade.entry_price) / trade.entry_price
-            if up_pct >= activation_pct:
-                trail_stop = trade.highest_price * (1.0 - trade.trail_pct)
-                if bar_low <= trail_stop:
-                    return "trailing_stop", min(trail_stop, bar_close)
+            # Take profit (intrabar check using bar high)
+            if trade.target_price and bar_high >= trade.target_price:
+                return "take_profit", trade.target_price
+
+            # Trailing stop (only after activation threshold is reached)
+            if trade.trail_pct and trade.highest_price:
+                activation_pct = trade.trail_activation_pct or 0.0
+                up_pct = (trade.highest_price - trade.entry_price) / trade.entry_price
+                if up_pct >= activation_pct:
+                    trail_stop = trade.highest_price * (1.0 - trade.trail_pct)
+                    if bar_low <= trail_stop:
+                        return "trailing_stop", min(trail_stop, bar_close)
 
         # Delegate to strategy's own evaluate_exit
         position_dict: dict[str, Any] = {
@@ -781,8 +838,18 @@ class MultiStrategyBacktester:
         reason: str,
         exit_time: datetime,
     ) -> None:
-        fill_exit = self._simulate_fill(exit_price, "sell", trade.ticker)
-        gross_pnl = (fill_exit - trade.entry_price) * trade.shares
+        if trade.direction == "short":
+            # Close a short by BUYING to cover: fill above the requested
+            # price, P&L = entry − exit, and cash falls by the cover cost.
+            # (At entry the short ADDED proceeds to cash; see the run-loop
+            # entry block, which keeps the round-trip equity consistent.)
+            fill_exit = self._simulate_fill(exit_price, "buy", trade.ticker)
+            gross_pnl = (trade.entry_price - fill_exit) * trade.shares
+            cash_delta = -fill_exit * trade.shares
+        else:
+            fill_exit = self._simulate_fill(exit_price, "sell", trade.ticker)
+            gross_pnl = (fill_exit - trade.entry_price) * trade.shares
+            cash_delta = fill_exit * trade.shares
 
         trade.exit_time = exit_time
         trade.exit_price = fill_exit
@@ -790,7 +857,7 @@ class MultiStrategyBacktester:
         trade.gross_pnl_usd = gross_pnl
         trade.net_pnl_usd = gross_pnl  # commission-free
 
-        state.cash_usd += fill_exit * trade.shares
+        state.cash_usd += cash_delta
         state.total_pnl_usd += gross_pnl
         if gross_pnl > 0:
             state.wins += 1
@@ -1006,7 +1073,7 @@ class MultiStrategyBacktester:
             day_start_equity: dict[str, float] = {}
             for sid, st in states.items():
                 pos_value = sum(
-                    t.entry_price * t.shares for t in st.open_positions
+                    self._mark_value(t, t.entry_price) for t in st.open_positions
                 )
                 day_start_equity[sid] = st.cash_usd + pos_value
 
@@ -1086,6 +1153,11 @@ class MultiStrategyBacktester:
                         sentiment_score=sentiment,
                     )
                     if decision is not None and decision.shares > 0:
+                        # Daily mode is long-only (hardcoded buy fills + long
+                        # ATR stops). Skip short decisions rather than open
+                        # them in the wrong direction.
+                        if decision.direction != "long":
+                            continue
                         if self._calendar_overlay_blocks(decision, current_time):
                             continue
                         ovl_mult = self._calendar_overlay_multiplier(
@@ -1459,6 +1531,9 @@ class MultiStrategyBacktester:
                     sentiment_score=sentiment,
                 )
                 if decision is not None and decision.shares > 0:
+                    # SPY-intraday mode is long-only; skip short decisions.
+                    if decision.direction != "long":
+                        continue
                     if self._calendar_overlay_blocks(decision, bar_dt):
                         continue
                     ovl_mult = self._calendar_overlay_multiplier(decision, bar_dt)
@@ -1706,7 +1781,7 @@ class MultiStrategyBacktester:
             day_start_equity: dict[str, float] = {}
             for sid, st in states.items():
                 pos_value = sum(
-                    t.entry_price * t.shares for t in st.open_positions
+                    self._mark_value(t, t.entry_price) for t in st.open_positions
                 )
                 day_start_equity[sid] = st.cash_usd + pos_value
 
@@ -1784,6 +1859,9 @@ class MultiStrategyBacktester:
                         sentiment_score=sentiment,
                     )
                     if decision is None or decision.shares <= 0:
+                        continue
+                    # SPY-intraday mode is long-only; skip short decisions.
+                    if decision.direction != "long":
                         continue
 
                     if self._calendar_overlay_blocks(decision, bar_dt):
