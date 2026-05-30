@@ -470,7 +470,24 @@ class TradingBot:
                 if ranked:
                     self._active_watchlist[Market.US] = ranked
 
-            # --- 12. Entry scan ---
+            # --- 12. Exit check (always) — MUST run before the entry scan ---
+            # Exits are processed first so a closing position frees broker
+            # state (and, once the exit fills, cash) before new entries are
+            # evaluated within the same multi-strategy contract. Concretely:
+            # ``overnight_drift`` sells its long at the open before
+            # ``gap_fill`` evaluates a short on the same ticker at 09:35
+            # (ai-broker#48). Caveat: Alpaca exit fills are asynchronous —
+            # detected by the step-6 order-status poll on a *later* tick —
+            # so this ordering guarantees exit decisions are issued before
+            # entry decisions, not that freed buying power is visible to
+            # entries within the same tick. The next tick's fresh equity
+            # fetch reflects the filled exit.
+            try:
+                await self.check_exits()
+            except Exception:
+                logger.exception("Exit check failed")
+
+            # --- 13. Entry scan (execution window only) ---
             if (
                 self._is_market_in_execution(Market.US)
                 and self._mode != "close-only"
@@ -479,12 +496,6 @@ class TradingBot:
                     await self.scan_for_entries(Market.US)
                 except Exception:
                     logger.exception("Entry scan failed")
-
-            # --- 13. Exit check (always) ---
-            try:
-                await self.check_exits()
-            except Exception:
-                logger.exception("Exit check failed")
 
             # --- 14. Wind-down (once per day within wind-down window) ---
             if (
