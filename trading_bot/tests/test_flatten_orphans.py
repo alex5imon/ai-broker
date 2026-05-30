@@ -9,18 +9,24 @@ and TIF selection from clock state.
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
 
 import pytest
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+from trading_bot.db import repository as repo
 from trading_bot.self_improve.flatten_orphans import (
+    _HALT_FLAGS,
+    _RISK_STATE_KEY,
     OrphanPlan,
+    _active_halts,
     _build_plan,
     _choose_tif,
     _execute_bulk,
     _find_db_position,
+    plan_and_execute,
 )
 
 
