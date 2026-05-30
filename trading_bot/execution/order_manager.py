@@ -110,6 +110,29 @@ def _coerce_broker_qty(value: Any) -> float | None:
 ExitFillCallback = Callable[[str, str, float, float], None]
 
 
+def _signed_pnl(
+    entry_price: float,
+    exit_price: float,
+    qty: float,
+    side: str,
+) -> float:
+    """Return realised P&L for a closed position.
+
+    For a long (``side == "BUY"``) profit accrues when ``exit > entry``.
+    For a short (``side == "SELL"``) profit accrues when ``exit < entry``
+    because the position was sold high and bought back lower.
+
+    All current strategies are long-only so the short branch is currently
+    untested by a production code path, but the formula is covered by
+    unit tests (``test_order_manager_pnl_sign``) and will be exercised
+    automatically once a short-side strategy lands (issue #126).
+    """
+    if side == "BUY":
+        return (exit_price - entry_price) * qty
+    # side == "SELL" (short): profit when exit_price < entry_price
+    return (entry_price - exit_price) * qty
+
+
 # ---------------------------------------------------------------------------
 # Decision dataclass — passed in from the strategy layer
 # ---------------------------------------------------------------------------
@@ -167,6 +190,7 @@ class _ActiveOrder:
     alpaca_exit_order_id: str | None = None
     exit_reason: str | None = None
     status: PositionStatus = PositionStatus.ENTRY_PENDING
+    side: str = "BUY"          # "BUY" (long) or "SELL" (short); mirrors positions.side
     entry_shares: float = 0.0  # float to support fractional shares
     filled_shares: float = 0.0
     entry_price: float = 0.0
@@ -320,6 +344,7 @@ class OrderManager:
                 alpaca_exit_order_id=exit_oid,
                 exit_reason=exit_reason_persisted,
                 status=status,
+                side=str(row["side"]) if row["side"] else "BUY",
                 entry_shares=float(row["quantity"] or 0),
                 filled_shares=float(row["quantity"] or 0)
                 if status != PositionStatus.ENTRY_PENDING
@@ -518,7 +543,10 @@ class OrderManager:
                             await self._close_position(
                                 trade_id, active, exit_price, exit_reason.value,
                             )
-                            pnl: float = (exit_price - active.entry_price) * active.filled_shares
+                            pnl: float = _signed_pnl(
+                                active.entry_price, exit_price,
+                                active.filled_shares, active.side,
+                            )
                             await self._notifier.position_closed(
                                 ticker=active.ticker, pnl=pnl,
                                 hold_time="", exit_reason=exit_reason.value,
@@ -635,9 +663,9 @@ class OrderManager:
                             trade_id, active, stop_exit_price,
                             ExitReason.STOP_LOSS.value,
                         )
-                        stop_pnl: float = (
-                            (stop_exit_price - active.entry_price)
-                            * active.filled_shares
+                        stop_pnl: float = _signed_pnl(
+                            active.entry_price, stop_exit_price,
+                            active.filled_shares, active.side,
                         )
                         await self._notifier.position_closed(
                             ticker=active.ticker, pnl=stop_pnl,
@@ -735,8 +763,9 @@ class OrderManager:
                             trade_id, active, exit_px, reason_str,
                             filled_qty=filled_exit_qty,
                         )
-                        pnl_strategy: float = (
-                            (exit_px - active.entry_price) * filled_exit_qty
+                        pnl_strategy: float = _signed_pnl(
+                            active.entry_price, exit_px,
+                            filled_exit_qty, active.side,
                         )
                         await self._notifier.position_closed(
                             ticker=active.ticker, pnl=pnl_strategy,
@@ -854,6 +883,7 @@ class OrderManager:
                 exchange=decision.exchange,
                 alpaca_entry_order_id=alpaca_order_id,
                 status=PositionStatus.ENTRY_PENDING,
+                side=decision.side,
                 entry_shares=decision.shares,
                 entry_price=decision.limit_price,
                 stop_price=decision.stop_price,
@@ -1912,7 +1942,9 @@ class OrderManager:
             filled_qty if filled_qty is not None and filled_qty > 0
             else active.filled_shares
         )
-        gross_pnl: float = (exit_price - active.entry_price) * qty_for_pnl
+        gross_pnl: float = _signed_pnl(
+            active.entry_price, exit_price, qty_for_pnl, active.side,
+        )
 
         # B3: target the trades row by trades.id, not positions.id. The two
         # tables have independent autoincrements; pre-fix this UPDATE
@@ -1992,15 +2024,16 @@ class OrderManager:
                 # row without its matching trades audit row.
                 cursor = conn.execute(
                     "INSERT INTO positions "
-                    "(ticker, exchange, currency, sector, quantity, entry_price, "
+                    "(ticker, exchange, currency, sector, side, quantity, entry_price, "
                     " entry_time, status, stop_price, target_price, hold_type, "
                     " phase, strategy_id, highest_price, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         decision.ticker,
                         decision.exchange,
                         decision.currency,
                         decision.sector,
+                        decision.side,
                         decision.shares,
                         decision.limit_price,
                         now_str,

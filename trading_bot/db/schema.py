@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS positions (
     exchange        TEXT NOT NULL,
     currency        TEXT NOT NULL,
     sector          TEXT,
+    side            TEXT NOT NULL DEFAULT 'BUY',
     quantity        INTEGER NOT NULL,
     entry_price     REAL NOT NULL,
     entry_time      TEXT NOT NULL,
