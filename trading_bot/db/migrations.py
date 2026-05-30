@@ -581,6 +581,29 @@ def _migration_v15(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_v16(conn: sqlite3.Connection) -> None:
+    """V16: add ``positions.side`` for correct short-position P&L sign (issue #126).
+
+    All existing positions are long-only (side='BUY') so the DEFAULT 'BUY'
+    backfill is correct for every live row. The column is needed by
+    ``OrderManager._hydrate_active_orders`` so a restarted tick can rehydrate
+    ``_ActiveOrder.side`` and compute P&L with the correct sign when a
+    short-side strategy eventually lands.
+    """
+    rows = conn.execute("PRAGMA table_info(positions)").fetchall()
+    if not any(r[1] == "side" for r in rows):
+        conn.execute(
+            "ALTER TABLE positions ADD COLUMN side TEXT NOT NULL DEFAULT 'BUY'"
+        )
+
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_version (version, description) "
+        "VALUES (16, "
+        "'V16 schema - positions.side for correct short P&L sign (issue #126)')"
+    )
+    logger.info("Applied migration V16: positions.side column added")
+
+
 _MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (4, "V4 schema - multi-market adaptive trading bot", _migration_v4),
     (5, "V5 schema - multi-strategy Alpaca trading bot", _migration_v5),
@@ -599,6 +622,8 @@ _MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
      _migration_v14),
     (15, "V15 schema - dedupe phantom backfill rows shadowing live closes",
      _migration_v15),
+    (16, "V16 schema - positions.side for correct short P&L sign (issue #126)",
+     _migration_v16),
 ]
 
 
