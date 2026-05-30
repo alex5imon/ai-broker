@@ -829,18 +829,25 @@ class TradingBot:
                 logger.warning("%s: exit triggered but qty=0 — skipping", ticker)
                 continue
 
+            # A short (side='SELL') covers with a BUY; thread the side into
+            # the emergency_flatten fallbacks. place_limit_exit derives it
+            # itself from the matching in-memory order.
+            position_side: str = str(position.get("side", "BUY"))
+
             if self._dry_run:
                 logger.info(
-                    "[DRY RUN] Would exit: SELL %.6f %s @ %.4f (reason=%s)",
-                    qty, ticker, current_price, exit_decision.reason,
+                    "[DRY RUN] Would exit: %.6f %s @ %.4f (reason=%s, side=%s)",
+                    qty, ticker, current_price, exit_decision.reason, position_side,
                 )
                 continue
 
             if exit_decision.use_market_order or force_market_exit:
                 # Market exit: cancel ALL ticker orders first so Alpaca
-                # releases held_for_orders qty before the IOC sell.
+                # releases held_for_orders qty before the IOC flatten.
                 await self._order_manager.cancel_all_for_ticker(ticker)
-                await self._order_manager.emergency_flatten(ticker, qty, exchange)
+                await self._order_manager.emergency_flatten(
+                    ticker, qty, exchange, position_side=position_side,
+                )
                 self._clear_spread_defer(ticker)
             else:
                 # Limit sell at mid-price. place_limit_exit cancels just
@@ -889,7 +896,9 @@ class TradingBot:
                         "Limit exit failed for %s — falling back to market", ticker,
                     )
                     await self._order_manager.cancel_all_for_ticker(ticker)
-                    await self._order_manager.emergency_flatten(ticker, qty, exchange)
+                    await self._order_manager.emergency_flatten(
+                        ticker, qty, exchange, position_side=position_side,
+                    )
                 self._clear_spread_defer(ticker)
 
     # ------------------------------------------------------------------
@@ -993,6 +1002,10 @@ class TradingBot:
             if qty <= 0.0:
                 continue
 
+            # Short intraday positions cover with a BUY; thread side into
+            # the emergency_flatten fallbacks (place_limit_exit derives it).
+            position_side: str = str(position.get("side", "BUY"))
+
             logger.info(
                 "Wind-down: closing intraday %s (%.6f shares) for %s market",
                 ticker, qty, market.value,
@@ -1022,7 +1035,9 @@ class TradingBot:
                     "%s: no price for wind-down — using emergency market flatten",
                     ticker,
                 )
-                await self._order_manager.emergency_flatten(ticker, qty, exchange)
+                await self._order_manager.emergency_flatten(
+                    ticker, qty, exchange, position_side=position_side,
+                )
                 continue
 
             # Tick-model wind-down: place a DAY limit sell via OrderManager
@@ -1041,7 +1056,9 @@ class TradingBot:
                     "Wind-down limit failed for %s — falling back to market",
                     ticker,
                 )
-                await self._order_manager.emergency_flatten(ticker, qty, exchange)
+                await self._order_manager.emergency_flatten(
+                    ticker, qty, exchange, position_side=position_side,
+                )
 
         logger.info("Wind-down complete for %s", market.value)
 
