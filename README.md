@@ -69,13 +69,20 @@ Live watchlist (Phase 1): SPY + QQQ + the 11 SPDR sector ETFs (XLK, XLF,
 XLV, XLY, XLP, XLE, XLI, XLB, XLU, XLRE, XLC) — pure ETFs only, to avoid
 earnings-gap risk.
 
+Status reflects `config.yaml` as of 2026-05-31. Three sleeves carry live
+capital; the rest are shelved with their backtest evidence recorded in
+`trading_bot/docs/` and the project memory.
+
 | Sleeve | Status | Allocation | Max Positions | Edge |
 |---|---|---|---|---|
-| **Mean Reversion** | Primary (validated) | $1,500 | 3 | RSI(14) oversold bounce on liquid ETFs with VIX-adaptive thresholds, ATR stops/targets, let-winners-run trailing. PF 1.54 on 13y SPY 5-min. |
-| **Breakout** | Active | $1,500 | 1 | 20-day high breakout with volume confirmation; exit at 10-day low or fixed stop. Highest PF (2.94) sleeve in the 13y SPY backtest. |
-| **Overnight Drift** | Active | $1,000 | 1 | Buy on the last 5-min bar of the session, sell on the first bar of the next session. Captures the overnight equity premium with a 3% disaster stop. |
-| **Trend Following** | Deprioritized | $1,000 | 1 | EMA 9/21 crossover + SMA(50) trend filter + volume. Retained for backtest comparisons; not intended for live capital. |
-| **Sentiment Combo** | Disabled | $0 | — | Finnhub sentiment + technical signal. Disabled 2026-04-24 after two tuning iterations failed to find an edge on ETFs. |
+| **Mean Reversion** | Active (validated) | $2,500 | 3 | RSI(14) oversold bounce on liquid ETFs with VIX-adaptive thresholds, ATR stops/targets, let-winners-run trailing. PF 1.54 on 13y SPY 5-min. |
+| **Overnight Drift** | Active | $2,500 | 3 | Buy on the last 5-min bar of the session, sell on the first bar of the next session. Captures the overnight equity premium with a 3% disaster stop. |
+| **Opening Range Breakout** | Active (paper) | $1,000 | 3 | Breakout above the first 30-min (6×5-min) range high; 2R target, stop at range low. Cleared the regime-matched walkforward (PF 1.18, CI ≥ 1.06) and was enabled on paper 2026-05-29 (#167). |
+| **Breakout** | Shelved | $0 | 1 | 20-day high breakout with volume confirmation. Mixed a daily signal with 5-min execution; 2026-05-02 retune failed acceptance. Superseded by Opening Range Breakout. |
+| **Trend Following** | Shelved | $0 | 1 | EMA 9/21 crossover + SMA(50) trend filter + volume. 2026-05-02 retune failed walkforward; retained for backtest comparisons only. |
+| **Sentiment Combo** | Disabled | $0 | 2 | Finnhub sentiment + technical signal. Disabled 2026-04-24 after two tuning iterations failed to find an edge on ETFs. |
+| **Cross-Sectional Momentum** | Shelved | $0 | 3 | Ranks the 11 SPDR sector ETFs by trailing total return, holds the top N monthly. A/B (#44) missed the Sharpe bar; ships disabled. |
+| **Opening Gap Fill** | Shelved | $0 | 3 | Fades large overnight gaps on the 09:35 bar, targets the prior close (long+short). A/B (#48) failed — PF 0.73, negative-skew payoff (gaps continue rather than fill). See `trading_bot/docs/gap_fill/`. |
 
 Shared portfolio-level filters apply on top of each sleeve: market regime
 filter (no new entries when SPY is below its 50-day SMA), ATR-percentile
