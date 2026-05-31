@@ -574,7 +574,10 @@ class MultiStrategyBacktester:
 
                     # --- Check entries (execution window only) ---
                     if us_exec_start <= bar_time <= us_exec_end:
-                        if bar_idx < 10:
+                        # Per-strategy intraday warm-up. Default 10 bars for
+                        # indicator-based sleeves; open-driven sleeves
+                        # (gap_fill) relax it to fire early in the session.
+                        if bar_idx < strat.min_warmup_bars():
                             continue
                         already_in = any(
                             t.ticker == ticker for t in st.open_positions

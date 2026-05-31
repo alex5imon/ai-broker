@@ -16,6 +16,7 @@ from trading_bot.strategy.strategies.opening_range_breakout import (
 from trading_bot.strategy.strategies.cross_sectional_momentum import (
     CrossSectionalMomentumStrategy,
 )
+from trading_bot.strategy.strategies.gap_fill import GapFillStrategy
 
 STRATEGY_REGISTRY: dict[str, type[StrategyBase]] = {
     "mean_reversion": MeanReversionStrategy,
@@ -25,6 +26,7 @@ STRATEGY_REGISTRY: dict[str, type[StrategyBase]] = {
     "overnight_drift": OvernightDriftStrategy,
     "opening_range_breakout": OpeningRangeBreakoutStrategy,
     "cross_sectional_momentum": CrossSectionalMomentumStrategy,
+    "gap_fill": GapFillStrategy,
 }
 
 

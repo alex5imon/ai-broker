@@ -850,3 +850,52 @@ multi_strategy:
       disaster_stop_pct: 0.15
       fractional_shares: true
       position_pct: 0.95
+
+    # Opening gap-fill (sleeve #9, issue #48).
+    # Fades large overnight gaps in the 13-ETF basket on the session's first
+    # 5-min bar and targets the prior (adjusted) close. Gap up → short, gap
+    # down → long. Short holding period (< ~4h, 14:00 ET time stop) → low
+    # correlation with the RSI-dip mean_reversion and the overnight_drift
+    # sleeves.
+    #
+    # SHIPPED DISABLED. Requires BOTH A/Bs to pass before enabling (separate
+    # PR): a standalone regime-matched walkforward A/B (PF >= 1.10 with CI
+    # lower >= 1.00, OOS positive in >= 4/6 windows, WR >= 55%, Sharpe >= 0.40
+    # with positive lower CI, MaxDD <= 10%, >= 150 trades, daily-return corr
+    # vs existing sleeves < 0.30) AND a combined-portfolio A/B
+    # (mean_reversion + overnight_drift + gap_fill) whose Sharpe must improve
+    # vs the mean_reversion + overnight_drift baseline.
+    #
+    # Live shorting requires the order path landed in #175/#177/#178; a paper
+    # short smoke test gates the eventual enablement PR.
+    gap_fill:
+      enabled: false
+      allocation_usd: 0.0
+      max_positions: 3
+      universe:
+        - "SPY"
+        - "QQQ"
+        - "XLF"
+        - "XLK"
+        - "XLE"
+        - "XLV"
+        - "XLI"
+        - "XLY"
+        - "XLP"
+        - "XLU"
+        - "XLB"
+        - "XLRE"
+        - "XLC"
+      # Latest acceptable label-time for the session's first 5-min bar. The
+      # open bar is left-labelled 09:30 (covers 09:30–09:34:59); entry fills
+      # at its close (~09:35). A later first bar (halt/late open) is skipped.
+      entry_time_et: "09:35"
+      time_stop_et: "14:00"
+      min_gap_pct: 0.005             # absolute gap-threshold floor
+      gap_atr_multiplier: 0.5        # adaptive: gap must exceed 0.5 × overnight ATR%
+      overnight_atr_period: 14
+      stop_atr_multiplier: 1.5
+      stop_pct_floor: 0.008          # minimum stop distance (prevents tiny-ATR size blow-up)
+      risk_per_trade_pct: 0.005      # 0.5% equity risked per trade
+      max_position_pct: 0.33
+      fractional_shares: true
