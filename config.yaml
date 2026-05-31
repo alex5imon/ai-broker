@@ -858,16 +858,18 @@ multi_strategy:
     # correlation with the RSI-dip mean_reversion and the overnight_drift
     # sleeves.
     #
-    # SHIPPED DISABLED. Requires BOTH A/Bs to pass before enabling (separate
-    # PR): a standalone regime-matched walkforward A/B (PF >= 1.10 with CI
-    # lower >= 1.00, OOS positive in >= 4/6 windows, WR >= 55%, Sharpe >= 0.40
-    # with positive lower CI, MaxDD <= 10%, >= 150 trades, daily-return corr
-    # vs existing sleeves < 0.30) AND a combined-portfolio A/B
-    # (mean_reversion + overnight_drift + gap_fill) whose Sharpe must improve
-    # vs the mean_reversion + overnight_drift baseline.
-    #
-    # Live shorting requires the order path landed in #175/#177/#178; a paper
-    # short smoke test gates the eventual enablement PR.
+    # SHIPPED DISABLED — and STAYS disabled: the standalone A/B FAILED.
+    # 2020-07-27 → 2026-04-16, 13 ETFs (default `run` harness, which honours
+    # the sleeve's own direction/stops; --multi-intraday is long-only + ATR-
+    # stop-overriding so it can't test this sleeve):
+    #   1,985 trades, WR 44.8%, Return -19.31%, MaxDD 20.2%, PF 0.73,
+    #   Sharpe -1.35 — misses every bar except trade count.
+    # The gap-fill base rate held (66% hit take-profit) but the payoff is
+    # negative-skew: tiny target wins (eroded by slippage on <0.5% targets)
+    # vs large 14:00 time-stop losses from gap CONTINUATION in a trend-heavy
+    # window. Combined A/B not run (a -19% sleeve can't lift a portfolio).
+    # Full writeup + follow-up hypotheses (regime conditioning, wider edge,
+    # gap-and-go inverse): trading_bot/docs/gap_fill/2026-05-31_ab_report.md
     gap_fill:
       enabled: false
       allocation_usd: 0.0
