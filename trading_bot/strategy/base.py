@@ -124,6 +124,18 @@ class StrategyBase(ABC):
     def get_max_positions(self) -> int:
         """Max concurrent positions for this strategy."""
 
+    def min_warmup_bars(self) -> int:
+        """Minimum intraday 5-min bars before the backtester evaluates entries.
+
+        The intraday backtester skips entries on a ticker until this many
+        bars of the session have elapsed, so indicator-based sleeves (RSI,
+        opening range, etc.) have enough warm-up. Default 10 preserves the
+        historical behaviour for every existing sleeve. Open-driven sleeves
+        that key off the session open + daily history (gap_fill) override to
+        a smaller value so their early-session entry isn't suppressed.
+        """
+        return 10
+
     def _compute_shares(
         self,
         price: float,
