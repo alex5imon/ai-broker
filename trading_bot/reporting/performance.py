@@ -69,11 +69,19 @@ class PerformanceCalculator:
         """
         conn: sqlite3.Connection = self._connect()
         try:
+            # Exclude terminal non-trade markers: 'void_no_fill' (phantom
+            # round-trips the reconciler closed that were never really held)
+            # and 'unresolved_exit' (entry filled but exit fill unrecoverable,
+            # awaiting human review). Counting either would inflate
+            # total_trades with positions that realized no attributable P&L.
+            # See self_improve/resolve_reconciliation_mismatch.py.
             trades_rows = conn.execute(
                 """
                 SELECT * FROM trades
                 WHERE substr(exit_time, 1, 10) = ?
                   AND exit_time IS NOT NULL
+                  AND (exit_reason IS NULL
+                       OR exit_reason NOT IN ('void_no_fill', 'unresolved_exit'))
                 ORDER BY exit_time
                 """,
                 (date,),
