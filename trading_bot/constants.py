@@ -96,6 +96,11 @@ class ExitReason(str, Enum):
     MANUAL = "manual"
     RECONCILIATION_MISMATCH = "reconciliation_mismatch"
     PHASE0_CLEANUP = "phase0_cleanup"
+    # Terminal states for reconciliation_mismatch rows the nightly backfill
+    # can never pair with a real Alpaca fill (see
+    # self_improve/resolve_reconciliation_mismatch.py).
+    VOID_NO_FILL = "void_no_fill"  # phantom round-trip, never held -> P&L = 0
+    UNRESOLVED_EXIT = "unresolved_exit"  # entry filled, exit fill missing -> human
 
 
 # ---------------------------------------------------------------------------

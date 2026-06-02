@@ -96,6 +96,27 @@ jobs:
         continue-on-error: true
         run: python -m trading_bot.self_improve.backfill_cli
 
+      - name: Resolve un-backfillable reconciliation_mismatch rows
+        # Runs AFTER the backfill so it only sees rows the backfill could not
+        # pair with a real Alpaca fill. These are phantom round-trips (positions
+        # never actually held at the broker) that would otherwise stay
+        # exit_price=NULL forever, retried every night, inflating total_trades
+        # and corrupting per-strategy P&L. Phantoms (entry never confirmed
+        # filled) are voided to $0; genuinely-orphaned exits (entry filled, exit
+        # fill missing) are flagged via ntfy for human review — never voided.
+        # Only touches rows >= 2 days old, so today's mismatches self-heal
+        # through the backfill first and are never voided prematurely.
+        env:
+          ALPACA_ENV: ${{ vars.ALPACA_ENV || 'paper' }}
+          ALPACA_PAPER_KEY_ID: ${{ secrets.ALPACA_PAPER_KEY_ID }}
+          ALPACA_PAPER_SECRET: ${{ secrets.ALPACA_PAPER_SECRET }}
+          ALPACA_LIVE_KEY_ID: ${{ secrets.ALPACA_LIVE_KEY_ID }}
+          ALPACA_LIVE_SECRET: ${{ secrets.ALPACA_LIVE_SECRET }}
+          BOT_LOG_DIR: logs
+        # Continue on error: a failed resolve must not block the report.
+        continue-on-error: true
+        run: python -m trading_bot.self_improve.resolve_cli
+
       - name: Recompute daily_summaries from backfilled trades
         # The live wind-down writes daily_summaries ~16:10 ET, before this
         # backfill runs at 21:30 UTC. Without a recompute, daily_summaries
