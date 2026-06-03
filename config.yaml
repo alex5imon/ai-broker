@@ -780,7 +780,11 @@ multi_strategy:
     # any scale-up. Conservative $1k allocation to start (others run $2.5k);
     # raise to 2500 after paper trades confirm clean execution.
     opening_range_breakout:
-      enabled: true
+      enabled: false               # SHELVED 2026-06-03 (#186): recent regime-matched
+                                   # walkforward fails — PF 0.907, OOS -1.37%, Sharpe -0.036,
+                                   # PF CI [0.648, 1.231]. 5.7y in-sample edge was front-loaded
+                                   # 2020-2022. Re-evaluate only on a regime shift.
+                                   # See trading_bot/docs/research/orb_exit_mismatch_2026-06-03.md
       allocation_usd: 1000.0       # conservative start; scale to 2500 after paper-confirm
       max_positions: 3
       range_bars: 6                # 6 × 5min = 30-min opening range
