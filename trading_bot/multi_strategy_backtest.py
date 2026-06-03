@@ -400,6 +400,52 @@ class MultiStrategyBacktester:
         return stop_price, target_price, trail_pct, activation_pct
 
     @staticmethod
+    def _resolve_intraday_exits(
+        decision: Any,
+        fill_price: float,
+        atr_stop: float,
+        atr_target: float,
+        atr_trail: float,
+        atr_activation: float,
+        honor: bool,
+    ) -> tuple[float, float | None, float | None, float]:
+        """Resolve (stop, target, trail_pct, activation_pct) for an entry.
+
+        ``honor=True`` uses the strategy's own ``stop_price`` / ``target_price``
+        / ``trail_pct`` (the exits that ship live), falling back to the ATR
+        value only where the strategy left a field unset (None / non-positive).
+        ``honor=False`` applies the historical ATR override, preserving the
+        let-winners-run path (``decision.target_price is None`` → no fixed
+        target, ride the trail). When the effective target is None the trail
+        activation is derived from the ATR target distance.
+        """
+        if honor:
+            stop: float = (
+                decision.stop_price
+                if (decision.stop_price or 0.0) > 0.0
+                else atr_stop
+            )
+            target: float | None = decision.target_price
+            trail: float | None = (
+                decision.trail_pct
+                if decision.trail_pct is not None
+                else atr_trail
+            )
+        else:
+            stop = atr_stop
+            trail = atr_trail
+            target = None if decision.target_price is None else atr_target
+
+        if target is None:
+            activation = (
+                max((atr_target - fill_price) / fill_price, 0.0)
+                if fill_price > 0 else atr_activation
+            )
+        else:
+            activation = atr_activation
+        return stop, target, trail, activation
+
+    @staticmethod
     def _has_excessive_gaps(df: pd.DataFrame, atr: float | None, max_gap_atr: float = 1.5) -> bool:
         """Check if a ticker has average overnight gaps exceeding max_gap_atr × ATR.
 
@@ -1656,8 +1702,15 @@ class MultiStrategyBacktester:
         regime_filter: bool = True,
         regime_ticker: str = "SPY",
         regime_sma_period: int | None = None,
+        honor_strategy_exits: bool = False,
     ) -> MultiStrategyResult:
         """Run strategies on 5-min bars across multiple tickers.
+
+        ``honor_strategy_exits``: when True, use each ``StrategyDecision``'s own
+        ``stop_price`` / ``target_price`` / ``trail_pct`` (the exits that ship
+        live) instead of the ATR override, falling back to ATR only for fields
+        the strategy leaves unset. Lets a sleeve's live exit config be A/B'd
+        faithfully (default False preserves the historical ATR behaviour).
 
         Loads 1-min bars from the parquet cache per (ticker, day), resamples
         to 5-min, and walks bars chronologically. Same intrabar stop execution
@@ -1878,22 +1931,27 @@ class MultiStrategyBacktester:
                         fill_price, df_slice, strat.strategy_id,
                     )
 
-                    # Honour "let winners run" signal (decision.target_price=None)
-                    if decision.target_price is None:
-                        effective_target: float | None = None
-                        effective_activation_pct = max(
-                            (atr_target - fill_price) / fill_price, 0.0
-                        ) if fill_price > 0 else atr_activation
-                    else:
-                        effective_target = atr_target
-                        effective_activation_pct = atr_activation
+                    # honor_strategy_exits=True tests the sleeve's live exit
+                    # config (its own stop/target/trail); False keeps the
+                    # historical ATR override. See
+                    # docs/research/orb_exit_mismatch_2026-06-03.md.
+                    (
+                        effective_stop,
+                        effective_target,
+                        effective_trail,
+                        effective_activation_pct,
+                    ) = self._resolve_intraday_exits(
+                        decision, fill_price,
+                        atr_stop, atr_target, atr_trail, atr_activation,
+                        honor_strategy_exits,
+                    )
 
                     equity = st.cash_usd + sum(
                         t.entry_price * t.shares for t in st.open_positions
                     )
                     vt = self._compute_vol_multiplier(st)
                     shares = self._size_by_risk(
-                        fill_price, atr_stop, equity,
+                        fill_price, effective_stop, equity,
                         risk_per_trade_pct=0.02,
                         max_position_pct=0.40,
                         fractional=True,
@@ -1917,9 +1975,9 @@ class MultiStrategyBacktester:
                         entry_time=bar_dt,
                         entry_price=fill_price,
                         shares=shares,
-                        stop_price=atr_stop,
+                        stop_price=effective_stop,
                         target_price=effective_target,
-                        trail_pct=atr_trail,
+                        trail_pct=effective_trail,
                         signals={**decision.signals, "atr_stop": atr_stop},
                         hold_type=decision.hold_type.value,
                         sentiment_score=decision.sentiment_score,
@@ -2275,6 +2333,12 @@ async def main() -> None:
         "--daily", action="store_true",
         help="Use S&P 500 daily CSV data instead of Alpaca intraday bars",
     )
+    parser.add_argument(
+        "--honor-strategy-exits", action="store_true",
+        help="(multi-intraday) Use each strategy's own stop/target/trail "
+             "instead of the ATR override, so a sleeve's live exit config is "
+             "tested faithfully. Falls back to ATR for unset fields.",
+    )
     parser.add_argument("--min-volume", type=int, default=1_000_000, help="Min avg daily volume filter (daily mode)")
     parser.add_argument("--min-price", type=float, default=5.0, help="Min avg price filter (daily mode)")
     parser.add_argument("--max-price", type=float, default=500.0, help="Max avg price filter (daily mode)")
@@ -2380,6 +2444,7 @@ async def main() -> None:
                 tickers=ticker_list,
                 cash_per_strategy_usd=args.cash,
                 regime_filter=not args.no_regime_filter,
+                honor_strategy_exits=args.honor_strategy_exits,
             )
         if args.spy:
             return await window_engine.run_spy_intraday(
