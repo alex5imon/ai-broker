@@ -722,6 +722,50 @@ class OrderManager:
                 else:
                     await self._recover_missing_stop(trade_id, active)
 
+            # Watchdog: a position wedged in CLOSING with NO exit order in
+            # flight (alpaca_exit_order_id is None) is unrecoverable through
+            # the normal paths — place_exit / drain_disabled_sleeves refuse to
+            # act on a CLOSING row ("exit already in flight"), and the CLOSING
+            # fill-poll below requires an exit order id to advance. This state
+            # arises when a market flatten is submitted after the close and
+            # canceled without persisting its id (emergency_flatten is
+            # fire-and-forget), or when a tick dies between the canceled-exit
+            # rollback and the re-drive. The row then sits CLOSING + held
+            # indefinitely (XLI #147 sat 2 days, 2026-06-01 wind-down). If the
+            # broker still holds the shares, roll back to STOP_ACTIVE so the
+            # exit/drain path re-drives a proper RTH flatten next tick (the
+            # protective stop is re-attached by the block above). If the broker
+            # no longer holds it, the exit already happened — leave it for the
+            # strategy-exit / StateRecovery close path. Guard on a positive
+            # broker qty so a transient lookup failure (returns None) never
+            # rolls back a position that is genuinely mid-close.
+            if (
+                active.status == PositionStatus.CLOSING
+                and active.alpaca_exit_order_id is None
+                and active.filled_shares > 0
+            ):
+                held_qty: float | None = await self._broker_held_qty(active.ticker)
+                if held_qty is not None and held_qty > 1e-6:
+                    logger.warning(
+                        "Position %s (trade_id=%d) wedged in CLOSING with no "
+                        "exit order in flight but %.6f still held at broker — "
+                        "rolling back to STOP_ACTIVE so the exit path re-drives.",
+                        active.ticker, trade_id, held_qty,
+                    )
+                    active.status = PositionStatus.STOP_ACTIVE
+                    self._update_position_status(
+                        trade_id, PositionStatus.STOP_ACTIVE,
+                    )
+                    await self._notifier.send(
+                        "Unwedged stuck CLOSING position",
+                        f"{active.ticker} was stuck in CLOSING with no exit "
+                        f"order in flight ({held_qty:.4f} held); rolled back "
+                        f"to STOP_ACTIVE for re-exit.",
+                        priority=4,
+                        tags=["warning"],
+                    )
+                    continue
+
             # Strategy-driven exit (place_exit / place_limit_exit). Without
             # this branch the row stays CLOSING until the next tick's
             # StateRecovery reconciles it as 'reconciliation_mismatch',
