@@ -39,6 +39,7 @@ from trading_bot.data.market_data import MarketDataManager
 from trading_bot.data.sentiment import SentimentAnalyzer
 from trading_bot.db import repository as repo
 from trading_bot.db.migrations import run_migrations
+from trading_bot.execution.invariant_guard import run_invariant_guard
 from trading_bot.execution.loss_cooldown import LossCooldownConfig, LossCooldownTracker
 from trading_bot.execution.order_manager import OrderManager
 from trading_bot.execution.risk_manager import RiskManager
@@ -360,6 +361,25 @@ class TradingBot:
             except Exception:
                 logger.warning(
                     "Naked-position reconciliation failed (non-fatal)",
+                    exc_info=True,
+                )
+
+            # --- 6c. Broker-truth invariant guard (Phase 0, observer-only) ---
+            # The reconciliation-loop design's Phase 0 (PR #191): one
+            # assertion per DB<->broker drift mode (naked / wedge / orphan /
+            # unknown), escalating only when a divergence persists > 1 tick.
+            # Catches the lifecycle bug class AS A CLASS. Takes no action —
+            # the healers above/below do the repair; this is early-warning
+            # and evidence-gathering before later phases drive behaviour.
+            try:
+                await run_invariant_guard(
+                    db_path=self._db_path,
+                    gateway=self._gateway,
+                    notifier=self._notifier,
+                )
+            except Exception:
+                logger.warning(
+                    "Invariant guard failed (non-fatal)",
                     exc_info=True,
                 )
 
