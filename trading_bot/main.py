@@ -42,6 +42,7 @@ from trading_bot.db.migrations import run_migrations
 from trading_bot.execution.invariant_guard import run_invariant_guard
 from trading_bot.execution.loss_cooldown import LossCooldownConfig, LossCooldownTracker
 from trading_bot.execution.order_manager import OrderManager
+from trading_bot.execution.reconciler import run_shadow_reconcile
 from trading_bot.execution.risk_manager import RiskManager
 from trading_bot.execution.stop_reconciler import reconcile_open_position_stops
 from trading_bot.gateway.connection import GatewayConnection
@@ -380,6 +381,24 @@ class TradingBot:
             except Exception:
                 logger.warning(
                     "Invariant guard failed (non-fatal)",
+                    exc_info=True,
+                )
+
+            # --- 6d. Shadow reconciler (Phase 1, read-only) ---
+            # The reconciliation-loop design's Phase 1 (PR #191): derive each
+            # position's desired state from broker truth (the §3 table) and
+            # log where the derivation disagrees with the live SQLite state
+            # machine. Validates the reconciler's brain against reality before
+            # Phase 2 lets it own the status column. Observe-only — no action,
+            # no paging (Phase 0's guard owns alerting).
+            try:
+                await run_shadow_reconcile(
+                    db_path=self._db_path,
+                    gateway=self._gateway,
+                )
+            except Exception:
+                logger.warning(
+                    "Shadow reconcile failed (non-fatal)",
                     exc_info=True,
                 )
 
