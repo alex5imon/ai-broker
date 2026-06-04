@@ -41,10 +41,11 @@ import asyncio
 import logging
 import sqlite3
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
-from trading_bot.constants import PositionStatus
+from trading_bot.constants import TZ_EASTERN, PositionStatus
 from trading_bot.execution.invariant_guard import BrokerView
 
 if TYPE_CHECKING:
@@ -472,11 +473,119 @@ async def broker_snapshot(gateway: GatewayConnection) -> BrokerView:
     return BrokerView.from_alpaca(positions, orders)
 
 
+# ---------------------------------------------------------------------------
+# Shadow evidence journal — persists per-day disagreement tallies so the
+# operator can make the Phase 2b "flip drive on" decision on DATA rather than
+# scrollback. This is the §5 gate's evidence ("run ~1 week to quantify how
+# often each divergence fires"). Stored in tick_state (no schema migration);
+# read it via load_shadow_evidence / surface it in the daily review.
+# ---------------------------------------------------------------------------
+
+_SHADOW_EVIDENCE_KEY: str = "__reconcile_shadow__"
+_EVIDENCE_RETENTION_DAYS: int = 14
+
+
+def _empty_day_tally() -> dict[str, Any]:
+    return {
+        "ticks": 0,
+        "disagreements": 0,      # cumulative across the day's ticks
+        "by_state": {},          # DesiredState.value -> cumulative count
+        "executed": 0,           # cumulative reconciler-driven actions
+        "max_diff_in_tick": 0,   # worst single tick that day
+    }
+
+
+def load_shadow_evidence(db_path: str) -> dict[str, dict[str, Any]]:
+    """Return the persisted per-day shadow tallies, keyed by ISO date.
+
+    Empty dict if nothing has been journaled yet. Callers (daily review,
+    operator) use this to judge whether divergence is rare/consistent enough
+    to flip ``reconciler.drive`` on (the Phase 2b gate).
+    """
+    from trading_bot.db import repository as repo
+
+    try:
+        conn: sqlite3.Connection = sqlite3.connect(db_path)
+        try:
+            row = repo.load_tick_state(conn, _SHADOW_EVIDENCE_KEY)
+        finally:
+            conn.close()
+    except sqlite3.OperationalError:
+        logger.warning("reconcile: shadow evidence unreadable", exc_info=True)
+        return {}
+    if row is None:
+        return {}
+    days = row.get("state", {}).get("days", {})
+    return {str(k): dict(v) for k, v in days.items()} if isinstance(days, dict) else {}
+
+
+def record_shadow_evidence(
+    db_path: str, result: ShadowReconcileResult, *, day_iso: str,
+) -> None:
+    """Fold one reconcile pass into the persisted per-day tally (idempotent-ish
+    accumulation). Prunes to the most recent ``_EVIDENCE_RETENTION_DAYS`` days.
+    Never raises — a journaling failure must not break the tick."""
+    from trading_bot.db import repository as repo
+
+    try:
+        days: dict[str, dict[str, Any]] = load_shadow_evidence(db_path)
+        tally: dict[str, Any] = days.get(day_iso) or _empty_day_tally()
+
+        n_diff: int = len(result.disagreements)
+        tally["ticks"] = int(tally.get("ticks", 0)) + 1
+        tally["disagreements"] = int(tally.get("disagreements", 0)) + n_diff
+        tally["executed"] = int(tally.get("executed", 0)) + len(result.executed)
+        tally["max_diff_in_tick"] = max(int(tally.get("max_diff_in_tick", 0)), n_diff)
+        by_state: dict[str, int] = dict(tally.get("by_state", {}))
+        for disp in result.disagreements:
+            key: str = disp.desired.value
+            by_state[key] = int(by_state.get(key, 0)) + 1
+        tally["by_state"] = by_state
+        days[day_iso] = tally
+
+        # Prune oldest days beyond the retention window.
+        if len(days) > _EVIDENCE_RETENTION_DAYS:
+            for stale in sorted(days)[: len(days) - _EVIDENCE_RETENTION_DAYS]:
+                days.pop(stale, None)
+
+        conn: sqlite3.Connection = sqlite3.connect(db_path)
+        try:
+            repo.save_tick_state(
+                conn, _SHADOW_EVIDENCE_KEY, last_bar_ts=None, state={"days": days},
+            )
+        finally:
+            conn.close()
+    except (sqlite3.OperationalError, ValueError, TypeError):
+        logger.warning("reconcile: failed to journal shadow evidence", exc_info=True)
+
+
+def summarize_shadow_evidence(days: dict[str, dict[str, Any]]) -> str:
+    """Readable multi-line summary of the persisted evidence (newest last)."""
+    if not days:
+        return "reconcile shadow evidence: none recorded yet"
+    lines: list[str] = ["reconcile shadow evidence (per day):"]
+    for day in sorted(days):
+        t: dict[str, Any] = days[day]
+        by_state: dict[str, int] = t.get("by_state", {}) or {}
+        breakdown: str = (
+            ", ".join(f"{k}={v}" for k, v in sorted(by_state.items()))
+            or "none"
+        )
+        lines.append(
+            f"  {day}: {t.get('ticks', 0)} ticks, "
+            f"{t.get('disagreements', 0)} disagreements "
+            f"(max {t.get('max_diff_in_tick', 0)}/tick), "
+            f"{t.get('executed', 0)} driven | {breakdown}"
+        )
+    return "\n".join(lines)
+
+
 async def run_reconcile(
     db_path: str,
     gateway: GatewayConnection,
     *,
     drive: bool = False,
+    now: datetime | None = None,
 ) -> ShadowReconcileResult:
     """Run one reconcile pass for a tick.
 
@@ -527,6 +636,12 @@ async def run_reconcile(
             len(delegated),
             "\n".join(f"  - {a.describe()}" for a in delegated),
         )
+
+    # Persist the day's disagreement tally so the Phase 2b flip decision is
+    # data-driven (the §5 gate evidence). Best-effort — never breaks the tick.
+    day_iso: str = (now or datetime.now(tz=TZ_EASTERN)).date().isoformat()
+    await asyncio.to_thread(record_shadow_evidence, db_path, result, day_iso=day_iso)
+
     return result
 
 
