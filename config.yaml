@@ -410,6 +410,22 @@ recovery:
   fresh_entry_grace_minutes: 10
 
 # -----------------------------------------------------------------------------
+# Broker-truth reconciler (reconciliation-loop design, PR #191)
+# -----------------------------------------------------------------------------
+reconciler:
+  # Phase 2 drive switch. When false (default), the reconciler runs in
+  # SHADOW mode each tick: it derives each position's desired state from
+  # broker truth and only LOGS where that diverges from the live SQLite
+  # state machine — no behaviour change. When true, the derived state OWNS
+  # the DB `status` column for the lossless transitions the reconciler can
+  # safely drive from positive broker evidence (e.g. normalize a held +
+  # broker-stopped row from POSITION_OPEN to STOP_ACTIVE). Order-submitting
+  # actions (attach stop, flatten, journal exit) stay with the existing
+  # healers regardless. Flip to true only after the shadow log has been
+  # quiet/consistent for several paper days (design §5 gate).
+  drive: false
+
+# -----------------------------------------------------------------------------
 # Exit Parameters - Swing
 # -----------------------------------------------------------------------------
 exit_swing:
