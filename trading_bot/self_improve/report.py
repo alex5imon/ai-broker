@@ -13,7 +13,7 @@ The agent never edits config.yaml directly — patches are advisory text.
 from __future__ import annotations
 
 from datetime import date
-from typing import Iterable
+from typing import Any, Iterable
 
 from trading_bot.self_improve.backtest_gate import BacktestComparison, StrategyMetrics
 from trading_bot.self_improve.hypotheses import Proposal
@@ -112,6 +112,54 @@ def _yaml_value(v: float) -> str:
     return f"{v:g}"
 
 
+def _render_shadow_evidence(days: dict[str, dict[str, Any]]) -> str:
+    """Render the reconciler shadow-evidence per-day tally as Markdown.
+
+    ``days`` is the structure persisted by the reconciler and read via
+    ``trading_bot.execution.reconciler.load_shadow_evidence`` — keyed by ISO
+    date. Surfaces the Phase 2b gate evidence (PR #191/#195): when several
+    consecutive days read quiet/consistent, the operator can flip
+    ``reconciler.drive`` on.
+    """
+    if not days:
+        return (
+            "_No reconciler shadow evidence recorded yet "
+            "(the bot has not run a tick since the journal shipped)._\n"
+        )
+
+    lines = [
+        "| Date | Ticks | Disagreements | Max/tick | Driven | By state |",
+        "|---|---:|---:|---:|---:|---|",
+    ]
+    total_diff: int = 0
+    for day in sorted(days):
+        t = days[day]
+        by_state = t.get("by_state", {}) or {}
+        breakdown = (
+            ", ".join(f"`{k}`={v}" for k, v in sorted(by_state.items()))
+            or "—"
+        )
+        diff = int(t.get("disagreements", 0))
+        total_diff += diff
+        lines.append(
+            f"| {day} | {int(t.get('ticks', 0))} | {diff} | "
+            f"{int(t.get('max_diff_in_tick', 0))} | "
+            f"{int(t.get('executed', 0))} | {breakdown} |"
+        )
+
+    quiet = sum(
+        1 for d in days.values() if int(d.get("disagreements", 0)) == 0
+    )
+    parts = ["\n".join(lines), ""]
+    parts.append(
+        f"_{quiet} of {len(days)} recorded day(s) had zero disagreements. "
+        f"**Phase 2b gate:** flip `reconciler.drive` on only after several "
+        f"consecutive quiet/consistent days (design §5)._"
+    )
+    parts.append("")
+    return "\n".join(parts)
+
+
 def render_markdown(
     *,
     report_date: date,
@@ -121,6 +169,7 @@ def render_markdown(
     comparisons: list[BacktestComparison],
     backtest_window: tuple[date, date] | None = None,
     backtest_universe: Iterable[str] | None = None,
+    shadow_evidence: dict[str, dict[str, Any]] | None = None,
 ) -> str:
     """Render the full report as a single Markdown string."""
     parts: list[str] = [
@@ -162,6 +211,11 @@ def render_markdown(
     else:
         for comp in comparisons:
             parts.append(_render_comparison(comp))
+
+    if shadow_evidence is not None:
+        parts.append("## Reconciler shadow evidence")
+        parts.append("")
+        parts.append(_render_shadow_evidence(shadow_evidence))
 
     parts.append("---")
     parts.append("")

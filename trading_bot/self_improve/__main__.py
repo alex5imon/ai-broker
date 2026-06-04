@@ -19,6 +19,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from trading_bot.config import Config
+from trading_bot.execution.reconciler import load_shadow_evidence
 from trading_bot.log_setup import setup_logging
 from trading_bot.self_improve.backtest_gate import (
     evaluate,
@@ -117,6 +118,11 @@ async def _async_main(args: argparse.Namespace) -> int:
         )
         comparisons = await evaluate(proposals, config, runner)
 
+    # Surface the reconciler's persisted shadow-evidence tally (PR #195) so
+    # the operator can see, post-close, whether DB<->broker divergence is rare
+    # enough to flip `reconciler.drive` on (the Phase 2b gate).
+    shadow_evidence = load_shadow_evidence(db_path)
+
     report_md = render_markdown(
         report_date=date.today(),
         window_days=args.window_days,
@@ -128,6 +134,7 @@ async def _async_main(args: argparse.Namespace) -> int:
             [t.strip() for t in args.tickers.split(",") if t.strip()]
             if not args.dry_run else None
         ),
+        shadow_evidence=shadow_evidence,
     )
 
     out_dir = Path(args.out)
