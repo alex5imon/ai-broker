@@ -131,6 +131,7 @@ class Disposition:
     desired: DesiredState
     action: str
     agrees_with_db: bool       # would the reconciler leave the DB untouched?
+    trade_id: int | None = None  # DB positions.id; None for an ADOPT
 
     def describe(self) -> str:
         intent: str = self.intent_status or "(no DB row)"
@@ -195,6 +196,7 @@ def derive_disposition(intent: PositionIntent, broker: BrokerView) -> Dispositio
         desired=desired,
         action=_ACTION_BY_STATE[desired],
         agrees_with_db=_db_reflects(desired, intent.status),
+        trade_id=intent.trade_id,
     )
 
 
@@ -225,11 +227,198 @@ def derive_all_dispositions(
     return dispositions
 
 
+# ---------------------------------------------------------------------------
+# Phase 2 — convergence (status ownership), gated by the `reconciler.drive`
+# flag. With the flag OFF (default) this layer plans + logs but executes
+# nothing: behaviour is identical to Phase 1 shadow mode. With it ON, the
+# reconciler OWNS the DB `status` column for the *lossless, DB-only*
+# transitions it can safely drive from positive broker evidence; every
+# order-submitting or P&L-bearing action is delegated to the existing healers
+# (StateRecovery / OrderManager) and only logged here. Deleting those reactive
+# patches is Phase 2b, gated on shadow-agreement evidence (design §5).
+# ---------------------------------------------------------------------------
+
+
+class ConvergenceOp(str, Enum):
+    """The kind of convergence step a disposition implies."""
+
+    NONE = "NONE"                          # already converged — nothing to do
+    NORMALIZE_STATUS = "NORMALIZE_STATUS"  # reconciler-owned lossless DB write
+    ATTACH_STOP = "ATTACH_STOP"            # delegated: submit protective stop
+    FLATTEN = "FLATTEN"                    # delegated: submit flatten (RTH)
+    JOURNAL_CLOSED = "JOURNAL_CLOSED"      # delegated: exit journal + P&L
+    ADOPT = "ADOPT"                        # delegated: adopt broker qty/price
+    INVESTIGATE = "INVESTIGATE"            # unexpected — alert only
+
+
+# The ONLY op the reconciler executes itself when drive is on. It is lossless
+# (a status label change), idempotent, and fires only on positive broker
+# evidence (held + protective stop on the book) — so a transient/empty broker
+# read can never trigger it. Every other op is owned by the existing healers.
+_RECONCILER_OWNED: frozenset[ConvergenceOp] = frozenset({ConvergenceOp.NORMALIZE_STATUS})
+
+
+@dataclass(frozen=True)
+class ConvergenceAction:
+    """A single planned convergence step for one ticker."""
+
+    ticker: str
+    trade_id: int | None
+    desired: DesiredState
+    op: ConvergenceOp
+    target_status: str | None  # only set for NORMALIZE_STATUS
+    detail: str
+
+    @property
+    def reconciler_owned(self) -> bool:
+        return self.op in _RECONCILER_OWNED
+
+    def describe(self) -> str:
+        owner: str = "reconciler" if self.reconciler_owned else "healer"
+        return f"[{self.op.value}/{owner}] {self.ticker}: {self.detail}"
+
+
+def _plan_one(disp: Disposition) -> ConvergenceAction:
+    """Pure: map one :class:`Disposition` to its convergence action."""
+    d: DesiredState = disp.desired
+
+    if d == DesiredState.PROTECTED:
+        # Lossless normalization: a held+stopped position recorded as
+        # POSITION_OPEN should read STOP_ACTIVE. Fires only on positive broker
+        # evidence, so it is safe against transient/empty reads. Any other
+        # open status already reflects reality -> NONE.
+        if disp.intent_status == PositionStatus.POSITION_OPEN.value:
+            return ConvergenceAction(
+                ticker=disp.ticker, trade_id=disp.trade_id, desired=d,
+                op=ConvergenceOp.NORMALIZE_STATUS,
+                target_status=PositionStatus.STOP_ACTIVE.value,
+                detail="normalize POSITION_OPEN -> STOP_ACTIVE (broker stop confirmed)",
+            )
+        return ConvergenceAction(
+            ticker=disp.ticker, trade_id=disp.trade_id, desired=d,
+            op=ConvergenceOp.NONE, target_status=None,
+            detail="already protected",
+        )
+
+    op_by_state: dict[DesiredState, tuple[ConvergenceOp, str]] = {
+        DesiredState.NEEDS_STOP: (
+            ConvergenceOp.ATTACH_STOP,
+            "attach protective stop (delegated to OrderManager recovery)",
+        ),
+        DesiredState.FLATTEN: (
+            ConvergenceOp.FLATTEN,
+            "re-submit flatten iff RTH (delegated to existing exit path)",
+        ),
+        DesiredState.CLOSED: (
+            ConvergenceOp.JOURNAL_CLOSED,
+            "journal exit from broker truth (delegated to StateRecovery/poll)",
+        ),
+        DesiredState.OPEN: (
+            ConvergenceOp.ADOPT,
+            "adopt broker qty/price (delegated to _transition_to_open)",
+        ),
+        DesiredState.ADOPT: (
+            ConvergenceOp.ADOPT,
+            "adopt unknown broker position (delegated to StateRecovery)",
+        ),
+        DesiredState.UNKNOWN: (
+            ConvergenceOp.INVESTIGATE,
+            "unexpected DB status — investigate",
+        ),
+        DesiredState.PENDING_ENTRY: (
+            ConvergenceOp.NONE,
+            "entry order still working",
+        ),
+    }
+    op, detail = op_by_state[d]
+    return ConvergenceAction(
+        ticker=disp.ticker, trade_id=disp.trade_id, desired=d,
+        op=op, target_status=None, detail=detail,
+    )
+
+
+def plan_convergence(dispositions: list[Disposition]) -> list[ConvergenceAction]:
+    """Pure: turn dispositions into the convergence plan (no side effects).
+
+    Actions that are no-ops (``NONE``) are dropped — the plan lists only the
+    steps that would change something. Reconciler-owned actions sort first.
+    """
+    actions: list[ConvergenceAction] = [
+        a for a in (_plan_one(d) for d in dispositions) if a.op != ConvergenceOp.NONE
+    ]
+    actions.sort(key=lambda a: (not a.reconciler_owned, a.ticker))
+    return actions
+
+
+def _write_status(db_path: str, trade_id: int, status: str) -> bool:
+    """Idempotently set a non-terminal position's status. Returns True on write.
+
+    Guarded to never touch a terminal row (CLOSED/ENTRY_FAILED) — the
+    reconciler must not resurrect a closed position.
+    """
+    from trading_bot.constants import TERMINAL_POSITION_STATUSES
+
+    placeholders: str = ",".join("?" * len(TERMINAL_POSITION_STATUSES))
+    try:
+        conn: sqlite3.Connection = sqlite3.connect(db_path)
+        try:
+            cur = conn.execute(
+                # nosec B608 — placeholders are literal "?" from a fixed
+                # module-level constant; no user input reaches the SQL.
+                f"UPDATE positions SET status = ?, "  # nosec B608
+                f"updated_at = datetime('now') "
+                f"WHERE id = ? AND status NOT IN ({placeholders})",
+                (status, trade_id, *sorted(TERMINAL_POSITION_STATUSES)),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+    except sqlite3.OperationalError:
+        logger.warning(
+            "reconcile: failed to write status for trade_id=%s", trade_id,
+            exc_info=True,
+        )
+        return False
+
+
+async def converge(
+    db_path: str,
+    plan: list[ConvergenceAction],
+    *,
+    drive: bool,
+) -> list[ConvergenceAction]:
+    """Execute the reconciler-owned subset of the plan iff ``drive`` is on.
+
+    Returns the list of actions actually executed (empty when ``drive`` is
+    off, or when the plan has no reconciler-owned steps). Healer-delegated
+    actions are never executed here — the existing in-tick healers do that
+    work; this layer only plans and logs them.
+    """
+    if not drive:
+        return []
+    executed: list[ConvergenceAction] = []
+    for action in plan:
+        if action.op != ConvergenceOp.NORMALIZE_STATUS or action.trade_id is None:
+            continue
+        assert action.target_status is not None  # NORMALIZE_STATUS invariant
+        wrote: bool = await asyncio.to_thread(
+            _write_status, db_path, action.trade_id, action.target_status,
+        )
+        if wrote:
+            executed.append(action)
+            logger.info("reconcile: drove %s", action.describe())
+    return executed
+
+
 @dataclass
 class ShadowReconcileResult:
-    """Outcome of one shadow-mode reconcile pass."""
+    """Outcome of one reconcile pass (shadow, or driven when the flag is on)."""
 
     dispositions: list[Disposition] = field(default_factory=list)
+    plan: list[ConvergenceAction] = field(default_factory=list)
+    executed: list[ConvergenceAction] = field(default_factory=list)
+    drive: bool = False
 
     @property
     def disagreements(self) -> list[Disposition]:
@@ -283,29 +472,68 @@ async def broker_snapshot(gateway: GatewayConnection) -> BrokerView:
     return BrokerView.from_alpaca(positions, orders)
 
 
-async def run_shadow_reconcile(
+async def run_reconcile(
     db_path: str,
     gateway: GatewayConnection,
+    *,
+    drive: bool = False,
 ) -> ShadowReconcileResult:
-    """Run the Phase 1 reconciler in SHADOW mode for one tick (read-only).
+    """Run one reconcile pass for a tick.
 
-    Derives a desired disposition for every open position and logs where the
-    derivation disagrees with the live SQLite state machine. Takes **no**
-    action and pages **nothing** (Phase 0's guard owns alerting). Safe to call
-    every tick and ignore the result.
+    Always derives a desired disposition for every open position and logs
+    where the derivation disagrees with the live SQLite state machine
+    (shadow). It then plans the convergence steps; when ``drive`` is **on**,
+    the reconciler-owned subset (lossless status normalization) is executed
+    and the DB ``status`` column is owned by broker truth. When ``drive`` is
+    **off** (the default), nothing is executed — behaviour is identical to
+    Phase 1 shadow mode.
+
+    Order-submitting / P&L-bearing actions (attach stop, flatten, journal
+    exit, adopt) are **never** executed here — they are planned and logged,
+    and the existing in-tick healers do the work. Pages nothing (Phase 0's
+    guard owns alerting). Safe to call every tick and ignore the result.
     """
     broker: BrokerView = await broker_snapshot(gateway)
     intents: list[PositionIntent] = await asyncio.to_thread(_load_intents, db_path)
 
     dispositions: list[Disposition] = derive_all_dispositions(intents, broker)
-    result: ShadowReconcileResult = ShadowReconcileResult(dispositions=dispositions)
+    plan: list[ConvergenceAction] = plan_convergence(dispositions)
+    result: ShadowReconcileResult = ShadowReconcileResult(
+        dispositions=dispositions, plan=plan, drive=drive,
+    )
 
     logger.info("%s", result.summary())
     if result.disagreements:
+        mode: str = "drive" if drive else "shadow"
         logger.warning(
-            "shadow reconcile: %d disposition(s) would change under the "
-            "reconciler (Phase 1 is observe-only — no action taken):\n%s",
+            "reconcile (%s): %d disposition(s) diverge from the live state "
+            "machine:\n%s",
+            mode,
             len(result.disagreements),
             "\n".join(f"  - {d.describe()}" for d in result.disagreements),
         )
+
+    result.executed = await converge(db_path, plan, drive=drive)
+
+    # Surface the steps the reconciler did NOT own (delegated to healers) so
+    # the operator can confirm the healers are converging them.
+    delegated: list[ConvergenceAction] = [
+        a for a in plan if not a.reconciler_owned
+    ]
+    if delegated:
+        logger.info(
+            "reconcile: %d action(s) delegated to existing healers "
+            "(not driven by the reconciler):\n%s",
+            len(delegated),
+            "\n".join(f"  - {a.describe()}" for a in delegated),
+        )
     return result
+
+
+async def run_shadow_reconcile(
+    db_path: str,
+    gateway: GatewayConnection,
+) -> ShadowReconcileResult:
+    """Backward-compatible shadow entry point — :func:`run_reconcile` with
+    ``drive=False``. Retained for callers that only want observe-only mode."""
+    return await run_reconcile(db_path, gateway, drive=False)
