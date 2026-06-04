@@ -138,3 +138,60 @@ def test_render_handles_zero_trade_strategy():
     )
     assert "no closed trades in window" in md
     assert "n/a" in md  # PF rendered as n/a
+
+
+@pytest.mark.unit
+def test_shadow_evidence_omitted_when_none():
+    # Backward compat: callers that don't pass evidence get no section.
+    md = render_markdown(
+        report_date=date(2026, 6, 4),
+        window_days=20,
+        stats_by_strategy={"mean_reversion": _stats("mean_reversion")},
+        proposals=[],
+        comparisons=[],
+    )
+    assert "Reconciler shadow evidence" not in md
+
+
+@pytest.mark.unit
+def test_shadow_evidence_empty_dict_renders_placeholder():
+    md = render_markdown(
+        report_date=date(2026, 6, 4),
+        window_days=20,
+        stats_by_strategy={"mean_reversion": _stats("mean_reversion")},
+        proposals=[],
+        comparisons=[],
+        shadow_evidence={},
+    )
+    assert "## Reconciler shadow evidence" in md
+    assert "No reconciler shadow evidence recorded yet" in md
+
+
+@pytest.mark.unit
+def test_shadow_evidence_table_and_gate_note():
+    evidence = {
+        "2026-06-03": {
+            "ticks": 78, "disagreements": 3, "executed": 0,
+            "max_diff_in_tick": 1,
+            "by_state": {"CLOSED": 2, "NEEDS_STOP": 1},
+        },
+        "2026-06-04": {
+            "ticks": 78, "disagreements": 0, "executed": 0,
+            "max_diff_in_tick": 0, "by_state": {},
+        },
+    }
+    md = render_markdown(
+        report_date=date(2026, 6, 4),
+        window_days=20,
+        stats_by_strategy={"mean_reversion": _stats("mean_reversion")},
+        proposals=[],
+        comparisons=[],
+        shadow_evidence=evidence,
+    )
+    assert "## Reconciler shadow evidence" in md
+    # Both days appear, with their disagreement counts and by-state breakdown.
+    assert "2026-06-03" in md and "2026-06-04" in md
+    assert "`CLOSED`=2" in md and "`NEEDS_STOP`=1" in md
+    # Gate note reports the quiet-day count (1 of 2 here).
+    assert "1 of 2 recorded day(s) had zero disagreements" in md
+    assert "reconciler.drive" in md
